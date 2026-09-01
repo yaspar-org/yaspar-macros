@@ -1,0 +1,26 @@
+# cargo-deny configuration. Run `cargo deny check` locally; CI runs the same.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+# Everything we ship under, plus the permissive licences our dependencies offer.
+# Anything not on this list is a deliberate decision, not an oversight.
+allow = ["Apache-2.0", "MIT", "Unicode-3.0"]
+
+[bans]
+# The dependency graph is four crates deep; a duplicate major version in it is a
+# mistake rather than something to tolerate. Dev-dependencies may still bring some.
+multiple-versions = "warn"
+# A wildcard version cannot be audited or reproduced.
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

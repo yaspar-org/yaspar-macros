@@ -104,6 +104,10 @@ impl<D> Pin<D> {
 
     /// Take ownership of `d` and hand back its address, which will not move until
     /// [`Pin::truncate`] drops it.
+    ///
+    /// The returned pointer stays valid across *later* `push`es, which is the whole
+    /// point of the type: a caller lends a value to its callee's entire subtree, and
+    /// that subtree pushes more values of its own before reading this one back.
     pub fn push(&mut self, d: D) -> *const D {
         if self.chunks.last().is_none_or(|c| c.len() == c.capacity()) {
             self.chunks.push(Vec::with_capacity(Self::CHUNK));
@@ -111,6 +115,18 @@ impl<D> Pin<D> {
         let chunk = self.chunks.last_mut().expect("just pushed one");
         chunk.push(d);
         self.len += 1;
+        // SAFETY: a later `push` re-takes `&mut self` and writes the same chunk, which
+        // would invalidate this pointer under either aliasing model *if* its provenance
+        // came from that borrow of `self`. It does not: the address belongs to the heap
+        // allocation the inner `Vec` owns, and the borrow of `self` only reads that
+        // buffer pointer out. A later push therefore writes a different element of the
+        // same allocation and leaves this one alone. The buffer never moves either, as
+        // chunks are pre-sized and never regrown and `truncate` keeps their capacity;
+        // the outer `Vec` may move the chunk *headers* when its spine grows, which does
+        // not move the buffers they own. Checked, not just argued: this interleaving and
+        // the macro-expanded tests report no UB under both `-Zmiri-stacked-borrows` and
+        // `-Zmiri-tree-borrows` with `-Zmiri-strict-provenance` (see the README), so
+        // keep those tests in step with any change to the chunking above.
         &chunk[chunk.len() - 1] as *const D
     }
 

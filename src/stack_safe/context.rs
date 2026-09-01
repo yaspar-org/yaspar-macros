@@ -65,6 +65,17 @@ impl CtxEntry {
         match (self.raw.get(), self.mutable) {
             // The deref of a raw pointer detaches the borrow, which is what lets
             // a swap assign to the slot while this reborrow is still live.
+            //
+            // SAFETY: emitted into the caller's crate, so the invariant is ours. A raw
+            // slot is written only by `init_expr`, from a reference the original was
+            // already given, and by a recursive call swapping in a pointer derived from
+            // that same reference — which `analyze::scan_context_args` has checked is
+            // rooted at this context parameter. The continuation restores the parent's
+            // pointer before the parent's frame resumes, so the slot always names a
+            // place inside a borrow the outermost call still holds, and only one
+            // reborrow is live at a time, since no frame carries one. Gated behind
+            // `use_nonlinear_mut`; `tests/context.rs` covers it under both of Miri's
+            // aliasing models.
             (true, true) => quote! { let #name: #ty = unsafe { &mut *#ctx.#idx }; },
             (true, false) => quote! { let #name: #ty = unsafe { &*#ctx.#idx }; },
             (false, true) => quote! { let #name: #ty = &mut *#ctx.#idx; },

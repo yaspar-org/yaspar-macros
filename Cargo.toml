@@ -5,6 +5,9 @@ members = ["defs"]
 name = "yaspar-macros"
 version = "0.1.0"
 edition = "2024"
+# A floor, not a pin: `edition = "2024"` needs 1.85 and the let-chains in `emit.rs` and
+# `context.rs` need 1.88. Any newer toolchain is fine. Checked by the `msrv` CI job.
+rust-version = "1.88"
 readme = "README.md"
 license = "Apache-2.0"
 description = "Proc macros: `#[stack_safe]` rewrites recursive functions — a cycle of them at a time — into a heap-stack state machine; `#[delegate_trait]` forwards unwritten trait methods to an inner field."

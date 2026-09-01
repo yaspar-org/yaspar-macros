@@ -3,5 +3,3 @@ target/
 /rust-toolchain.toml
 .idea/
 **/.DS_Store
-.*/
-!.github/

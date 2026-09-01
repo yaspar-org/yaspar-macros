@@ -129,6 +129,15 @@ fn split_params(func: &ItemFn) -> syn::Result<Split> {
                     // names the reference's: nothing else fixes this payload's type, and
                     // in a group one member's payload is only ever built inside another
                     // member's arm.
+                    //
+                    // SAFETY: as in `CtxEntry::rebind`, this lands in the caller's crate
+                    // and the invariant is ours. The pointer is one `Pin::push` returned
+                    // for a value moved into the driver's store, and `Pin` never moves a
+                    // value it holds, so the address stays valid. The frame that pushed
+                    // it holds the mark that drops it, so the value outlives every arm
+                    // that can reach this payload and is dropped once. Gated behind
+                    // `data_in_frame`; covered by `tests/transform.rs` and
+                    // `tests/group.rs` under both of Miri's aliasing models.
                     param_anns_pinned.push(match &**ty {
                         syn::Type::Reference(r) => {
                             let elem = &r.elem;

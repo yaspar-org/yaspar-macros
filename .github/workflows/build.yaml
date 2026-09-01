@@ -40,6 +40,81 @@ jobs:
       - name: Run copyright check
         run: ./.github/copyright-check.sh
 
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Keeps `rust-version` in both manifests honest. Lib targets only: the
+      # dev-dependencies are free to need something newer than consumers do.
+      - name: Install the declared MSRV
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: "1.88"
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Run cargo check
+        run: cargo check --workspace
+
+  miri:
+    name: Miri (${{ matrix.model }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - model: stacked borrows
+            miriflags: -Zmiri-strict-provenance
+          - model: tree borrows
+            miriflags: -Zmiri-tree-borrows -Zmiri-strict-provenance
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      # Pinned deliberately: Miri tracks the compiler's aliasing model, so a floating
+      # nightly would let this job's verdict change without a commit. Bump on purpose.
+      NIGHTLY: nightly-2026-08-25
+      MIRIFLAGS: ${{ matrix.miriflags }}
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install pinned nightly with Miri
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.NIGHTLY }}
+          components: miri, rust-src
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - run: cargo miri setup
+
+      # The two opt-in options put raw pointers where the original had references, so
+      # these three suites are the only control over the aliasing model. The depth-only
+      # tests are skipped: they are about frames rather than aliasing, and Miri would
+      # take forever over them. Kept in step with the invocations in the README.
+      - name: Aliasing tests
+        run: |
+          cargo miri test --test context -- --skip deep_ --skip _is_flat --skip _is_stack_safe
+          cargo miri test --test transform -- lends_the_callee two_values_of three_lent_values_with
+          cargo miri test --test group -- lend unsafe_options --skip _is_flat
+
+  deny:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Advisories, licences, duplicate versions and registry provenance, per deny.toml.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+
   test:
     name: Test Suite
     strategy:

@@ -9,8 +9,8 @@ macros. A crate using these macros therefore depends on both.
 
 This package features two groups of procedural macros:
 
-* `#[stack_safe]`: implement stack-safe transformations on (mutually) recursive functions, so
-  that they become stack safe, i.e. never cause stack overflow on any input size. The scan is arbitrarily deep.
+* `#[stack_safe]`: rewrite (mutually) recursive functions into an iterative state machine whose frames live on the heap,
+  so that recursion depth is bounded by available memory rather than by the native stack.
 * `#[delegatable_trait]`, `#[delegate_trait]`: implement trait delegation to simulate an object-oriented programming
   style for traits.
 
@@ -23,6 +23,15 @@ yaspar-macros-defs = "0.1" # only need this for #[stack_safe]
 ```
 
 ## Stack-safe Recursions
+
+### TLDR
+
+Tag all your recursive functions with `#[stack_safe]` and enjoy stack-overflow freedom! The transformation is **almost**
+zero-cost!
+
+Caveats:
+1. Trait impls cannot get involved in recursion.
+2. Certain recursive styles require special unsafe options, which are documented below.
 
 ### Recursion: Good and Bad
 
@@ -477,9 +486,15 @@ tree that way, i.e. it mutates each node through the derived reference while car
 chain built one link per level, and it is checked under both of Miri's aliasing models.
 
 Both options hand the driver a raw pointer where the original had a reference. That does not put the borrow checker
-aside: whatever the original asked of it is still checked, and a program it would have refused is still refused, e.g.
-a callee that returns a borrow of a value lent to it. One consequence is worth knowing, since it is visible: a mistake
-either option would otherwise have hidden may be reported twice, once against each of the two readings of the body.
+aside for the program you wrote: the untransformed body is emitted alongside the state machine, so the *source-level*
+borrow structure is still checked, and a program it would have refused is still refused, e.g. a callee that returns a
+borrow of a value lent to it. One consequence is worth knowing, since it is visible: a mistake either option would
+otherwise have hidden may be reported twice, once against each of the two readings of the body.
+
+The expansion is not checked that way: keeping those pointers valid is an invariant this crate takes on, argued in
+`SAFETY:` blocks and tested under both of Miri's aliasing models, but not proved. Both options also emit `unsafe` into
+*your* crate, where your own `#![forbid(unsafe_code)]` will not see it. Neither is on by default, so keeping that
+guarantee means not opting in.
 
 #### Supports
 
@@ -585,6 +600,13 @@ On `?`:
 
 Misusing the attribute is also an error: `#[stack_safe]` on an item that is neither a function, a module nor an impl
 block; on a bodiless `mod m;`, which shows it no body to scan; and an unknown or malformed option list.
+
+Two notes on the generated code. Where a group's members return different types, the arms that take a member's result out
+of the driver's union end in `::core::unreachable!`; they cannot be taken, but the panic path is present, which matters
+under `panic = "abort"`. And the rewriting itself is recursive descent with no depth guard, so a body whose *expressions*
+nest deeply enough overflows `rustc`'s own stack — on `aarch64`, 700 levels of parentheses around a recursive call
+compile and 800 abort with `SIGBUS`. That is compile-time only and out of reach of hand-written code, and we accept it as
+it stands: the claim is that a *recursion* is bounded by memory, not that any body shape is accepted.
 
 #### More Tests and Examples
 
@@ -808,6 +830,11 @@ impl other_crate::a::Store for Wrapper {}
 
 Naming the trait *bare*, after importing it, leaves no path to follow, and that form works only inside the crate that
 defines the trait, where the helper's own `#[macro_export]`ed name is in scope. Writing the path is the fix.
+
+That export brings two items neither written by you nor shown in `cargo doc`: `macro_rules! __delegate_impl_<Trait>`,
+which `#[macro_export]` places at the crate root whatever module the trait sits in, and a `pub use` of it as
+`__delegate_path_<Trait>` beside the trait. Both are `#[doc(hidden)]`, so `#[delegatable_trait]` on a trait in a private
+module still grows the crate's public macro namespace. `local` keeps both `pub(crate)`.
 
 Two `#[delegatable_trait]` traits of the same name in one crate would collide with an `E0428`, since that exported name
 lands at the crate root. For that case there is `local`, which keeps the helper out of the root entirely:

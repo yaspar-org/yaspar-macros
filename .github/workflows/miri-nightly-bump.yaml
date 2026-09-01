@@ -1,0 +1,126 @@
+name: Bump Miri nightly
+
+# The Miri job in `build.yaml` pins a nightly on purpose, so that its verdict cannot
+# change without a commit. The cost of a pin is that it goes stale, and a stale Miri is
+# not checking the aliasing model the current compiler implements. This walks the pin
+# forward once a week, but only after proving the new nightly still passes: the bump
+# arrives as a reviewed PR whose matrix has already run, not as a blind date change.
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    name: Resolve and verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Not every nightly ships Miri for every target, so "yesterday's date" is not a
+      # safe guess: walk back from today and take the newest one that actually carries
+      # the component for the target this workflow runs Miri on.
+      - name: Resolve the newest nightly carrying Miri
+        id: resolve
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import datetime, re, urllib.error, urllib.request
+
+          TARGET = "x86_64-unknown-linux-gnu"
+          today = datetime.date.today()
+
+          for back in range(14):
+              day = today - datetime.timedelta(days=back)
+              url = f"https://static.rust-lang.org/dist/{day}/channel-rust-nightly.toml"
+              try:
+                  manifest = urllib.request.urlopen(url, timeout=60).read().decode()
+              except urllib.error.HTTPError:
+                  continue
+              section = re.search(
+                  r"\[pkg\.miri-preview\.target\." + re.escape(TARGET) + r"\]\n(.*?)\n\[",
+                  manifest,
+                  re.S,
+              )
+              if section and re.search(r"available\s*=\s*true", section.group(1)):
+                  print(f"date={day}")
+                  break
+          else:
+              raise SystemExit(f"no nightly in the last 14 days carries Miri for {TARGET}")
+          PY
+
+      - name: Compare against the current pin
+        id: pin
+        run: |
+          current=$(grep -oE 'NIGHTLY: nightly-[0-9]{4}-[0-9]{2}-[0-9]{2}' .github/workflows/build.yaml \
+            | head -1 | sed 's/.*nightly-//')
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          if [[ "$current" == "${{ steps.resolve.outputs.date }}" ]]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Already on the newest nightly carrying Miri ($current)."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install the candidate nightly
+        if: steps.pin.outputs.changed == 'true'
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: nightly-${{ steps.resolve.outputs.date }}
+          components: miri, rust-src
+
+      - run: cargo miri setup
+        if: steps.pin.outputs.changed == 'true'
+
+      # The same matrix `build.yaml` runs, both aliasing models. A candidate that fails
+      # here opens no PR and fails this workflow instead, which is the signal wanted:
+      # either the new Miri found something or it changed behaviour, and both need a
+      # human rather than an automatic bump.
+      - name: Verify the matrix on the candidate
+        if: steps.pin.outputs.changed == 'true'
+        run: |
+          for flags in "-Zmiri-strict-provenance" "-Zmiri-tree-borrows -Zmiri-strict-provenance"; do
+            export MIRIFLAGS="$flags"
+            echo "::group::MIRIFLAGS=$flags"
+            cargo miri test --test context -- --skip deep_ --skip _is_flat --skip _is_stack_safe
+            cargo miri test --test transform -- lends_the_callee two_values_of three_lent_values_with
+            cargo miri test --test group -- lend unsafe_options --skip _is_flat
+            echo "::endgroup::"
+          done
+
+      - name: Move the pin
+        if: steps.pin.outputs.changed == 'true'
+        run: |
+          sed -i \
+            "s/NIGHTLY: nightly-[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}/NIGHTLY: nightly-${{ steps.resolve.outputs.date }}/" \
+            .github/workflows/build.yaml
+          # A silent no-op here would open an empty PR, so treat "nothing changed" as a
+          # failure: it means the pin's spelling in `build.yaml` drifted from this regex.
+          if git diff --quiet; then
+            echo "::error::pin substitution matched nothing in build.yaml"
+            exit 1
+          fi
+
+      - name: Open the bump PR
+        if: steps.pin.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7.0.11
+        with:
+          branch: chore/miri-nightly-${{ steps.resolve.outputs.date }}
+          title: "Bump the Miri nightly to ${{ steps.resolve.outputs.date }}"
+          commit-message: "Bump the Miri nightly to ${{ steps.resolve.outputs.date }}"
+          body: |
+            Moves the pinned Miri nightly in `build.yaml` from
+            `${{ steps.pin.outputs.current }}` to `${{ steps.resolve.outputs.date }}`,
+            the newest nightly carrying the `miri` component for
+            `x86_64-unknown-linux-gnu`.
+
+            The full aliasing matrix — `context`, `transform` and `group`, under both
+            Stacked Borrows and Tree Borrows with `-Zmiri-strict-provenance` — already
+            passed on this nightly in the run that opened this PR.
+          delete-branch: true

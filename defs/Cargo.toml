@@ -2,6 +2,8 @@
 name = "yaspar-macros-defs"
 version = "0.1.0"
 edition = "2024"
+# Kept in step with the macro crate, the only thing that depends on this one.
+rust-version = "1.88"
 readme = "README.md"
 license = "Apache-2.0"
 description = "The fixed definitions that `yaspar-macros` expansions refer to: the step protocol, its driver, the pinned store, and a stable stand-in for `Try`."
