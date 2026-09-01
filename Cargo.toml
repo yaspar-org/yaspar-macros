@@ -1,0 +1,27 @@
+[workspace]
+members = ["defs"]
+
+[package]
+name = "yaspar-macros"
+version = "0.1.0"
+edition = "2024"
+publish = false
+readme = "README.md"
+description = "Proc macros: `#[stack_safe]` rewrites recursive functions — a cycle of them at a time — into a heap-stack state machine; `#[delegate_trait]` forwards unwritten trait methods to an inner field."
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "3", features = ["full", "visit", "visit-mut", "extra-traits"] }
+
+# The expansions of `#[stack_safe]` refer to the definitions crate, so anything using
+# these macros depends on it too. It is only needed to *run* the expansions, hence a
+# dev-dependency here for this crate's own tests and examples.
+[dev-dependencies]
+yaspar-macros-defs = { path = "defs", version = "0.1.0" }
+# The rejections are the half of the feature that is easiest to break silently: a
+# `compile_fail` doctest keeps passing however the message reads. These pin the messages.
+trybuild = "1.0"

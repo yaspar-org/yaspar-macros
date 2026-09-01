@@ -1,0 +1,37 @@
+error[E0382]: use of moved value: `v`
+  --> tests/ui/original_moved.rs:11:35
+   |
+11 | fn moved(n: usize, c: &Chain<'_>, v: Vec<u64>) -> usize {
+   |                                   ^
+   |                                   |
+   |                                   value used here after move
+   |                                   move occurs because `v` has type `Vec<u64>`, which does not implement the `Copy` trait
+...
+15 |         moved(n - 1, &Chain::Cons(1, c), v) + v.len()
+   |                                          - value moved here
+   |
+help: consider cloning the value if the performance cost is acceptable
+   |
+15 |         moved(n - 1, &Chain::Cons(1, c), v.clone()) + v.len()
+   |                                           ++++++++
+
+error[E0382]: borrow of moved value: `v`
+  --> tests/ui/original_moved.rs:15:47
+   |
+11 | fn moved(n: usize, c: &Chain<'_>, v: Vec<u64>) -> usize {
+   |                                   - move occurs because `v` has type `Vec<u64>`, which does not implement the `Copy` trait
+...
+15 |         moved(n - 1, &Chain::Cons(1, c), v) + v.len()
+   |                                          -    ^ value borrowed here after move
+   |                                          |
+   |                                          value moved here
+   |
+note: consider changing this parameter type in function `__ss_orig_moved` to borrow instead if owning the value isn't necessary
+  --> tests/ui/original_moved.rs:11:38
+   |
+11 | fn moved(n: usize, c: &Chain<'_>, v: Vec<u64>) -> usize {
+   |    ----- in this function            ^^^^^^^^ this parameter takes ownership of the value
+help: consider cloning the value if the performance cost is acceptable
+   |
+15 |         moved(n - 1, &Chain::Cons(1, c), v.clone()) + v.len()
+   |                                           ++++++++

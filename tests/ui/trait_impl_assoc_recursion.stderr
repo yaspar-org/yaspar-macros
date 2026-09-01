@@ -1,0 +1,5 @@
+error: `depth` recurses, and `#[stack_safe]` cannot rewrite a recursive member of a trait impl: the rewritten body has to sit beside the member, and a trait impl may hold nothing but the trait's own members. Move the body to an inherent method, annotate that, and have this one forward to it. A function declared inside the body may still recurse, since its driver is written there
+  --> tests/ui/trait_impl_assoc_recursion.rs:13:8
+   |
+13 |     fn depth(n: u64) -> u64 {
+   |        ^^^^^

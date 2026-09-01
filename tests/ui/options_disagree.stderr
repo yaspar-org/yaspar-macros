@@ -1,0 +1,5 @@
+error: `down` and `up` are mutually recursive, so they share one driver and must be given the same options; `down` has [use_nonlinear_mut] and `up` has [none]
+  --> tests/ui/options_disagree.rs:16:12
+   |
+16 |     pub fn up(t: &mut Tree, n: u64) -> u64 {
+   |            ^^

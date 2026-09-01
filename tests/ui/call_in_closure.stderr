@@ -1,0 +1,5 @@
+error: `#[stack_safe]` cannot rewrite a recursive call inside a closure: the closure is invoked by code the macro cannot see. Hoist the call out of the closure, or use a `for` loop.
+ --> tests/ui/call_in_closure.rs:5:16
+  |
+5 |     (0..n).map(|k| f(k)).sum()
+  |                ^

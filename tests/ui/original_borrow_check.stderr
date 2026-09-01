@@ -1,0 +1,9 @@
+error[E0515]: cannot return value referencing temporary value
+  --> tests/ui/original_borrow_check.rs:13:4
+   |
+13 |   fn grow<'a>(n: usize, c: &'a Chain<'a>) -> &'a Chain<'a> {
+   |  ____^
+14 | |     if n == 0 { c } else { grow(n - 1, &Chain::Cons(1, c)) }
+   | |_________________________________________-----------------^ returns a value referencing data owned by the current function
+   |                                           |
+   |                                           temporary value created here

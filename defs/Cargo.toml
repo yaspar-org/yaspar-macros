@@ -1,0 +1,7 @@
+[package]
+name = "yaspar-macros-defs"
+version = "0.1.0"
+edition = "2024"
+publish = false
+readme = "README.md"
+description = "The fixed definitions that `yaspar-macros` expansions refer to: the step protocol, its driver, the pinned store, and a stable stand-in for `Try`."

@@ -1,0 +1,5 @@
+error: `#[stack_safe]` takes a list of options, as in `#[stack_safe(use_nonlinear_mut)]`
+ --> tests/ui/option_shape.rs:7:7
+  |
+7 |     #[stack_safe = "data_in_frame"]
+  |       ^^^^^^^^^^
