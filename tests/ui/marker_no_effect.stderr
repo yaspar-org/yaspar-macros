@@ -1,5 +1,5 @@
 error: `#[stack_safe]` on `helper` has no effect: `#[stack_safe]` found no path from it back to itself, so it does not recurse. It needs no attribute of its own in any case: the one covering the body it is declared in already applies to it
- --> tests/ui/marker_no_effect.rs:6:8
+ --> tests/ui/marker_no_effect.rs:9:8
   |
-6 |     fn helper(n: u64) -> u64 {
+9 |     fn helper(n: u64) -> u64 {
   |        ^^^^^^

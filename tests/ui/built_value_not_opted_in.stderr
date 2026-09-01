@@ -1,5 +1,5 @@
 error: `#[stack_safe]` cannot pass a reference to a value built here: the recursive call becomes a `return`, so this temporary would be dropped before the callee runs. Opt in with `#[stack_safe(data_in_frame)]`, which moves the value into the driver's own store for as long as the frame that built it lives — see README.md for the invariant that asks of you
-  --> tests/ui/built_value_not_opted_in.rs:10:40
+  --> tests/ui/built_value_not_opted_in.rs:13:40
    |
-10 |     if n == 0 { 0 } else { grow(n - 1, &Chain::Cons(1, c)) }
+13 |     if n == 0 { 0 } else { grow(n - 1, &Chain::Cons(1, c)) }
    |                                        ^

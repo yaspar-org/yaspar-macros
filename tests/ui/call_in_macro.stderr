@@ -1,5 +1,5 @@
 error: possible recursive call to `f` inside a macro invocation; `#[stack_safe]` cannot rewrite macro bodies — bind the call to a `let` outside the macro
- --> tests/ui/call_in_macro.rs:8:9
-  |
-8 |         println!("{}", f(n - 1));
-  |         ^^^^^^^
+  --> tests/ui/call_in_macro.rs:11:9
+   |
+11 |         println!("{}", f(n - 1));
+   |         ^^^^^^^

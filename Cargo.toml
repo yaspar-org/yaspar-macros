@@ -5,9 +5,14 @@ members = ["defs"]
 name = "yaspar-macros"
 version = "0.1.0"
 edition = "2024"
-publish = false
 readme = "README.md"
+license = "Apache-2.0"
 description = "Proc macros: `#[stack_safe]` rewrites recursive functions — a cycle of them at a time — into a heap-stack state machine; `#[delegate_trait]` forwards unwritten trait methods to an inner field."
+authors = ["the Amazon Trusted Solver team"]
+keywords = ["macros", "recursion", "stack", "delegation"]
+categories = ["development-tools::procedural-macro-helpers", "rust-patterns"]
+homepage = "https://github.com/yaspar-org/yaspar-macros"
+repository = "https://github.com/yaspar-org/yaspar-macros"
 
 [lib]
 proc-macro = true

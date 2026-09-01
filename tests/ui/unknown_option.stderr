@@ -1,5 +1,5 @@
 error: unknown `#[stack_safe]` option `data_in_fram`; the options are `use_nonlinear_mut` and `data_in_frame`
- --> tests/ui/unknown_option.rs:3:14
+ --> tests/ui/unknown_option.rs:6:14
   |
-3 | #[stack_safe(data_in_fram)]
+6 | #[stack_safe(data_in_fram)]
   |              ^^^^^^^^^^^^

@@ -1,15 +1,15 @@
 error[E0716]: temporary value dropped while borrowed
-  --> tests/ui/original_stash.rs:17:23
+  --> tests/ui/original_stash.rs:20:23
    |
-12 |   fn stash<'a>(n: usize, c: &'a Chain<'a>, out: &mut Vec<&'a Chain<'a>>) -> usize {
+15 |   fn stash<'a>(n: usize, c: &'a Chain<'a>, out: &mut Vec<&'a Chain<'a>>) -> usize {
    |      -     -- lifetime `'a` defined here
    |  ____|
    | |
-13 | |     if n == 0 {
-14 | |         out.len()
-15 | |     } else {
-16 | |         out.push(c);
-17 | |         stash(n - 1, &Chain::Cons(1, c), out)
+16 | |     if n == 0 {
+17 | |         out.len()
+18 | |     } else {
+19 | |         out.push(c);
+20 | |         stash(n - 1, &Chain::Cons(1, c), out)
    | |                       ^^^^^^^^^^^^^^^^^     -
    | |                       |                     |
    | |_______________________|_____________________temporary value is freed at the end of this statement

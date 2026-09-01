@@ -1,5 +1,5 @@
 error: `up` and `down` are mutually recursive, so they share one driver and must take the same `&mut` parameters (in any position); `up` takes [&mut Vec<u64>] and `down` takes []
- --> tests/ui/slot_mismatch.rs:9:9
-  |
-9 |     pub fn down(n: u64) -> u64 {
-  |         ^^
+  --> tests/ui/slot_mismatch.rs:12:9
+   |
+12 |     pub fn down(n: u64) -> u64 {
+   |         ^^

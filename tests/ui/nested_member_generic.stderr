@@ -1,5 +1,5 @@
 error: `step` is declared inside the body of a function it recurses with, so the driver they share has to be written outside that body — and the driver they share is generic, which a function declared in a body cannot be: it cannot name the parameters of the one hosting it. Move `step` out to the enclosing scope, where it can be a member like any other
- --> tests/ui/nested_member_generic.rs:5:8
+ --> tests/ui/nested_member_generic.rs:8:8
   |
-5 |     fn step(n: u64) -> u64 {
+8 |     fn step(n: u64) -> u64 {
   |        ^^^^

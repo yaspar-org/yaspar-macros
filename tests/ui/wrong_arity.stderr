@@ -1,5 +1,5 @@
 error: recursive call passes 2 of `f`'s 1 parameters
- --> tests/ui/wrong_arity.rs:5:28
+ --> tests/ui/wrong_arity.rs:8:28
   |
-5 |     if n == 0 { 0 } else { f(n - 1, 2) }
+8 |     if n == 0 { 0 } else { f(n - 1, 2) }
   |                            ^

@@ -1,5 +1,5 @@
 error: `#[stack_safe]` applies to a function, a module or an impl block: it has to see a body to know what recurses, and this item has none
- --> tests/ui/wrong_item.rs:4:1
+ --> tests/ui/wrong_item.rs:7:1
   |
-4 | struct NotAFunction(u64);
+7 | struct NotAFunction(u64);
   | ^^^^^^

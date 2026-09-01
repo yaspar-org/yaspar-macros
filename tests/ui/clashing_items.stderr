@@ -1,5 +1,5 @@
 error: `up` and `down` are mutually recursive, so their bodies become arms of one `match`, and an item a body declares is moved out to one place enclosing all the arms. Both declare `Local`, so it would be declared twice there. Rename one, or move it to the enclosing module
-  --> tests/ui/clashing_items.rs:11:16
+  --> tests/ui/clashing_items.rs:14:16
    |
-11 |         struct Local(u64);
+14 |         struct Local(u64);
    |                ^^^^^

@@ -2,6 +2,11 @@
 name = "yaspar-macros-defs"
 version = "0.1.0"
 edition = "2024"
-publish = false
 readme = "README.md"
+license = "Apache-2.0"
 description = "The fixed definitions that `yaspar-macros` expansions refer to: the step protocol, its driver, the pinned store, and a stable stand-in for `Try`."
+authors = ["the Amazon Trusted Solver team"]
+keywords = ["macros", "recursion", "stack"]
+categories = ["development-tools::procedural-macro-helpers", "rust-patterns"]
+homepage = "https://github.com/yaspar-org/yaspar-macros"
+repository = "https://github.com/yaspar-org/yaspar-macros"

@@ -1,5 +1,5 @@
 error: `up` is part of a mutually recursive group, and a group's members answer through one driver, so their return types have to be nameable. An `impl Trait` return is its own opaque type and cannot be named, not even to join it with another member's. Return a concrete type, or box it
- --> tests/ui/impl_trait_in_group.rs:5:23
+ --> tests/ui/impl_trait_in_group.rs:8:23
   |
-5 |     pub fn up(n: u64) -> impl Iterator<Item = u64> {
+8 |     pub fn up(n: u64) -> impl Iterator<Item = u64> {
   |                       ^

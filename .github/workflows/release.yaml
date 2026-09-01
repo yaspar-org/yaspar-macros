@@ -1,0 +1,45 @@
+name: Publish to crates.io
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: release  # Optional: for enhanced security
+    permissions:
+      id-token: write     # Required for OIDC token exchange
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Pinned by SHA, so the ref no longer names the toolchain: pass it explicitly.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+
+      # The tag triggers the release but `cargo publish` reads the version from the
+      # manifests, so a tag that disagrees with them would ship the wrong number.
+      - name: Check the tag matches both crate versions
+        run: |
+          tag=${GITHUB_REF_NAME#v}
+          mismatch=0
+          while read -r name version; do
+            if [[ $version != "$tag" ]]; then
+              echo "::error::$name is at $version but the tag says $tag"
+              mismatch=1
+            fi
+          done < <(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | "\(.name) \(.version)"')
+          exit $mismatch
+
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        id: auth
+
+      # Both crates ship together. `--workspace` uploads them in dependency order,
+      # which matters because `yaspar-macros` dev-depends on `yaspar-macros-defs` by
+      # version as well as by path: published one at a time, the macro crate would be
+      # rejected until the definitions crate had landed in the registry index.
+      - name: Publish
+        run: cargo publish --workspace
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
