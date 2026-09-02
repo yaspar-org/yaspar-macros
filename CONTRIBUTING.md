@@ -40,6 +40,28 @@ GitHub provides additional document on [forking a repository](https://help.githu
 [creating a pull request](https://help.github.com/articles/creating-a-pull-request/).
 
 
+### Changes to the `unsafe` emission paths
+
+Two `#[stack_safe]` options, `use_nonlinear_mut` and `data_in_frame`, expand to code containing `unsafe` blocks in the
+*consuming* crate, and the pinned store behind the second one hands out raw pointers. Their correctness rests on an
+invariant the compiler does not check, so those paths carry an extra bar. It applies to any change touching:
+
+* `src/stack_safe/context.rs` — the raw context-slot rebinding,
+* `src/stack_safe/emit.rs` — reading a lent value back out of the driver's store, or
+* `Pin` in `defs/src/lib.rs` — the pinned store's chunking, `push` or `truncate`.
+
+For a pull request touching any of those, we ask for both of the following:
+
+1. **The Miri matrix passes.** Both aliasing models, not just the default one. CI runs it on every pull request, and you
+   can reproduce it locally with the invocations in the README. A change that Miri cannot check — because no test
+   exercises the new path — needs a test that does.
+2. **A `SAFETY:` rationale in the pull request.** Say which invariant the change relies on and why it still holds, in the
+   description as well as in the `SAFETY:` comment at the emission site. "Miri is green" is evidence, not an argument:
+   Miri only covers the paths a test actually runs.
+
+Changes that add a *new* `unsafe` emission site, or a new option that reaches one, should be raised in an issue first.
+
+
 ## Finding contributions to work on
 Looking at the existing issues is a great way to find something to contribute on. As our projects, by default, use the default GitHub issue labels (enhancement/bug/duplicate/help wanted/invalid/question/wontfix), looking at any 'help wanted' issues is a great place to start.
 

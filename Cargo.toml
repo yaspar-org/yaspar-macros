@@ -16,6 +16,10 @@ keywords = ["macros", "recursion", "stack", "delegation"]
 categories = ["development-tools::procedural-macro-helpers", "rust-patterns"]
 homepage = "https://github.com/yaspar-org/yaspar-macros"
 repository = "https://github.com/yaspar-org/yaspar-macros"
+# `Config` is an internal Brazil package definition and has no business in a published
+# crate. It is not in the repository either; this keeps it out of the package even if a
+# local workspace tool puts one back.
+exclude = ["Config"]
 
 [lib]
 proc-macro = true
