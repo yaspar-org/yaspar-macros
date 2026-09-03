@@ -18,6 +18,9 @@ use super::context::CtxEntry;
 /// A place the driver can arrive at, whose payload is solved to a fixed point: a
 /// lowered loop's entry point, or a resume point after a recursive call.
 pub(super) struct PayloadPoint {
+    /// Which member's body this point came out of; one name can mean different types in two of
+    /// them.
+    pub(super) member: usize,
     /// Bindings in scope there, in declaration order. Threading state through a
     /// payload is a move, so the order must be stable.
     pub(super) scope: Vec<Ident>,
@@ -74,6 +77,8 @@ pub(super) struct Member {
     /// `: u64` per payload parameter, empty for an `impl Trait` one. Used to pin a
     /// payload argument hoisted to a temporary at the call site.
     pub(super) param_types: Vec<TokenStream>,
+    /// The same types without the colon, where the type is needed on its own.
+    pub(super) param_bare_types: Vec<TokenStream>,
 }
 
 pub(super) struct Ctx {
@@ -111,6 +116,14 @@ pub(super) struct Ctx {
     /// this instead, and each member's entry takes its own variant back out.
     pub(super) ret_union: Option<Ident>,
     pub(super) opts: Opts,
+    /// Which member's body is being lowered; one at a time, so one slot suffices.
+    pub(super) current: Cell<usize>,
+    /// Declared type of each annotated `let`, by `(member, name)`; `None` if bound
+    /// inconsistently. Re-applied where a payload slot carries that local.
+    pub(super) local_types: RefCell<HashMap<(usize, String), Option<TokenStream>>>,
+    /// `(loop index, element type)` per `for` loop over a borrow: the collection moves into the
+    /// store so the iterator borrows that, not a local the frame owns.
+    pub(super) loop_stores: RefCell<Vec<(usize, TokenStream)>>,
 }
 
 impl Ctx {
@@ -170,12 +183,82 @@ impl Ctx {
         self.members[member].param_pointees[position].clone()
     }
 
-    /// Every pinned position with the type its store holds, in slot order.
+    /// Each store's element type in slot order: parameter positions, then one per borrowing loop.
     pub(super) fn pin_elements(&self) -> Vec<Option<TokenStream>> {
-        self.pinned_positions()
+        let params = self
+            .pinned_positions()
             .iter()
             .map(|&(i, j)| self.pin_element(i, j))
-            .collect()
+            .collect::<Vec<_>>();
+        let loops = self
+            .loop_stores
+            .borrow()
+            .iter()
+            .map(|(_, elem)| Some(elem.clone()))
+            .collect::<Vec<_>>();
+        params.into_iter().chain(loops).collect()
+    }
+
+    /// Reserve a borrowing loop's store, returning its context-tuple index. The element type is
+    /// named here because `C` in `&mut C` settles before the closure body is checked.
+    pub(super) fn loop_store_slot(&self, loop_idx: usize, elem: TokenStream) -> syn::Index {
+        let mut stores = self.loop_stores.borrow_mut();
+        let at = match stores.iter().position(|(n, _)| *n == loop_idx) {
+            Some(at) => at,
+            None => {
+                stores.push((loop_idx, elem));
+                stores.len() - 1
+            }
+        };
+        syn::Index::from(self.context.len() + self.pinned_positions().len() + at)
+    }
+
+    /// Record an annotated `let` binding of the member being lowered.
+    pub(super) fn note_local_type(&self, name: &Ident, ty: TokenStream) {
+        let key = (self.current.get(), name.to_string());
+        let rendered = ty.to_string();
+        let mut map = self.local_types.borrow_mut();
+        match map.get(&key) {
+            // Shadowed with a different type: neither annotation describes the slot on its own.
+            Some(Some(seen)) if seen.to_string() != rendered => {
+                map.insert(key, None);
+            }
+            Some(_) => {}
+            None => {
+                map.insert(key, Some(ty));
+            }
+        }
+    }
+
+    /// A payload slot's type, from the signature or an annotated `let`.
+    pub(super) fn slot_type(&self, member: usize, name: &Ident) -> Option<TokenStream> {
+        self.param_type_of(member, name).or_else(|| {
+            self.local_types
+                .borrow()
+                .get(&(member, name.to_string()))
+                .cloned()
+                .flatten()
+        })
+    }
+
+    /// A payload parameter's declared type, if writable: not `impl Trait`, and not a pinned
+    /// position, whose slot holds a pointer instead.
+    pub(super) fn param_type_of(&self, member: usize, name: &Ident) -> Option<TokenStream> {
+        let member = &self.members[member];
+        let j = member.param_names.iter().position(|p| p == name)?;
+        if member.pinned[j].get() {
+            return None;
+        }
+        let bare = member.param_bare_types.get(j)?;
+        (!bare.is_empty()).then(|| bare.clone())
+    }
+
+    /// The declared type of a payload parameter of the member being lowered.
+    pub(super) fn current_param_type(&self, name: &Ident) -> Option<TokenStream> {
+        let member = &self.members[self.current.get()];
+        let j = member.param_names.iter().position(|p| p == name)?;
+        let bare = member.param_bare_types.get(j)?;
+        (!bare.is_empty()).then(|| bare.clone())
     }
 
     /// The context-tuple index of the store for one position. The stores sit after
@@ -198,11 +281,17 @@ impl Ctx {
     }
 
     /// Reserve an entry point for a loop; the code is filled in afterwards.
-    pub(super) fn reserve_loop(&self, scope: Vec<Ident>, iter: Option<Ident>) -> usize {
+    pub(super) fn reserve_loop(
+        &self,
+        scope: Vec<Ident>,
+        iter: Option<Ident>,
+        also_forced: Vec<Ident>,
+    ) -> usize {
         let mut loops = self.loops.borrow_mut();
         loops.push(PayloadPoint {
+            member: self.current.get(),
             scope,
-            forced: iter.into_iter().collect(),
+            forced: iter.into_iter().chain(also_forced).collect(),
             code: TokenStream::new(),
         });
         loops.len() - 1
@@ -269,6 +358,7 @@ impl Ctx {
         let mut resumes = self.resumes.borrow_mut();
         resumes.push(ResumePoint {
             point: PayloadPoint {
+                member: self.current.get(),
                 scope,
                 forced,
                 code: TokenStream::new(),
@@ -346,6 +436,9 @@ pub(super) struct Env<'a> {
     /// follow a swapped context slot: leaving without putting the parent's pointer
     /// back would strand the slot pointing at the child.
     pub(super) restores: TokenStream,
+    /// Stores to truncate before `?` or `return` abandons the member. Not `continue`, which stays
+    /// in the loop; `break` releases through the continuation instead.
+    pub(super) teardown: TokenStream,
     /// How this member's own result enters the union, when the group has one: the union
     /// type and this member's variant. `return` and `?` finish the member from wherever
     /// they stand, so they have to wrap the value just as a normal exit does.
@@ -381,17 +474,26 @@ impl<'a> Env<'a> {
             scope: self.scope.clone(),
             lp: Some(lp),
             restores: self.restores.clone(),
+            teardown: self.teardown.clone(),
             wrap: self.wrap.clone(),
         }
     }
 
     /// Evaluating an argument after a swap: an escape has to undo it first.
+    /// Add a truncation to run before `?` or `return` leaves the member.
+    pub(super) fn with_teardown(&self, extra: TokenStream) -> Env<'a> {
+        let mut teardown = self.teardown.clone();
+        teardown.extend(extra);
+        Env {
+            teardown,
+            ..self.clone()
+        }
+    }
+
     pub(super) fn with_restores(&self, restores: TokenStream) -> Env<'a> {
         Env {
-            scope: self.scope.clone(),
-            lp: self.lp,
             restores,
-            wrap: self.wrap.clone(),
+            ..self.clone()
         }
     }
 }

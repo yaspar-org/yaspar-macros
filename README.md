@@ -642,6 +642,10 @@ MIRIFLAGS="-Zmiri-strict-provenance" cargo +nightly miri test --test group \
     -- lend unsafe_options --skip _is_flat
 MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-strict-provenance" cargo +nightly miri test --test group \
     -- lend unsafe_options --skip _is_flat
+MIRIFLAGS="-Zmiri-strict-provenance" cargo +nightly miri test --test loops \
+    -- borrowed_loop_is_correct borrowed_loop_releases_on_break_and_question_mark
+MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-strict-provenance" cargo +nightly miri test --test loops \
+    -- borrowed_loop_is_correct borrowed_loop_releases_on_break_and_question_mark
 ```
 
 The two examples are runnable programs rather than tests, since one of them deliberately aborts:

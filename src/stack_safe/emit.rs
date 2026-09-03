@@ -49,6 +49,7 @@ fn split_params(func: &ItemFn) -> syn::Result<Split> {
     let mut param_anns_pinned: Vec<TokenStream> = Vec::new();
     let mut param_pointees: Vec<Option<TokenStream>> = Vec::new();
     let mut param_types: Vec<TokenStream> = Vec::new();
+    let mut param_bare_types: Vec<TokenStream> = Vec::new();
     let mut param_names = Vec::new();
     let mut context: Vec<CtxEntry> = Vec::new();
     let mut context_at: HashMap<usize, usize> = HashMap::new();
@@ -111,6 +112,11 @@ fn split_params(func: &ItemFn) -> syn::Result<Split> {
                     } else {
                         quote! { : #ty }
                     });
+                    param_bare_types.push(if matches!(&**ty, syn::Type::ImplTrait(_)) {
+                        TokenStream::new()
+                    } else {
+                        quote! { #ty }
+                    });
                     param_pointees.push(match &**ty {
                         syn::Type::Reference(r) => {
                             let elem = &r.elem;
@@ -167,6 +173,7 @@ fn split_params(func: &ItemFn) -> syn::Result<Split> {
             param_anns,
             param_anns_pinned,
             param_types,
+            param_bare_types,
         },
         slot_types,
     })
@@ -860,6 +867,9 @@ fn analyse(funcs: &[ItemFn], opts: Opts, assoc: bool) -> syn::Result<Ctx> {
         rets: rets.clone(),
         ret_union: ret_union.clone(),
         opts,
+        current: Cell::new(0),
+        local_types: RefCell::new(HashMap::new()),
+        loop_stores: RefCell::new(Vec::new()),
     };
 
     for func in funcs {
@@ -934,12 +944,16 @@ fn member_arms(ctx: &Ctx, funcs: &[ItemFn]) -> syn::Result<(Vec<Item>, Vec<Token
             scope: ctx.member(i).param_names.clone(),
             lp: None,
             restores: TokenStream::new(),
+            teardown: TokenStream::new(),
         };
         // Each member's own result enters the union under its own variant.
         let done = |v: TokenStream| -> syn::Result<TokenStream> {
             let v = ctx.wrap_result(i, v);
             Ok(quote! { #step::Done(#v) })
         };
+        ctx.current.set(i);
+        // Before rewriting: a `let` annotation is the only type the transform has for a local.
+        note_annotated_lets(ctx, &func.block);
         let arm = cps_stmts(ctx, &env, &stmts, &done)?;
         let variant = entry_variant(i);
         let pats = &ctx.member(i).param_pats;
@@ -1042,10 +1056,16 @@ pub(super) fn expand_group(
 
     let mut subst = HashMap::new();
     for (n, st) in states.iter().enumerate() {
-        subst.insert(state_marker(n).to_string(), quote! { #(#st,)* });
+        subst.insert(
+            state_marker(n).to_string(),
+            payload_expr(&ctx, loops[n].member, st),
+        );
     }
     for (r, fr) in frames.iter().enumerate() {
-        subst.insert(frame_marker(r).to_string(), quote! { #(#fr,)* });
+        subst.insert(
+            frame_marker(r).to_string(),
+            payload_expr(&ctx, resumes[r].point.member, fr),
+        );
     }
 
     let frame = frame_ty();
@@ -1224,4 +1244,102 @@ pub(super) fn expand_group(
         });
     }
     Ok((out, TokenStream::new()))
+}
+
+/// A payload tuple's contents, each slot given its declared type where one is known.
+///
+/// The entry and frame enums are generic over one parameter per variant and are built only inside
+/// the driver's closure, whose parameter types settle before its body is checked. So a slot with
+/// nothing outside to pin it cannot be inferred, and rustc reports `type annotations needed` at
+/// some unrelated-looking use in the user's body.
+fn payload_expr(ctx: &Ctx, member: usize, ids: &[Ident]) -> TokenStream {
+    let parts = ids.iter().map(|id| match ctx.slot_type(member, id) {
+        Some(ty) => quote! { { let __ss_slot: #ty = #id; __ss_slot }, },
+        None => quote! { #id, },
+    });
+    quote! { #(#parts)* }
+}
+
+/// Record the type of each local annotated *everywhere* it is bound, so [`payload_expr`] can
+/// name its slot.
+///
+/// Every binding of a name must agree: one `let n: &str` beside a plain `let n = String::new()`
+/// would otherwise put the first type on the second's slot. So a `for` pattern, an `if let`, a
+/// match arm, a plain `let`, or a disagreeing annotation all rule the name out.
+fn note_annotated_lets(ctx: &Ctx, block: &syn::Block) {
+    use std::collections::HashSet;
+
+    #[derive(Default)]
+    struct Found {
+        annotated: HashMap<String, Vec<(String, TokenStream)>>,
+        poisoned: HashSet<String>,
+    }
+
+    struct V(Found);
+
+    impl V {
+        fn poison(&mut self, pat: &Pat) {
+            for id in super::analyze::pat_bindings(pat) {
+                self.0.poisoned.insert(id.to_string());
+            }
+        }
+    }
+
+    impl syn::visit::Visit<'_> for V {
+        fn visit_local(&mut self, local: &syn::Local) {
+            match &local.pat {
+                Pat::Type(pt) if matches!(&*pt.pat, Pat::Ident(_)) => {
+                    let Pat::Ident(id) = &*pt.pat else {
+                        unreachable!("matched just above")
+                    };
+                    let ty = &pt.ty;
+                    let ty = quote! { #ty };
+                    self.0
+                        .annotated
+                        .entry(id.ident.to_string())
+                        .or_default()
+                        .push((ty.to_string(), ty));
+                }
+                other => self.poison(other),
+            }
+            syn::visit::visit_local(self, local);
+        }
+
+        fn visit_expr_for_loop(&mut self, f: &syn::ExprForLoop) {
+            self.poison(&f.pat);
+            syn::visit::visit_expr_for_loop(self, f);
+        }
+
+        fn visit_expr_let(&mut self, l: &syn::ExprLet) {
+            self.poison(&l.pat);
+            syn::visit::visit_expr_let(self, l);
+        }
+
+        fn visit_arm(&mut self, a: &syn::Arm) {
+            self.poison(&a.pat);
+            syn::visit::visit_arm(self, a);
+        }
+
+        // A nested item has its own bindings and its own scope; it is not part of this body.
+        fn visit_item(&mut self, _: &syn::Item) {}
+    }
+
+    let mut v = V(Found::default());
+    syn::visit::Visit::visit_block(&mut v, block);
+    let Found {
+        annotated,
+        poisoned,
+    } = v.0;
+    for (name, tys) in annotated {
+        if poisoned.contains(&name) {
+            continue;
+        }
+        let first = &tys[0].0;
+        if tys.iter().all(|(rendered, _)| rendered == first) {
+            ctx.note_local_type(
+                &format_ident!("{}", name),
+                tys.into_iter().next().expect("non-empty").1,
+            );
+        }
+    }
 }
