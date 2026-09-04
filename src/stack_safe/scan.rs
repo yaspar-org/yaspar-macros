@@ -27,6 +27,7 @@
 use proc_macro2::{Ident, TokenStream};
 use quote::{ToTokens, quote};
 use std::collections::HashMap;
+use syn::visit_mut::VisitMut;
 use syn::{FnArg, ItemFn, ItemImpl, ItemMod};
 
 use super::Opts;
@@ -325,6 +326,130 @@ fn agreed_opts(defs: &[scope::Def], cycle: &[usize]) -> syn::Result<Opts> {
         }
     }
     Ok(opts)
+}
+
+/// Expand every module and impl block declared in this body, deepest scope first, and report
+/// whether there was one.
+///
+/// A body is a scope of item definitions like any other, so it may hold a container, and a
+/// recursion inside that container is exactly as invisible to the native stack as one anywhere
+/// else. It is handed to the same one entry a container declared in a module is, and what comes
+/// back is written where it stood. `thread_out` is false: nothing outside the body could name the
+/// container's functions anyway.
+///
+/// A marker of its own says what that subtree wants, in full, exactly as one on a `fn` does.
+fn expand_nested_containers(func: &mut ItemFn, opts: Opts) -> syn::Result<bool> {
+    struct V {
+        opts: Opts,
+        found: bool,
+        failed: Option<syn::Error>,
+    }
+
+    impl V {
+        /// The tokens a nested container expands to, or `None` for an item that is not one.
+        fn expanded(&mut self, item: &syn::Item) -> syn::Result<Option<TokenStream>> {
+            match item {
+                // A module with no body is rejected by the compiler before the tokens ever reach
+                // here: a file module in proc-macro input is unstable.
+                syn::Item::Mod(inner) if inner.content.is_some() => {
+                    let mut inner = inner.clone();
+                    let own = Opts::take_from(&mut inner.attrs)?;
+                    Scope::of_mod(inner)?
+                        .expand(own.unwrap_or(self.opts), false)
+                        .map(Some)
+                }
+                syn::Item::Impl(inner) => {
+                    let mut inner = inner.clone();
+                    let own = Opts::take_from(&mut inner.attrs)?;
+                    Scope::of_impl(inner)?
+                        .expand(own.unwrap_or(self.opts), false)
+                        .map(Some)
+                }
+                _ => Ok(None),
+            }
+        }
+    }
+
+    impl VisitMut for V {
+        fn visit_item_mut(&mut self, item: &mut syn::Item) {
+            if let syn::Item::Fn(inner) = item {
+                // A function declared here is a scope of its own, and its body may hold a container
+                // too.
+                self.visit_block_mut(&mut inner.block);
+                return;
+            }
+            match self.expanded(item) {
+                // The first failure wins, as it would if this returned a `Result`.
+                Err(e) => self.failed = self.failed.take().or(Some(e)),
+                Ok(None) => {}
+                Ok(Some(tokens)) => {
+                    self.found = true;
+                    *item = syn::Item::Verbatim(tokens);
+                }
+            }
+        }
+    }
+
+    let mut v = V {
+        opts,
+        found: false,
+        failed: None,
+    };
+    v.visit_block_mut(&mut func.block);
+    match v.failed {
+        Some(e) => Err(e),
+        None => Ok(v.found),
+    }
+}
+
+/// Refuse a recursion the scan can see and the transform cannot rewrite.
+///
+/// A call written through a path that says what it names but is not one of the shapes the rewriter
+/// follows — `T::g(..)` inside `impl T`, `<Self>::g(..)`, `crate::m::g(..)` inside `#[stack_safe]
+/// mod m` — cannot become an entry into a driver. Treating it as one anyway would emit a function
+/// whose other calls are flattened and whose this one still descends natively, so it is reported
+/// instead, and only where it matters: such a call closes a cycle nothing else in the graph closes.
+/// One that merely reaches a function of this scope, recursion or no recursion, is an ordinary call
+/// and stays one.
+fn unresolvable_recursion(
+    defs: &[scope::Def],
+    edges: &[Vec<bool>],
+    reaches: &[Vec<bool>],
+    blocked: &[scope::Blocked],
+    assoc: bool,
+) -> syn::Result<()> {
+    if blocked.is_empty() {
+        return Ok(());
+    }
+    // The graph as it would be if every one of these calls were an edge, which is what says whether
+    // one of them is what makes a cycle a cycle.
+    let mut optimistic = edges.to_vec();
+    for b in blocked {
+        optimistic[b.caller][b.callee] = true;
+    }
+    let optimistic = scope::closure(&optimistic);
+
+    for b in blocked {
+        if !optimistic[b.callee][b.caller] || reaches[b.caller][b.callee] {
+            continue;
+        }
+        let callee = &defs[b.callee].name;
+        let forms = match assoc {
+            true => format!("`Self::{callee}(..)` or `self.{callee}(..)`"),
+            false => format!("`{callee}(..)` or `self::{callee}(..)`"),
+        };
+        return Err(syn::Error::new(
+            b.span,
+            format!(
+                "`{callee}` is called through the path `{}`, which `#[stack_safe]` cannot rewrite: \
+                 a macro resolves no paths, so it recognises a call to something in its scope only \
+                 by the shape of it, and this call is part of a cycle it would otherwise have to \
+                 leave on the native stack. Write it as {forms}",
+                b.path,
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn expand_roots(roots: Roots<'_>) -> syn::Result<Scanned> {
