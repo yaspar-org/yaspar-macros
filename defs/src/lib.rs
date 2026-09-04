@@ -14,11 +14,15 @@
 //! - [`Pin`], the store for values a call site lends its callee, under
 //!   `#[stack_safe(data_in_frame)]`;
 //! - [`Try`] and [`FromResidual`], a stable stand-in for the unstable traits of the
-//!   same names, so that `?` works on a `Result` and on an `Option` alike.
+//!   same names, so that `?` works on a `Result`, an `Option` and a `ControlFlow` alike.
 //!
-//! Nothing here is meant to be named by hand. It is `pub` because the expansions refer
-//! to it by path, and the items are documented because a reader of an expansion should
-//! be able to find out what they do.
+//! Nothing here is meant to be named by hand, with one exception: [`Try`] and
+//! [`FromResidual`] are the extension point for `?` on a carrier of one's own, since a
+//! macro that aims at stable cannot use the real traits. Implementing the pair for a
+//! local type is all it takes — see their own documentation.
+//!
+//! Everything is `pub` because the expansions refer to it by path, and the items are
+//! documented because a reader of an expansion should be able to find out what they do.
 
 #![no_std]
 
@@ -165,14 +169,50 @@ pub struct ResultErr<E>(pub E);
 /// The residual of an `Option`, which carries nothing.
 pub struct OptionNone;
 
+/// The residual of a `ControlFlow`: the value it broke with.
+pub struct ControlFlowBreak<B>(pub B);
+
 /// `core::ops::Try::branch`, on stable.
 ///
 /// `?` has to be desugared by hand, because it returns early and every early exit has to
 /// become `Step::Done` instead. The obvious desugaring hardcodes `Ok` / `Err` /
 /// `From::from`, which is wrong for an `Option`; the real one goes through `Try` and
 /// `FromResidual`, which are unstable. This pair stands in for them, with one impl per
-/// carrier. A type with a hand-written `Try` impl is therefore still unsupported: the
-/// error is a missing-impl one naming this trait by path.
+/// carrier: `Result`, `Option` and `ControlFlow`, as in `core`.
+///
+/// # A carrier of your own
+///
+/// This trait and [`FromResidual`] are ordinary public traits, neither sealed nor
+/// blanket-implemented, so a carrier of your own joins by implementing both — the orphan
+/// rule is satisfied because the carrier is your type. `?` on it then works inside a
+/// `#[stack_safe]` body, on the value path and on the early exit alike:
+///
+/// ```
+/// use yaspar_macros_defs::{FromResidual, Try};
+///
+/// enum Maybe<T> { Just(T), Nothing }
+/// struct NothingLeft;
+///
+/// impl<T> Try for Maybe<T> {
+///     type Output = T;
+///     type Residual = NothingLeft;
+///     fn branch(self) -> Result<T, NothingLeft> {
+///         match self {
+///             Maybe::Just(v) => Ok(v),
+///             Maybe::Nothing => Err(NothingLeft),
+///         }
+///     }
+/// }
+///
+/// impl<T> FromResidual<NothingLeft> for Maybe<T> {
+///     fn from_residual(_: NothingLeft) -> Self { Maybe::Nothing }
+/// }
+/// ```
+///
+/// What you cannot do is reuse an existing `core::ops::Try` impl: a blanket impl over it
+/// would need that unstable trait, so a carrier that already supports `?` outside a
+/// `#[stack_safe]` body still needs the pair above to support it inside one. Without
+/// them the error is a missing-impl one naming this trait by path.
 pub trait Try {
     type Output;
     type Residual;
@@ -205,6 +245,19 @@ impl<T> Try for Option<T> {
     }
 }
 
+impl<B, C> Try for core::ops::ControlFlow<B, C> {
+    type Output = C;
+    type Residual = ControlFlowBreak<B>;
+
+    #[inline]
+    fn branch(self) -> Result<C, ControlFlowBreak<B>> {
+        match self {
+            core::ops::ControlFlow::Continue(c) => Ok(c),
+            core::ops::ControlFlow::Break(b) => Err(ControlFlowBreak(b)),
+        }
+    }
+}
+
 /// `core::ops::FromResidual::from_residual`, on stable.
 ///
 /// `Self` is the *function's* return type, which the driver's annotated `let` pins, so
@@ -227,5 +280,12 @@ impl<T> FromResidual<OptionNone> for Option<T> {
     #[inline]
     fn from_residual(_: OptionNone) -> Self {
         None
+    }
+}
+
+impl<B, C> FromResidual<ControlFlowBreak<B>> for core::ops::ControlFlow<B, C> {
+    #[inline]
+    fn from_residual(r: ControlFlowBreak<B>) -> Self {
+        core::ops::ControlFlow::Break(r.0)
     }
 }
