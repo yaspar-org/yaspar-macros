@@ -1,0 +1,24 @@
+error: `#[delegate_trait]` for `Pair`: the impl block passes the wrong number of generic arguments; `Pair` takes 2
+  --> tests/ui/delegate_wrong_generic_arity.rs:13:1
+   |
+13 | #[delegatable_trait]
+   | ^^^^^^^^^^^^^^^^^^^^
+...
+34 | #[delegate_trait(target = inner)]
+   | --------------------------------- in this attribute macro expansion
+   |
+   = note: this error originates in the macro `__delegate_impl_Pair` which comes from the expansion of the attribute macro `delegate_trait` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0107]: trait takes at most 2 generic arguments but 3 generic arguments were supplied
+  --> tests/ui/delegate_wrong_generic_arity.rs:35:6
+   |
+35 | impl Pair<u8, u16, u32> for Wrapper {}
+   |      ^^^^        ----- help: remove the unnecessary generic argument
+   |      |
+   |      expected at most 2 generic arguments
+   |
+note: trait defined here, with at most 2 generic parameters: `A`, `B`
+  --> tests/ui/delegate_wrong_generic_arity.rs:14:7
+   |
+14 | trait Pair<A, B = u16> {
+   |       ^^^^ -  -------
