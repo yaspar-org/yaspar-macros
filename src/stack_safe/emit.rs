@@ -14,7 +14,8 @@ use syn::{FnArg, Item, ItemFn, Pat, PatIdent, ReturnType, Stmt};
 
 use super::Opts;
 use super::analyze::{
-    MethodSplit, desugar_receiver, scan_context_args, scan_pinned_args, validate,
+    MethodSplit, desugar_apit, desugar_receiver, reject_generic_payload, scan_context_args,
+    scan_pinned_args, validate,
 };
 use super::context::CtxEntry;
 use super::cps::cps_stmts;
@@ -456,6 +457,10 @@ struct Pieces<'a> {
     ctx_inits: &'a [TokenStream],
     /// `: R`, naming the driver's result type.
     ret_ann: &'a TokenStream,
+    /// Names the entry type parameters the macro knows, outside the closure.
+    anchor: &'a TokenStream,
+    /// `: In<_, Frame<..>, _>`, naming the frame type parameters on the closure's parameter.
+    input_ann: &'a TokenStream,
     /// The union of the members' return types, when they differ. It is named by the
     /// shared machine's own signature, so it cannot live inside it.
     ret_union_decl: &'a TokenStream,
@@ -483,6 +488,8 @@ fn lifted(
         allows,
         arms,
         ctx_inits,
+        anchor,
+        input_ann,
         ret_ann,
         ret_union_decl,
     } = pieces;
@@ -663,10 +670,11 @@ fn lifted(
             let (mut #ctxp, __ss_entry) = match __ss_seed {
                 #(#dispatch)*
             };
+            #anchor
             let __ss_out #ret_ann = #drive(
                 &mut #ctxp,
                 __ss_entry,
-                |#ctxp, __ss_input| match __ss_input { #(#arms)* },
+                |#ctxp, __ss_input #input_ann| match __ss_input { #(#arms)* },
             );
             __ss_out
         }
@@ -872,7 +880,12 @@ fn analyse(funcs: &[ItemFn], opts: Opts, assoc: bool) -> syn::Result<Ctx> {
         loop_stores: RefCell::new(Vec::new()),
     };
 
-    for func in funcs {
+    reject_generic_payload(&ctx, funcs)?;
+
+    for (i, func) in funcs.iter().enumerate() {
+        // Before the scans: whether a borrowed local is owned here is judged from its annotation.
+        ctx.current.set(i);
+        note_annotated_lets(&ctx, &func.block);
         validate(&ctx, &func.block)?;
         // Must run before any code is generated: it decides which slots are raw,
         // which every context rebinding depends on.
@@ -952,8 +965,6 @@ fn member_arms(ctx: &Ctx, funcs: &[ItemFn]) -> syn::Result<(Vec<Item>, Vec<Token
             Ok(quote! { #step::Done(#v) })
         };
         ctx.current.set(i);
-        // Before rewriting: a `let` annotation is the only type the transform has for a local.
-        note_annotated_lets(ctx, &func.block);
         let arm = cps_stmts(ctx, &env, &stmts, &done)?;
         let variant = entry_variant(i);
         let pats = &ctx.member(i).param_pats;
@@ -999,6 +1010,9 @@ pub(super) fn expand_group(
     let group_names: Vec<Ident> = funcs.iter().map(|f| f.sig.ident.clone()).collect();
     let mut methods: Vec<Option<MethodSplit>> = Vec::with_capacity(funcs.len());
     for func in &mut funcs {
+        // Before anything reads a signature: an `impl Trait` parameter becomes the generic it
+        // already is, so its type has a name the payload can be pinned with.
+        desugar_apit(func);
         methods.push(desugar_receiver(func, &group_names)?);
     }
 
@@ -1054,17 +1068,24 @@ pub(super) fn expand_group(
     let resumes = ctx.resumes.take();
     let (states, frames) = solve_payloads(&loops, &resumes);
 
+    // The seed lifetime only exists in the lifted path, and only when some member takes a
+    // reference: elsewhere an elided `&` in a slot annotation stays elided.
+    let seed_lt = lift
+        && ctx
+            .members
+            .iter()
+            .any(|m| m.param_pointees.iter().any(Option::is_some));
     let mut subst = HashMap::new();
     for (n, st) in states.iter().enumerate() {
         subst.insert(
             state_marker(n).to_string(),
-            payload_expr(&ctx, loops[n].member, st),
+            payload_expr(&ctx, loops[n].member, st, self_ty, seed_lt),
         );
     }
     for (r, fr) in frames.iter().enumerate() {
         subst.insert(
             frame_marker(r).to_string(),
-            payload_expr(&ctx, resumes[r].point.member, fr),
+            payload_expr(&ctx, resumes[r].point.member, fr, self_ty, seed_lt),
         );
     }
 
@@ -1107,6 +1128,32 @@ pub(super) fn expand_group(
         .collect();
     let frame_variants: Vec<Ident> = (0..resumes.len()).map(frame_variant).collect();
     let ctxp = ctx_param();
+
+    // The dispatch builds only the member entries, so a loop state's or a frame's type parameter is
+    // still an inference variable when the closure's own type is settled -- and a closure's
+    // parameter types are settled before its body is checked, so no construction inside can pin
+    // them. Naming here, outside the closure, what the macro knows: `_` stands for a variant whose
+    // payload has a slot no annotation reached.
+    let anchor = {
+        let entry_args = (0..total_entries)
+            .map(|n| variant_payload_type(&ctx, n, &loops, &states, self_ty, seed_lt));
+        let entry_ty_name = entry_ty();
+        quote! { let _: &#entry_ty_name<#(#entry_args),*> = &__ss_entry; }
+    };
+    // A frame has no value outside the closure to hang an ascription on, so its slots are named
+    // on the closure's parameter instead. Without this a slot whose only use constrains nothing
+    // -- `{x:?}` asks for `Debug` and no more -- stays ambiguous.
+    let input_ann = if resumes.is_empty() {
+        TokenStream::new()
+    } else {
+        let frame_args = frames
+            .iter()
+            .enumerate()
+            .map(|(r, fr)| slots_payload_type(&ctx, resumes[r].point.member, fr, self_ty, seed_lt));
+        let input_ty_name = input_ty();
+        let frame_ty_name = frame_ty();
+        quote! { : #input_ty_name<_, #frame_ty_name<#(#frame_args),*>, _> }
+    };
 
     let defs_imports = defs_imports();
     let ret_union_decl = match &ctx.ret_union {
@@ -1158,6 +1205,8 @@ pub(super) fn expand_group(
             allows: &allows,
             arms: &arms,
             ctx_inits: &ctx_inits,
+            anchor: &anchor,
+            input_ann: &input_ann,
             ret_ann: &ctx.ret_ann,
             ret_union_decl: &ret_union_decl,
         };
@@ -1237,7 +1286,7 @@ pub(super) fn expand_group(
                 let __ss_out #ret_ann = #drive(
                     &mut #ctxp,
                     #entry::#variant((#(#seed,)*)),
-                    |#ctxp, __ss_input| match __ss_input { #(#arms)* },
+                    |#ctxp, __ss_input #input_ann| match __ss_input { #(#arms)* },
                 );
                 #take_out
             }
@@ -1252,9 +1301,26 @@ pub(super) fn expand_group(
 /// the driver's closure, whose parameter types settle before its body is checked. So a slot with
 /// nothing outside to pin it cannot be inferred, and rustc reports `type annotations needed` at
 /// some unrelated-looking use in the user's body.
-fn payload_expr(ctx: &Ctx, member: usize, ids: &[Ident]) -> TokenStream {
+fn payload_expr(
+    ctx: &Ctx,
+    member: usize,
+    ids: &[Ident],
+    self_ty: Option<&syn::Type>,
+    seed_lt: bool,
+) -> TokenStream {
     let parts = ids.iter().map(|id| match ctx.slot_type(member, id) {
-        Some(ty) => quote! { { let __ss_slot: #ty = #id; __ss_slot }, },
+        // An elided reference is given the seed lifetime where there is one: a slot holding a
+        // reborrow of a reference parameter has no other name for that lifetime.
+        Some(ty) => {
+            let ty = match (seed_lt, syn::parse2::<syn::Type>(ty.clone())) {
+                (true, Ok(parsed)) => {
+                    let named = seed_field_type(&parsed, self_ty);
+                    quote! { #named }
+                }
+                _ => ty,
+            };
+            quote! { { let __ss_slot: #ty = #id; __ss_slot }, }
+        }
         None => quote! { #id, },
     });
     quote! { #(#parts)* }
@@ -1266,6 +1332,33 @@ fn payload_expr(ctx: &Ctx, member: usize, ids: &[Ident]) -> TokenStream {
 /// Every binding of a name must agree: one `let n: &str` beside a plain `let n = String::new()`
 /// would otherwise put the first type on the second's slot. So a `for` pattern, an `if let`, a
 /// match arm, a plain `let`, or a disagreeing annotation all rule the name out.
+/// The type of an initialiser that names itself, so a `let` without an annotation still tells the
+/// transform what its local holds.
+fn self_typing(e: &syn::Expr) -> Option<TokenStream> {
+    match e {
+        syn::Expr::Cast(c) => {
+            let ty = &c.ty;
+            Some(quote! { #ty })
+        }
+        syn::Expr::Lit(l) => match &l.lit {
+            syn::Lit::Int(i) if !i.suffix().is_empty() => {
+                let ty = format_ident!("{}", i.suffix());
+                Some(quote! { #ty })
+            }
+            syn::Lit::Float(f) if !f.suffix().is_empty() => {
+                let ty = format_ident!("{}", f.suffix());
+                Some(quote! { #ty })
+            }
+            syn::Lit::Bool(_) => Some(quote! { bool }),
+            syn::Lit::Char(_) => Some(quote! { char }),
+            _ => None,
+        },
+        syn::Expr::Group(g) => self_typing(&g.expr),
+        syn::Expr::Paren(p) => self_typing(&p.expr),
+        _ => None,
+    }
+}
+
 fn note_annotated_lets(ctx: &Ctx, block: &syn::Block) {
     use std::collections::HashSet;
 
@@ -1300,6 +1393,15 @@ fn note_annotated_lets(ctx: &Ctx, block: &syn::Block) {
                         .or_default()
                         .push((ty.to_string(), ty));
                 }
+                Pat::Ident(id) => match local.init.as_ref().and_then(|i| self_typing(&i.expr)) {
+                    Some(ty) => self
+                        .0
+                        .annotated
+                        .entry(id.ident.to_string())
+                        .or_default()
+                        .push((ty.to_string(), ty)),
+                    None => self.poison(&local.pat),
+                },
                 other => self.poison(other),
             }
             syn::visit::visit_local(self, local);
@@ -1341,5 +1443,68 @@ fn note_annotated_lets(ctx: &Ctx, block: &syn::Block) {
                 tys.into_iter().next().expect("non-empty").1,
             );
         }
+    }
+}
+
+/// The payload type of one entry variant, with `_` for any slot the macro cannot name.
+///
+/// A member's variant carries that member's payload parameters; a lowered loop's carries the
+/// locals its state threads.
+fn variant_payload_type(
+    ctx: &Ctx,
+    variant: usize,
+    loops: &[super::walk::PayloadPoint],
+    states: &[Vec<Ident>],
+    self_ty: Option<&syn::Type>,
+    seed_lt: bool,
+) -> TokenStream {
+    let members = ctx.members.len();
+    if variant < members {
+        let member = ctx.member(variant);
+        let tys = (0..member.param_names.len()).map(|j| {
+            let known = match member.pinned[j].get() {
+                // The slot holds a pointer into the driver's store, not the parameter's own type.
+                true => member.param_pointees[j]
+                    .clone()
+                    .map(|elem| quote! { *const #elem }),
+                false => member
+                    .param_bare_types
+                    .get(j)
+                    .filter(|bare| !bare.is_empty())
+                    .map(|bare| named(bare.clone(), self_ty, seed_lt)),
+            };
+            known.unwrap_or_else(|| quote! { _ })
+        });
+        return quote! { (#(#tys,)*) };
+    }
+    let n = variant - members;
+    slots_payload_type(ctx, loops[n].member, &states[n], self_ty, seed_lt)
+}
+
+/// The payload type of a tuple of slots, with `_` for any slot the macro cannot name.
+fn slots_payload_type(
+    ctx: &Ctx,
+    member: usize,
+    ids: &[Ident],
+    self_ty: Option<&syn::Type>,
+    seed_lt: bool,
+) -> TokenStream {
+    let tys = ids.iter().map(|id| match ctx.slot_type(member, id) {
+        Some(ty) => named(ty, self_ty, seed_lt),
+        // A slot no annotation reached -- a generated loop iterator, say -- is left to inference;
+        // naming the others is what pins the rest of the tuple.
+        None => quote! { _ },
+    });
+    quote! { (#(#tys,)*) }
+}
+
+/// A slot type with its elided references named, where there is a seed lifetime to name them with.
+fn named(ty: TokenStream, self_ty: Option<&syn::Type>, seed_lt: bool) -> TokenStream {
+    match (seed_lt, syn::parse2::<syn::Type>(ty.clone())) {
+        (true, Ok(parsed)) => {
+            let ty = seed_field_type(&parsed, self_ty);
+            quote! { #ty }
+        }
+        _ => ty,
     }
 }

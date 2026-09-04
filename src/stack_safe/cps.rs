@@ -210,7 +210,7 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
                     let j = payload.len();
                     if ctx.member(callee).pinned[j].get() {
                         let pin = ctx.pin_slot(callee, j);
-                        payload.push(match borrows_a_built_value(arg) {
+                        payload.push(match borrows_a_built_value(ctx, ctx.current.get(), arg) {
                             Some(built) => {
                                 if !pinned_slots.contains(&pin) {
                                     pinned_slots.push(pin.clone());
