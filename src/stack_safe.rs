@@ -80,8 +80,7 @@
 //! `#[stack_safe(use_nonlinear_mut)]`, under which such a slot holds a raw
 //! pointer. See `README.md` for the invariant that opt-in asks of the caller.
 
-use proc_macro2::{Ident, TokenStream};
-use syn::ItemFn;
+use proc_macro2::{Ident, TokenStream, TokenTree};
 use syn::spanned::Spanned;
 
 mod analyze;
@@ -105,7 +104,52 @@ mod walk;
 /// recursion needs — expanding `f` requires `g`'s body — and a single function is just a
 /// container of one.
 pub fn expand_attr(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> {
+    already_expanded(&item)?;
     scan::Scope::parse(item)?.expand(Opts::parse(attr)?, true)
+}
+
+/// Refuse an item that is already an expansion of this very attribute.
+///
+/// A marker inside a scope the attribute covers is recognised *by name*, since a macro resolves no
+/// paths — so one written under an alias (`use yaspar_macros::stack_safe as ss;` then `#[ss]`) is
+/// left where it stands, and the compiler runs it a second time on the body the first run rewrote.
+/// Everything that run generated is `__ss`-prefixed, which nothing the user wrote may be, so
+/// finding such a name in the input says exactly that. Reported here rather than left to whatever
+/// the second run happens to make of an already-transformed body.
+fn already_expanded(item: &TokenStream) -> syn::Result<()> {
+    fn generated(tokens: TokenStream) -> Option<Ident> {
+        for tt in tokens {
+            match tt {
+                TokenTree::Ident(id)
+                    if id.to_string().starts_with("__ss") || id.to_string().starts_with("__Ss") =>
+                {
+                    return Some(id);
+                }
+                TokenTree::Group(g) => {
+                    if let Some(found) = generated(g.stream()) {
+                        return Some(found);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    match generated(item.clone()) {
+        None => Ok(()),
+        Some(id) => Err(syn::Error::new(
+            id.span(),
+            format!(
+                "`#[stack_safe]` has already rewritten this item: `{id}` is one of the names it \
+                 generates. A marker inside a scope this attribute covers is recognised by name \
+                 only, since a macro resolves no paths, so an alias — `use \
+                 yaspar_macros::stack_safe as ss;` and then `#[ss]` — is not recognised, is left \
+                 in place, and runs again on the rewritten body. Write the inner marker as \
+                 `#[stack_safe(..)]` or `#[yaspar_macros::stack_safe(..)]`"
+            ),
+        )),
+    }
 }
 
 /// `#[stack_safe(..)]` flags.
@@ -122,68 +166,148 @@ pub(super) struct Opts {
     pub(super) data_in_frame: bool,
 }
 
+/// Every option there is, in the order an error message lists them.
+const FLAGS: [&str; 2] = ["use_nonlinear_mut", "data_in_frame"];
+
+/// An option this attribute does not have, with the nearest one it does named where there is one.
+///
+/// A typo is the usual reason to be here, and the list alone leaves the reader to spot which of
+/// them they meant to write.
+fn unknown_flag(path: &syn::Path) -> syn::Error {
+    let written = path
+        .get_ident()
+        .map(Ident::to_string)
+        .unwrap_or_else(|| quote::ToTokens::to_token_stream(path).to_string());
+    let hint = match nearest(&written) {
+        Some(flag) => format!(" — did you mean `{flag}`?"),
+        None => String::new(),
+    };
+    syn::Error::new(
+        path.span(),
+        format!(
+            "unknown `#[stack_safe]` option `{written}`; the options are `{}` and `{}`{hint}",
+            FLAGS[0], FLAGS[1],
+        ),
+    )
+}
+
+/// The option this was most likely meant to be, if any is close enough.
+///
+/// Levenshtein distance, bounded at a third of the option's length, so a genuinely different word
+/// gets no suggestion at all: `data_in_fram` is `data_in_frame` mistyped, and `keep_frames` is not.
+fn nearest(written: &str) -> Option<&'static str> {
+    fn distance(a: &str, b: &str) -> usize {
+        let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+        // One row of the matrix at a time: `row[j]` is the distance from `a[..i]` to `b[..j]`.
+        let mut row: Vec<usize> = (0..=b.len()).collect();
+        for (i, ca) in a.iter().enumerate() {
+            let mut prev = row[0];
+            row[0] = i + 1;
+            for (j, cb) in b.iter().enumerate() {
+                let cost = usize::from(ca != cb);
+                let next = (row[j] + 1).min(row[j + 1] + 1).min(prev + cost);
+                prev = row[j + 1];
+                row[j + 1] = next;
+            }
+        }
+        row[b.len()]
+    }
+
+    FLAGS
+        .into_iter()
+        .map(|flag| (distance(written, flag), flag))
+        .filter(|&(d, flag)| d <= flag.len() / 3)
+        .min_by_key(|&(d, _)| d)
+        .map(|(_, flag)| flag)
+}
+
 impl Opts {
+    /// The options as written between the parentheses.
+    ///
+    /// A `Meta` rather than a bare identifier, so that a value someone tried to give a flag is
+    /// *parsed* and then rejected by name: `#[stack_safe(data_in_frame = true)]` otherwise gets
+    /// `expected ,` pointing at the `=`, which says nothing about the option or the attribute.
+    /// Repeating an option is rejected for the same reason — it means the writer expected it to do
+    /// something the second time.
     pub(super) fn parse(attr: TokenStream) -> syn::Result<Self> {
         let mut opts = Opts::default();
         if attr.is_empty() {
             return Ok(opts);
         }
-        let flags = syn::parse::Parser::parse2(
-            syn::punctuated::Punctuated::<Ident, syn::Token![,]>::parse_terminated,
+        let metas = syn::parse::Parser::parse2(
+            syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
             attr,
         )?;
-        for flag in flags {
-            if flag == "use_nonlinear_mut" {
-                opts.use_nonlinear_mut = true;
-            } else if flag == "data_in_frame" {
-                opts.data_in_frame = true;
-            } else {
+        for meta in &metas {
+            let path = meta.path();
+            let Some(name) = path.get_ident().map(Ident::to_string) else {
+                return Err(unknown_flag(path));
+            };
+            let flag = match name.as_str() {
+                "use_nonlinear_mut" => &mut opts.use_nonlinear_mut,
+                "data_in_frame" => &mut opts.data_in_frame,
+                _ => return Err(unknown_flag(path)),
+            };
+            if !matches!(meta, syn::Meta::Path(_)) {
                 return Err(syn::Error::new(
-                    flag.span(),
+                    meta.span(),
                     format!(
-                        "unknown `#[stack_safe]` option `{flag}`; the options are \
-                         `use_nonlinear_mut` and `data_in_frame`"
+                        "`{name}` is a flag and takes no value: write `#[stack_safe({name})]`"
                     ),
                 ));
             }
+            if *flag {
+                return Err(syn::Error::new(
+                    path.span(),
+                    format!("`{name}` is given twice; one `#[stack_safe({name})]` is enough"),
+                ));
+            }
+            *flag = true;
         }
         Ok(opts)
     }
 
     /// Is this attribute this very one?
     ///
-    /// A marker on a function inside the scope is recognised by its name, since a macro resolves
-    /// no paths: `#[stack_safe]` as imported, or `yaspar_macros::stack_safe` written out. An
-    /// attribute of the same name from anywhere else is somebody else's and is left alone — as is
-    /// this one under an alias (`use yaspar_macros::stack_safe as ss;` then `#[ss]`), which
-    /// nothing in the tokens ties back to this crate.
+    /// A marker inside the scope is recognised by its *last* segment, since a macro resolves no
+    /// paths and so cannot tell one route to this attribute from another: `#[stack_safe]` as
+    /// imported, `#[yaspar_macros::stack_safe]`, `#[ym::stack_safe]` under a renamed `extern
+    /// crate`, `#[crate::stack_safe]` through a re-export — all of them lead here, and demanding a
+    /// particular prefix only means the others are left in the output to expand a second time on a
+    /// body that has already been rewritten.
+    ///
+    /// The price is that an attribute of the same name from somewhere else is read as this one. The
+    /// name is specific enough that this is the better trade: the alternative is silently dropping
+    /// the options of every marker not spelled one of two ways.
+    ///
+    /// What no name can catch is this attribute under an *alias* (`use yaspar_macros::stack_safe as
+    /// ss;` then `#[ss]`), where nothing in the tokens ties back to this crate at all. That one is
+    /// caught after the fact instead, by [`already_expanded`].
     pub(super) fn is_marker(attr: &syn::Attribute) -> bool {
-        let path = attr.path();
-        let segments = &path.segments;
-        segments
+        attr.path()
+            .segments
             .last()
             .is_some_and(|last| last.ident == "stack_safe")
-            && match segments.len() {
-                1 => true,
-                2 => segments[0].ident == "yaspar_macros",
-                _ => false,
-            }
     }
 
-    /// Take a function's own `#[stack_safe]`, leaving its other attributes, and read what it
+    /// Take an item's own `#[stack_safe]`, leaving its other attributes, and read what it
     /// asked for. `Some` therefore means the marker was written by hand — which is worth
     /// knowing, since one that turns out to cover no recursion is a mistake.
     ///
     /// A marker inside a scope the attribute already covers asks for options rather than for an
     /// expansion of its own, so it is removed: left in place it would expand a second time, on a
     /// function with nothing left to rewrite.
-    pub(super) fn take_from(func: &mut ItemFn) -> syn::Result<Option<Self>> {
+    ///
+    /// Over the attributes rather than over a function, because the rule is the item's and not the
+    /// function's: a `mod` or an `impl` block inside the scope is a subtree of it, and a marker
+    /// there says what that subtree wants exactly as one on a `fn` does.
+    pub(super) fn take_from(attrs: &mut Vec<syn::Attribute>) -> syn::Result<Option<Self>> {
         let mut found: Option<Self> = None;
-        let prev_attrs = std::mem::take(&mut func.attrs);
-        let mut attrs = Vec::with_capacity(prev_attrs.len());
+        let prev_attrs = std::mem::take(attrs);
+        let mut kept = Vec::with_capacity(prev_attrs.len());
         for attr in prev_attrs {
             if !Self::is_marker(&attr) {
-                attrs.push(attr);
+                kept.push(attr);
                 continue;
             }
             let tokens = match &attr.meta {
@@ -203,7 +327,7 @@ impl Opts {
                 Some(prev) => Some(prev.merge(new)),
             };
         }
-        func.attrs = attrs;
+        *attrs = kept;
         Ok(found)
     }
 
