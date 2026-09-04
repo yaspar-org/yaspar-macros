@@ -6,12 +6,14 @@
 //! it — and a loop whose body recurses becomes a new entry point.
 
 use proc_macro2::{Ident, TokenStream};
-use quote::{format_ident, quote};
+use quote::{ToTokens, format_ident, quote};
 use syn::spanned::Spanned;
 use syn::visit_mut::VisitMut;
 use syn::{Block, Expr, Pat, Stmt, parse_quote};
 
-use super::analyze::{borrows_a_built_value, contains_rec, pat_bindings, stmt_contains_rec};
+use super::analyze::{
+    borrows_a_built_value, contains_rec, pat_bindings, stmt_contains_rec, tokens_mention,
+};
 use super::context::{CtxArg, classify_ctx_arg};
 use super::leaf::{leaf_expr, leaf_stmt};
 use super::names::*;
@@ -68,6 +70,9 @@ pub(super) fn cps_stmts(ctx: &Ctx, env: &Env, stmts: &[Stmt], k: Cont) -> syn::R
                      statement; bind the call first",
                 ));
             }
+            // The attributes are re-emitted on the `let` below, but a `#[cfg]` there would
+            // gate the binding while the call it was written around had already been made.
+            reject_cfg(&local.attrs, "a `let` whose initializer recurses")?;
             let pat = &local.pat;
             let attrs = &local.attrs;
             cps_expr(ctx, env, &init.expr, &|v| {
@@ -76,15 +81,19 @@ pub(super) fn cps_stmts(ctx: &Ctx, env: &Env, stmts: &[Stmt], k: Cont) -> syn::R
                 Ok(quote! { { #(#attrs)* let #pat = #v; #tail } })
             })
         }
-        Stmt::Expr(e, Some(_)) => cps_expr(ctx, env, e, &|v| {
-            let tail = cps_stmts(ctx, env, rest, k)?;
-            Ok(quote! { { let _ = #v; #tail } })
-        }),
-        Stmt::Expr(e, None) if rest.is_empty() => cps_expr(ctx, env, e, k),
-        Stmt::Expr(e, None) => cps_expr(ctx, env, e, &|v| {
-            let tail = cps_stmts(ctx, env, rest, k)?;
-            Ok(quote! { { let _ = #v; #tail } })
-        }),
+        // A statement's attributes are the expression's, and a `#[cfg]` among them would
+        // have to gate this statement alone — but the code after it is generated *inside*
+        // the statement, as the continuation of the call being cut here.
+        Stmt::Expr(e, semi) => {
+            reject_cfg(&expr_attrs(e), "a statement that recurses")?;
+            if semi.is_none() && rest.is_empty() {
+                return cps_expr(ctx, env, e, k);
+            }
+            cps_expr(ctx, env, e, &|v| {
+                let tail = cps_stmts(ctx, env, rest, k)?;
+                Ok(quote! { { let _ = #v; #tail } })
+            })
+        }
         Stmt::Item(_) | Stmt::Macro(_) => unreachable!("checked by stmt_contains_rec / validate"),
     }
 }
@@ -151,20 +160,172 @@ fn hoist_place(ctx: &Ctx, place: &Expr) -> (Vec<TokenStream>, Expr) {
     (h.pre, place)
 }
 
-/// Is this expression a place whose evaluation cannot run user code?
+/// Split a place into the values inside it, in evaluation order, and the place with
+/// each of those values replaced by the temporary it was bound to.
 ///
-/// A path, a field of one, or a dereference of one. An index is *not* included: the index
-/// expression may have side effects, and those have to keep their position, so such a
-/// receiver goes through the ordinary hoisting.
-fn is_simple_place(e: &Expr) -> bool {
-    match e {
-        Expr::Path(p) => p.qself.is_none(),
-        Expr::Field(f) => is_simple_place(&f.base),
-        Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => is_simple_place(&u.expr),
-        Expr::Paren(p) => is_simple_place(&p.expr),
-        Expr::Group(g) => is_simple_place(&g.expr),
-        _ => false,
+/// This is what lets a place *stay* a place across a cut. `xs[0].bump(f(n - 1))` must
+/// not bind `xs[0]` to a temporary: `bump` takes `&mut self`, so it would mutate a copy
+/// and the original would answer afterwards — silently, whenever the element is `Copy`.
+/// Splicing the place itself into the continuation instead denotes the same location,
+/// because the local it is rooted at travels in the frame, and nothing left in the place
+/// can run user code.
+///
+/// The root is taken too when it is not itself a place (`foo()[i]`): binding *it* by
+/// value keeps the location, since a reference copied out of a temporary still points
+/// where it did, and an owned temporary is one the source was about to drop anyway. Only
+/// a path root stays, and it must: its identity is the whole point.
+///
+/// Unlike [`hoist_place`], which prepares a place for `ptr::from_mut` a few tokens
+/// later, this prepares one to be evaluated in a *later* invocation of the body closure,
+/// so a method call in the chain is a root to bind rather than a projection to keep.
+fn split_place(ctx: &Ctx, place: &Expr, later: &[&Expr]) -> (Vec<(Ident, Expr)>, Expr) {
+    struct S<'a> {
+        ctx: &'a Ctx,
+        /// Expressions the source evaluates *after* this place: a path read from the
+        /// place can be written there, and the continuation would then read the new value.
+        later: &'a [&'a Expr],
+        values: Vec<(Ident, Expr)>,
     }
+
+    impl S<'_> {
+        fn bind(&mut self, e: &mut Expr) {
+            let tmp = self.ctx.fresh();
+            self.values.push((tmp.clone(), e.clone()));
+            *e = parse_quote! { #tmp };
+        }
+
+        /// A value inside the place — an index, say. It is read where the source reads
+        /// it, unless reading it plainly cannot run code and cannot change in between.
+        fn take(&mut self, e: &mut Expr) {
+            let stable = match &*e {
+                Expr::Lit(_) => true,
+                Expr::Path(p) => p
+                    .path
+                    .get_ident()
+                    .is_some_and(|id| !self.later.iter().any(|l| mentions_ident(l, id))),
+                _ => false,
+            };
+            if !stable {
+                self.bind(e);
+            }
+        }
+
+        /// Walk down the projections, taking the values they contain. Whatever is
+        /// innermost is the root.
+        fn walk(&mut self, e: &mut Expr) {
+            match e {
+                // Children first, so nested projections are taken in evaluation order.
+                Expr::Index(i) => {
+                    self.walk(&mut i.expr);
+                    self.take(&mut i.index);
+                }
+                Expr::Field(f) => self.walk(&mut f.base),
+                Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => self.walk(&mut u.expr),
+                Expr::Paren(p) => self.walk(&mut p.expr),
+                Expr::Group(g) => self.walk(&mut g.expr),
+                // The root. A path names a place the frame carries; anything else is
+                // evaluated here, exactly where the source evaluates it.
+                Expr::Path(p) if p.qself.is_none() => {}
+                root => self.bind(root),
+            }
+        }
+    }
+
+    let mut s = S {
+        ctx,
+        later,
+        values: Vec::new(),
+    };
+    let mut place = place.clone();
+    s.walk(&mut place);
+    (s.values, place)
+}
+
+/// Does this expression name this identifier anywhere?
+fn mentions_ident(e: &Expr, id: &Ident) -> bool {
+    tokens_mention(&e.to_token_stream(), id)
+}
+
+/// The outer attributes of an expression, whatever kind of expression it is.
+///
+/// `syn` keeps them in each variant's own `attrs` field and offers no accessor across
+/// variants, but an expression's attributes are the first thing in its tokens, so they
+/// can simply be read back.
+fn expr_attrs(e: &Expr) -> Vec<syn::Attribute> {
+    let parser = |input: syn::parse::ParseStream| {
+        let attrs = input.call(syn::Attribute::parse_outer)?;
+        input.parse::<TokenStream>()?;
+        Ok(attrs)
+    };
+    syn::parse::Parser::parse2(parser, e.to_token_stream()).unwrap_or_default()
+}
+
+/// Refuse a `#[cfg]` on something a recursive call is cut out of.
+///
+/// Every arm here rebuilds its expression from pieces, and the pieces do not all stay in
+/// this position: the code after the call becomes an arm of another `match`, in another
+/// invocation of the body closure. So there is no one place left to put the attribute,
+/// and dropping it is not an option — the code the user disabled would compile and run.
+///
+/// Lint attributes are dropped, which only widens where a lint applies. `cfg` and
+/// `cfg_attr` decide whether code exists at all, so they are an error instead.
+fn reject_cfg(attrs: &[syn::Attribute], what: &str) -> syn::Result<()> {
+    for attr in attrs {
+        if attr.path().is_ident("cfg") || attr.path().is_ident("cfg_attr") {
+            return Err(syn::Error::new_spanned(
+                attr,
+                format!(
+                    "`#[stack_safe]` cannot honour a `#[cfg]` on {what}: the recursive call in \
+                     it is cut into a state machine, so the gated code does not stay in one \
+                     piece and there is nothing left to gate — what the `#[cfg]` disables \
+                     would compile and run. Put the `#[cfg]` on an item, or move the gated \
+                     code into a function this one calls"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// CPS an expression that the rebuilt expression will use as a *place*: evaluate the
+/// values inside it where the source evaluates them, then hand `k` the place itself,
+/// together with the environment the temporaries are bound in.
+///
+/// `later` is what the source evaluates after this place — a method call's arguments —
+/// which decides whether a plain path inside the place has to be read now.
+fn cps_place(
+    ctx: &Ctx,
+    env: &Env,
+    place: &Expr,
+    later: &[&Expr],
+    k: &dyn Fn(&Env, &Expr) -> syn::Result<TokenStream>,
+) -> syn::Result<TokenStream> {
+    fn bind_values(
+        ctx: &Ctx,
+        env: &Env,
+        values: &[(Ident, Expr)],
+        place: &Expr,
+        k: &dyn Fn(&Env, &Expr) -> syn::Result<TokenStream>,
+    ) -> syn::Result<TokenStream> {
+        let Some(((tmp, value), rest)) = values.split_first() else {
+            return k(env, place);
+        };
+        // The temporary is in scope for everything that follows, including the
+        // continuation the place is spliced into, which has to thread it.
+        let inner = env.bind([tmp.clone()]);
+        if !contains_rec(ctx, value) {
+            let head = leaf_expr(env, value)?;
+            let tail = bind_values(ctx, &inner, rest, place, k)?;
+            return Ok(quote! { { let #tmp = #head; #tail } });
+        }
+        cps_expr(ctx, env, value, &|v| {
+            let tail = bind_values(ctx, &inner, rest, place, k)?;
+            Ok(quote! { { let #tmp = #v; #tail } })
+        })
+    }
+
+    let (values, place) = split_place(ctx, place, later);
+    bind_values(ctx, env, &values, &place, k)
 }
 
 /// Does this statement leave the enclosing block unconditionally? Only the shapes
@@ -181,6 +342,9 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
     if !contains_rec(ctx, e) {
         return k(leaf_expr(env, e)?);
     }
+    // Everything below rebuilds this expression from pieces, so an attribute on it has
+    // no position to keep. Only `#[cfg]` matters; see `reject_cfg`.
+    reject_cfg(&expr_attrs(e), "an expression that recurses")?;
 
     let step = step_ty();
     let entry = entry_ty();
@@ -609,10 +773,10 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
             let member = &f.member;
             cps_expr(ctx, env, &f.base, &|v| k(quote! { (#v).#member }))
         }
-        Expr::Index(i) => cps_seq(ctx, env, &[&i.expr, &i.index], Vec::new(), &|v| {
-            let (b, idx) = (&v[0], &v[1]);
-            k(quote! { (#b)[#idx] })
-        }),
+        // An index is a *place*, and the rebuilt expression may use it as one — `&mut
+        // xs[i]`, `xs[i].bump(..)`, a field of it. So it is spliced back as a place
+        // rather than bound by value; only the values inside it are evaluated here.
+        Expr::Index(_) => cps_place(ctx, env, e, &[], &|_, place| k(quote! { (#place) })),
         Expr::Tuple(t) => {
             let elems: Vec<&Expr> = t.elems.iter().collect();
             cps_seq(ctx, env, &elems, Vec::new(), &|v| k(quote! { (#(#v,)*) }))
@@ -631,28 +795,22 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
         Expr::MethodCall(mc) => {
             let method = &mc.method;
             let turbofish = &mc.turbofish;
-            // A receiver that is a plain *place* is left where it is. Hoisting it would
-            // bind it by value, so a method taking `&mut self` would mutate the copy and
-            // the original would answer afterwards — silently, whenever the receiver is
-            // `Copy`. Reading a place has no side effect, so leaving it to the
-            // continuation is not observable either way.
-            if is_simple_place(&mc.receiver) && !contains_rec(ctx, &mc.receiver) {
-                let recv = &mc.receiver;
-                let args: Vec<&Expr> = mc.args.iter().collect();
-                return cps_seq(ctx, env, &args, Vec::new(), &|v| {
+            // The receiver is a place, and the method may take it by `&mut`, so it is
+            // spliced back as a place rather than bound by value — see [`split_place`].
+            // Rust evaluates it before the arguments, so its own values are bound first
+            // and the arguments are sequenced after them.
+            let args: Vec<&Expr> = mc.args.iter().collect();
+            cps_place(ctx, env, &mc.receiver, &args, &|env, recv| {
+                cps_seq(ctx, env, &args, Vec::new(), &|v| {
                     k(quote! { (#recv).#method #turbofish (#(#v),*) })
-                });
-            }
-            let mut parts: Vec<&Expr> = vec![&mc.receiver];
-            parts.extend(mc.args.iter());
-            cps_seq(ctx, env, &parts, Vec::new(), &|v| {
-                let recv = &v[0];
-                let args = &v[1..];
-                k(quote! { (#recv).#method #turbofish (#(#args),*) })
+                })
             })
         }
         Expr::Struct(s) => {
             let path = &s.path;
+            for f in &s.fields {
+                reject_cfg(&f.attrs, "a field of a struct expression that recurses")?;
+            }
             let names: Vec<&syn::Member> = s.fields.iter().map(|f| &f.member).collect();
             let vals: Vec<&Expr> = s.fields.iter().map(|f| &f.expr).collect();
             let rest = match &s.rest {
@@ -948,6 +1106,14 @@ fn cps_seq(
     let Some((first, rest)) = exprs.split_first() else {
         return k(&acc);
     };
+
+    // One of these operands recurses, so all of them are rebuilt into positions the
+    // source did not write them in — an argument bound to a temporary, an element
+    // produced by a continuation. A `#[cfg]` on any of them cannot travel there.
+    reject_cfg(
+        &expr_attrs(first),
+        "an operand of an expression that recurses",
+    )?;
 
     let rest_recurses = rest.iter().any(|e| contains_rec(ctx, e));
 
