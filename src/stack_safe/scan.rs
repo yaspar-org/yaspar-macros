@@ -6,7 +6,7 @@
 //! The one entry for both kinds of item the attribute goes on. A single function is a scope of
 //! one *root*; a module or an impl block is a scope of as many roots as it has functions. Either
 //! way the roots and everything their bodies declare go into one graph ([`scope`]), the cycles
-//! are read off it, and each is handed to [`emit::expand_group`] to be given a driver.
+//! are read off it, and each is handed to [`expand_group`] to be given a driver.
 //!
 //! # Where a cycle's driver goes
 //!
