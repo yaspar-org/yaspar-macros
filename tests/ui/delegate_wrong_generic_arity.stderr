@@ -1,4 +1,4 @@
-error: `#[delegate_trait]` for `Pair`: the impl block passes the wrong number of generic arguments; `Pair` takes 2
+error: `#[delegate_trait]` for `Pair`: the impl block passes the wrong number of generic arguments; `Pair` takes 1 to 2
   --> tests/ui/delegate_wrong_generic_arity.rs:13:1
    |
 13 | #[delegatable_trait]

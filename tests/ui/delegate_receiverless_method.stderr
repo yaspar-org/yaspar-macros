@@ -1,33 +1,21 @@
-error[E0424]: expected value, found module `self`
-  --> tests/ui/delegate_receiverless_method.rs:14:1
-   |
-14 | #[delegatable_trait]
-   | ^^^^^^^^^^^^^^^^^^^^ `self` value is a keyword only available in methods with a `self` parameter
-15 | trait Cfg {
-16 |     fn version() -> u32;
-   |        ------- this function doesn't have a `self` parameter
-...
-31 | #[delegate_trait(target = inner)]
-   | --------------------------------- in this attribute macro expansion
-   |
-   = note: this error originates in the macro `__delegate_impl_Cfg` which comes from the expansion of the attribute macro `delegate_trait` (in Nightly builds, run with -Z macro-backtrace for more info)
-help: add a `self` receiver parameter to make the associated `fn` a method
-   |
-16 |     fn version&self() -> u32;
-   |               +++++
-
-error[E0061]: this function takes 0 arguments but 1 argument was supplied
-  --> tests/ui/delegate_receiverless_method.rs:14:1
-   |
-14 | #[delegatable_trait]
-   | ^^^^^^^^^^^^^^^^^^^^ unexpected argument
-...
-31 | #[delegate_trait(target = inner)]
-   | --------------------------------- in this attribute macro expansion
-   |
-note: associated function defined here
+error: `#[delegate_trait]`: `version` has no `self` receiver, so there is no field to forward it to; write `version` in the impl block
   --> tests/ui/delegate_receiverless_method.rs:16:8
    |
 16 |     fn version() -> u32;
    |        ^^^^^^^
+...
+31 | #[delegate_trait(target = inner)]
+   | --------------------------------- in this attribute macro expansion
+   |
    = note: this error originates in the macro `__delegate_impl_Cfg` which comes from the expansion of the attribute macro `delegate_trait` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0046]: not all trait items implemented, missing: `version`
+  --> tests/ui/delegate_receiverless_method.rs:31:1
+   |
+16 |     fn version() -> u32;
+   |     -------------------- `version` from trait
+...
+31 | #[delegate_trait(target = inner)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `version` in implementation
+   |
+   = note: this error originates in the attribute macro `delegate_trait` (in Nightly builds, run with -Z macro-backtrace for more info)

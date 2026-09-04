@@ -1,20 +1,21 @@
-error[E0308]: mismatched types
-  --> tests/ui/delegate_typed_receiver.rs:11:1
+error: `#[delegate_trait]`: `consume` writes its receiver as a type, as in `self: Box<Self>`, and a field is not of that type; write `consume` in the impl block
+  --> tests/ui/delegate_typed_receiver.rs:13:8
    |
-11 | #[delegatable_trait]
-   | ^^^^^^^^^^^^^^^^^^^^
-   | |
-   | expected `Box<_>`, found `Base`
-   | arguments to this function are incorrect
+13 |     fn consume(self: Box<Self>) -> u32;
+   |        ^^^^^^^
 ...
 28 | #[delegate_trait(target = inner)]
    | --------------------------------- in this attribute macro expansion
    |
-   = note: expected struct `Box<_>`
-              found struct `Base`
-note: method defined here
-  --> tests/ui/delegate_typed_receiver.rs:13:8
+   = note: this error originates in the macro `__delegate_impl_Boxed` which comes from the expansion of the attribute macro `delegate_trait` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0046]: not all trait items implemented, missing: `consume`
+  --> tests/ui/delegate_typed_receiver.rs:28:1
    |
 13 |     fn consume(self: Box<Self>) -> u32;
-   |        ^^^^^^^ ----
-   = note: this error originates in the macro `__delegate_impl_Boxed` which comes from the expansion of the attribute macro `delegate_trait` (in Nightly builds, run with -Z macro-backtrace for more info)
+   |     ----------------------------------- `consume` from trait
+...
+28 | #[delegate_trait(target = inner)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `consume` in implementation
+   |
+   = note: this error originates in the attribute macro `delegate_trait` (in Nightly builds, run with -Z macro-backtrace for more info)
