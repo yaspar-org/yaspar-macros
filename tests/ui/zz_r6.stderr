@@ -1,0 +1,5 @@
+error: expected `,`
+ --> tests/ui/zz_r6.rs:5:28
+  |
+5 | #[stack_safe(data_in_frame = true)]
+  |                            ^

@@ -1,0 +1,16 @@
+error[E0658]: file modules in proc macro input are unstable
+  --> tests/ui/zz_r2d.rs:10:5
+   |
+10 |     pub mod sub;
+   |     ^^^^^^^^^^^^
+   |
+   = note: see issue #54727 <https://github.com/rust-lang/rust/issues/54727> for more information
+
+error[E0583]: file not found for module `sub`
+  --> tests/ui/zz_r2d.rs:10:5
+   |
+10 |     pub mod sub;
+   |     ^^^^^^^^^^^^
+   |
+   = help: to create the module `sub`, create file "$DIR/tests/ui/m/sub.rs" or "$DIR/tests/ui/m/sub/mod.rs"
+   = note: if there is a `mod sub` elsewhere in the crate already, import it with `use crate::...` instead

@@ -44,6 +44,10 @@ struct Roots<'a> {
     opts: Opts,
     /// The type an impl block is for, which its methods' arms need in order to name `Self`.
     self_ty: Option<&'a syn::Type>,
+    /// What the scope is called where it is written: the impl block's own type, or the annotated
+    /// module's ident. A call may name a member through it rather than through `Self` or `self`.
+    /// See [`scope::edges`].
+    host_name: Option<Ident>,
     /// Are they associated items? See [`scope::edges`].
     assoc: bool,
     /// Are they the members of a *trait* impl? Such a block may hold nothing but the trait's own
@@ -146,11 +150,24 @@ impl Scope {
     /// *annotated* module does — re-export its functions beside itself — since a module reached
     /// by descending into it is not at the caller's scope anyway.
     pub(super) fn expand(self, opts: Opts, thread_out: bool) -> syn::Result<TokenStream> {
+        Ok(self.expand_reporting(opts, thread_out)?.0)
+    }
+
+    /// The same, saying also whether anything in this scope was rewritten.
+    ///
+    /// Which is what an annotated container has to know: one that flattened nothing is a mistake,
+    /// and a container reached by descending into it may have been the one that did the flattening.
+    pub(super) fn expand_reporting(
+        self,
+        opts: Opts,
+        thread_out: bool,
+    ) -> syn::Result<(TokenStream, bool)> {
         let Scope { funcs, host } = self;
         let scanned = expand_roots(Roots {
             funcs,
             opts,
             self_ty: host.self_ty(),
+            host_name: host.host_name(),
             assoc: host.assoc(),
             trait_impl: host.trait_impl(),
         })?;
@@ -184,13 +201,36 @@ impl Host {
         }
     }
 
-    fn rebuild(self, scanned: Scanned, opts: Opts, thread_out: bool) -> syn::Result<TokenStream> {
+    /// The name a call may reach into this scope by, other than `Self` or `self`: the leading
+    /// segment of the type an impl block is for, or the module's own ident. Generics do not matter
+    /// here, unlike for [`Host::self_ty`] — this is a name to compare a path against, not a type to
+    /// write down.
+    ///
+    /// A lone function has none. Nothing names its body from outside, and the function itself is
+    /// reached by the name it was declared with, which is the bare form already.
+    fn host_name(&self) -> Option<Ident> {
+        match self {
+            Host::Fn { .. } => None,
+            Host::Mod(module) => Some(module.ident.clone()),
+            Host::Impl(block) => match &*block.self_ty {
+                syn::Type::Path(p) => p.path.segments.first().map(|s| s.ident.clone()),
+                _ => None,
+            },
+        }
+    }
+
+    fn rebuild(
+        self,
+        scanned: Scanned,
+        opts: Opts,
+        thread_out: bool,
+    ) -> syn::Result<(TokenStream, bool)> {
         match self {
             Host::Fn { name, .. } => {
                 let hoisted = scanned.hoisted;
                 let original = scanned.originals.into_iter().next().expect("one root");
                 match scanned.rewritten.into_iter().next().expect("one root") {
-                    Some(tokens) => Ok(quote! { #(#hoisted)* #tokens #original }),
+                    Some(tokens) => Ok((quote! { #(#hoisted)* #tokens #original }, true)),
                     None => Err(syn::Error::new(
                         name.span(),
                         format!(
@@ -205,7 +245,7 @@ impl Host {
                 }
             }
             Host::Mod(module) => group::rebuild_mod(module, scanned, opts, thread_out),
-            Host::Impl(block) => group::rebuild_impl(block, scanned),
+            Host::Impl(block) => group::rebuild_impl(block, scanned, thread_out),
         }
     }
 }
@@ -292,15 +332,24 @@ fn expand_roots(roots: Roots<'_>) -> syn::Result<Scanned> {
         funcs,
         opts: scope_opts,
         self_ty,
+        host_name,
         assoc,
         trait_impl,
     } = roots;
+    let mut roots = funcs;
+    // A container declared in a body is a scope of its own, so it is expanded before anything else
+    // looks at the body: what comes back is tokens, and the scan has nothing more to do there.
+    let mut changed = vec![false; roots.len()];
+    for (i, root) in roots.iter_mut().enumerate() {
+        changed[i] = expand_nested_containers(root, scope_opts)?;
+    }
     // The scope in declaration order, with each definition's marker taken off and the options in
     // force at it handed down from its host.
-    let mut roots = funcs;
     let defs = scope::collect(&mut roots, scope_opts)?;
 
-    let reaches = scope::closure(&scope::edges(&roots, &defs, assoc));
+    let (edges, blocked) = scope::edges(&roots, &defs, assoc, host_name.as_ref());
+    let reaches = scope::closure(&edges);
+    unresolvable_recursion(&defs, &edges, &reaches, &blocked, assoc)?;
     for (i, d) in defs.iter().enumerate() {
         // A marker that turns out to cover no recursion is a mistake, wherever it was written.
         if d.marked && !reaches[i][i] {
@@ -339,7 +388,6 @@ fn expand_roots(roots: Roots<'_>) -> syn::Result<Scanned> {
         originals: vec![None; roots.len()],
         hoisted: Vec::new(),
     };
-    let mut changed = vec![false; roots.len()];
 
     for cycle in scope::cycles(&defs, &reaches) {
         // The outermost member, which is where this cycle is written. `cycle` comes back in
