@@ -122,6 +122,99 @@ pub(super) fn classify_ctx_arg(arg: &Expr, entries: &[CtxEntry]) -> Option<CtxAr
     }
 }
 
+/// A type with its parentheses and invisible groups stripped.
+///
+/// `(&mut Vec<u64>)` is the `&mut` parameter it plainly is: parenthesising a type changes
+/// nothing about it, and a parameter that slipped past the test below travelled in the
+/// payload instead of becoming a slot — an `E0505` blamed on the attribute.
+pub(super) fn peel_type(ty: &syn::Type) -> &syn::Type {
+    match ty {
+        syn::Type::Paren(p) => peel_type(&p.elem),
+        syn::Type::Group(g) => peel_type(&g.elem),
+        other => other,
+    }
+}
+
+/// Does a parameter of this type become a context slot rather than payload?
+///
+/// Only a `&mut` can: a shared reference is `Copy`, so the payload is fine for it, and an
+/// owned value moves into the payload like any other. Asked of the peeled type, so that
+/// however the reference is parenthesised it is the same answer.
+///
+/// One shape cannot be seen from the tokens and so is missed: a `&mut` hidden behind a type
+/// alias, `type Out<'a> = &'a mut Vec<u64>`. Treating every unrecognised type as a slot would
+/// be far worse — every by-value parameter is one — so an alias has to be written out.
+pub(super) fn is_context_slot(ty: &syn::Type) -> bool {
+    matches!(peel_type(ty), syn::Type::Reference(r) if r.mutability.is_some())
+}
+
+/// A slot's type as the driver names it: parentheses peeled, and every lifetime the user
+/// named erased.
+///
+/// The rebinding this annotates is a `let` in the driver, where a lifetime is inferred, and
+/// the group's members are free to have named theirs differently — or not at all — so the
+/// one spelling kept for the whole group must not name a lifetime only one member declares.
+/// `'static` is left alone: it is a requirement rather than a name, and a slot that asks for
+/// it is not the same slot as one that does not.
+pub(super) fn slot_type(ty: &syn::Type) -> syn::Type {
+    struct V;
+
+    impl syn::visit_mut::VisitMut for V {
+        fn visit_type_mut(&mut self, ty: &mut syn::Type) {
+            *ty = peel_type(ty).clone();
+            syn::visit_mut::visit_type_mut(self, ty);
+        }
+
+        fn visit_type_reference_mut(&mut self, r: &mut syn::TypeReference) {
+            if r.lifetime.as_ref().is_some_and(|l| l.ident != "static") {
+                r.lifetime = None;
+            }
+            syn::visit_mut::visit_type_reference_mut(self, r);
+        }
+
+        fn visit_lifetime_mut(&mut self, l: &mut syn::Lifetime) {
+            if l.ident != "static" {
+                *l = syn::Lifetime::new("'_", l.apostrophe);
+            }
+        }
+    }
+
+    let mut ty = ty.clone();
+    syn::visit_mut::VisitMut::visit_type_mut(&mut V, &mut ty);
+    ty
+}
+
+/// What two members' slots are compared by: [`slot_type`], plus `Self` resolved to the type
+/// the impl block is for, where the caller knows it.
+///
+/// Compared as types rather than as rendered text, so that two spellings of one type — `&'a
+/// mut Vec<u64>` and `&mut Vec<u64>`, or `&mut Self` and `&mut S` inside one impl — are not
+/// presented to the user as their own mistake.
+pub(super) fn slot_key(ty: &syn::Type, self_ty: Option<&syn::Type>) -> syn::Type {
+    struct V<'a> {
+        self_ty: &'a syn::Type,
+    }
+
+    impl syn::visit_mut::VisitMut for V<'_> {
+        fn visit_type_mut(&mut self, ty: &mut syn::Type) {
+            if let syn::Type::Path(p) = &*ty
+                && p.qself.is_none()
+                && p.path.is_ident("Self")
+            {
+                *ty = self.self_ty.clone();
+                return;
+            }
+            syn::visit_mut::visit_type_mut(self, ty);
+        }
+    }
+
+    let mut ty = slot_type(ty);
+    if let Some(self_ty) = self_ty {
+        syn::visit_mut::VisitMut::visit_type_mut(&mut V { self_ty }, &mut ty);
+    }
+    ty
+}
+
 pub(super) fn strip_parens(e: &Expr) -> &Expr {
     match e {
         Expr::Paren(p) => strip_parens(&p.expr),
