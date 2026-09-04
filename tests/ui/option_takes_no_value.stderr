@@ -1,0 +1,5 @@
+error: `data_in_frame` is a flag and takes no value: write `#[stack_safe(data_in_frame)]`
+ --> tests/ui/option_takes_no_value.rs:5:14
+  |
+5 | #[stack_safe(data_in_frame = true)]
+  |              ^^^^^^^^^^^^^

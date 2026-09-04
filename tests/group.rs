@@ -2384,3 +2384,162 @@ fn unsafe_options_across_a_cycle_is_flat() {
         "the module cycle and the method cycle count alike"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Where a definition may be written.
+//
+// The scan used to take only the *statements* of a body as its definitions, so a
+// `fn` one block deeper — inside an `if`, a `match` arm, a bare `{ }` — was not a
+// definition at all. Nothing was reported: no edge, so no cycle, so the function
+// came out exactly as written and overflowed the native stack on a deep input,
+// which is the one failure this crate exists to remove. A `mod` in a body was
+// never looked at either, at any depth.
+// ---------------------------------------------------------------------------
+
+/// The recursion runs entirely inside a block-nested `fn`.
+#[stack_safe]
+mod block_nested {
+    pub fn wraps_a_block_fn(n: u64) -> u64 {
+        if n < u64::MAX {
+            fn go(n: u64) -> u64 {
+                if n == 0 { 0 } else { 1 + go(n - 1) }
+            }
+            go(n)
+        } else {
+            0
+        }
+    }
+}
+
+/// The cycle *straddles* the block: `f` calls `go`, declared one block deep, and
+/// `go` calls `f` back.
+#[stack_safe]
+fn straddles_a_block(n: u64) -> u64 {
+    if n < u64::MAX {
+        fn go(n: u64) -> u64 {
+            if n == 0 {
+                0
+            } else {
+                1 + straddles_a_block(n - 1)
+            }
+        }
+        if n == 0 { 0 } else { go(n - 1) }
+    } else {
+        0
+    }
+}
+
+/// A whole `mod` declared in a body, whose function recurses inside it.
+#[stack_safe]
+fn hosts_a_module(n: u64) -> u64 {
+    mod inner {
+        pub fn go(n: u64) -> u64 {
+            if n == 0 { 0 } else { 1 + go(n - 1) }
+        }
+    }
+    inner::go(n)
+}
+
+#[test]
+fn a_fn_declared_in_a_nested_block_is_flat() {
+    let depth = 200_000;
+    assert_eq!(
+        on_tiny_stack(move || block_nested::wraps_a_block_fn(depth)),
+        depth
+    );
+}
+
+#[test]
+fn a_cycle_through_a_block_nested_fn_is_flat() {
+    // Two levels of the cycle per unit counted: `straddles_a_block` hands to `go`,
+    // which counts one and hands back.
+    let depth = 200_000;
+    assert_eq!(on_tiny_stack(move || straddles_a_block(depth)), depth / 2);
+}
+
+#[test]
+fn a_mod_declared_in_a_body_is_flat() {
+    let depth = 200_000;
+    assert_eq!(on_tiny_stack(move || hosts_a_module(depth)), depth);
+}
+
+// ---------------------------------------------------------------------------
+// A marker written some other way.
+//
+// A marker inside a covered scope is recognised by name, since a macro resolves no
+// paths. The recognition used to require either a bare `stack_safe` or exactly
+// `yaspar_macros::stack_safe`, so any other path to this very attribute was somebody
+// else's as far as the macro could tell: its options went unread *and* it was left in
+// place, whereupon the compiler ran it a second time over an already-rewritten body.
+// A marker on a nested `mod` or `impl` was not read at all, for the same reason.
+// ---------------------------------------------------------------------------
+
+extern crate yaspar_macros as ym;
+
+#[stack_safe]
+mod marker_paths {
+    /// Reached through a crate alias, which is neither of the two spellings that used
+    /// to be recognised.
+    #[ym::stack_safe]
+    pub fn through_an_extern_alias(n: u64) -> u64 {
+        if n == 0 {
+            0
+        } else {
+            1 + through_an_extern_alias(n - 1)
+        }
+    }
+}
+
+#[stack_safe]
+mod outer_scope {
+    /// The options a nested container asks for hold throughout it, shadowing the
+    /// enclosing attribute's, exactly as a marker on a function does.
+    #[stack_safe]
+    pub mod inner {
+        pub fn f(n: u64) -> u64 {
+            if n == 0 { 0 } else { 1 + f(n - 1) }
+        }
+    }
+}
+
+#[test]
+fn a_marker_through_a_crate_alias_is_flat() {
+    let depth = 200_000;
+    assert_eq!(
+        on_tiny_stack(move || marker_paths::through_an_extern_alias(depth)),
+        depth
+    );
+}
+
+#[test]
+fn a_marker_on_a_nested_module_is_flat() {
+    let depth = 200_000;
+    assert_eq!(on_tiny_stack(move || outer_scope::inner::f(depth)), depth);
+}
+
+// ---------------------------------------------------------------------------
+// A member the build configures out.
+//
+// The thread-out emits one `use` per member the module lets out, and a proc macro
+// sees `#[cfg]` unexpanded — so a gated member was configured away while the `use`
+// naming it stayed, and the module failed to compile with an `E0432` nobody wrote.
+// ---------------------------------------------------------------------------
+
+#[stack_safe]
+mod with_a_gated_member {
+    pub fn kept(n: u64) -> u64 {
+        if n == 0 { 0 } else { 1 + kept(n - 1) }
+    }
+
+    #[cfg(any())]
+    pub fn configured_out(n: u64) -> u64 {
+        if n == 0 { 0 } else { 1 + configured_out(n - 1) }
+    }
+}
+
+#[test]
+fn a_cfg_gated_member_does_not_break_the_thread_out() {
+    let depth = 200_000;
+    // `kept` is threaded out, so it is callable unqualified here.
+    assert_eq!(on_tiny_stack(move || kept(depth)), depth);
+}

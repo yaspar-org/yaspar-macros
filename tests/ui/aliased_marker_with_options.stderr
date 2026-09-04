@@ -1,11 +1,11 @@
 error: `#[stack_safe]` cannot pass a reference derived from `t` to a recursive call: the parent frame keeps its own reference alive, so the two cannot both be `&mut`. Opt in with `#[stack_safe(use_nonlinear_mut)]`, which parks the pointers instead — see README.md for the invariant you take on
-  --> tests/ui/zz_r4a.rs:18:25
+  --> tests/ui/aliased_marker_with_options.rs:18:25
    |
 18 |             acc += bump(&mut t.kids[i]);
    |                         ^
 
 warning: unused import: `yaspar_macros::stack_safe as ss`
- --> tests/ui/zz_r4a.rs:5:5
+ --> tests/ui/aliased_marker_with_options.rs:5:5
   |
 5 | use yaspar_macros::stack_safe as ss;
   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

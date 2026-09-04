@@ -80,12 +80,14 @@ pub(super) fn collect(roots: &mut [ItemFn], opts: Opts) -> syn::Result<Vec<Def>>
         // One walk down to the body, not one per function it declares.
         let mut found: Vec<(usize, Ident, Option<Opts>)> = Vec::new();
         let mut failed: Option<syn::Error> = None;
-        with_def_mut(&mut roots[owner], &path, &mut |host| {
-            match nested_mut(host) {
+        with_def_mut(
+            &mut roots[owner],
+            &path,
+            &mut |host| match nested_mut(host) {
                 Ok(nested) => found = nested,
                 Err(e) => failed = Some(e),
-            }
-        });
+            },
+        );
         if let Some(e) = failed {
             return Err(e);
         }
@@ -168,7 +170,7 @@ pub(super) fn at<'a>(func: &'a ItemFn, path: &[usize]) -> &'a ItemFn {
 }
 
 /// The function at this ordinal among the ones the body declares.
-fn nth<'a>(block: &'a Block, ordinal: usize) -> Option<&'a ItemFn> {
+fn nth(block: &Block, ordinal: usize) -> Option<&ItemFn> {
     struct V<'a> {
         want: usize,
         next: usize,
@@ -182,10 +184,10 @@ fn nth<'a>(block: &'a Block, ordinal: usize) -> Option<&'a ItemFn> {
             }
             let ordinal = self.next;
             self.next += 1;
-            if ordinal == self.want {
-                if let Item::Fn(func) = item {
-                    self.found = Some(func);
-                }
+            if ordinal == self.want
+                && let Item::Fn(func) = item
+            {
+                self.found = Some(func);
             }
         }
     }

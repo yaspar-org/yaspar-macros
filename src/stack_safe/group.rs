@@ -181,12 +181,16 @@ pub(super) fn impl_functions(block: &mut ItemImpl) -> syn::Result<Vec<ItemFn>> {
 
 /// Put the module back together: each rewritten function where it stood, every other item as it
 /// was, nested containers descended into, and the module's own functions re-exported beside it.
+///
+/// Says also whether anything here was rewritten, counting the nested containers, since an
+/// annotated module that flattened nothing at all is a mistake and only the caller knows whether
+/// this module is the annotated one.
 pub(super) fn rebuild_mod(
     module: ItemMod,
     scanned: Scanned,
     opts: Opts,
     thread_out: bool,
-) -> syn::Result<TokenStream> {
+) -> syn::Result<(TokenStream, bool)> {
     let ItemMod {
         attrs,
         vis,
@@ -205,10 +209,14 @@ pub(super) fn rebuild_mod(
     // each function. Everything else comes out as it went in.
     let mut answers = scanned.rewritten.into_iter().zip(scanned.originals);
     let mut out_items: Vec<TokenStream> = Vec::with_capacity(items.len());
+    let mut transformed = false;
     for item in &items {
         out_items.push(match item {
             Item::Fn(f) => match answers.next().expect("one answer per function") {
-                (Some(tokens), original) => quote! { #tokens #original },
+                (Some(tokens), original) => {
+                    transformed = true;
+                    quote! { #tokens #original }
+                }
                 (None, Some(original)) => {
                     // Not rewritten, but a cycle in its body was, so the copy still has something
                     // to hold that body to.
@@ -229,9 +237,17 @@ pub(super) fn rebuild_mod(
             // *annotated* module threads its functions out, since one reached by descending into
             // it is not at the caller's scope anyway.
             Item::Mod(inner) if inner.content.is_some() => {
-                Scope::of_mod(inner.clone())?.expand(opts, false)?
+                let (tokens, inner_transformed) =
+                    Scope::of_mod(inner.clone())?.expand_reporting(opts, false)?;
+                transformed |= inner_transformed;
+                tokens
             }
-            Item::Impl(inner) => Scope::of_impl(inner.clone())?.expand(opts, false)?,
+            Item::Impl(inner) => {
+                let (tokens, inner_transformed) =
+                    Scope::of_impl(inner.clone())?.expand_reporting(opts, false)?;
+                transformed |= inner_transformed;
+                tokens
+            }
             other => other.to_token_stream(),
         });
     }
@@ -249,27 +265,43 @@ pub(super) fn rebuild_mod(
         .map(|f| {
             let vis = threaded_visibility(&f.vis, &vis);
             let name = &f.sig.ident;
+            // The `use` exists only because the function does, so it lives and dies with it. A
+            // proc macro sees `#[cfg]` unexpanded, so a gated member would otherwise be
+            // configured out while the `use` naming it stayed, which is an `E0432` on the
+            // module. Copying the condition across keeps the two in step.
+            let gates = f
+                .attrs
+                .iter()
+                .filter(|a| a.path().is_ident("cfg") || a.path().is_ident("cfg_attr"));
             // Generated, so an unused one is noise rather than a finding.
             quote! {
+                #(#gates)*
                 #[allow(unused_imports)]
                 #vis use #ident::#name;
             }
         });
 
-    Ok(quote! {
-        #(#attrs)*
-        #vis #unsafety mod #ident {
-            #(#out_items)*
-        }
-        #(#reexports)*
-    })
+    Ok((
+        quote! {
+            #(#attrs)*
+            #vis #unsafety mod #ident {
+                #(#out_items)*
+            }
+            #(#reexports)*
+        },
+        transformed,
+    ))
 }
 
 /// Put the impl block back together. A method's body needs `Self` and the impl's generics, so it
 /// is rewritten where it stands; only what cannot live in an impl block — a group's seed enum —
 /// goes beside it.
-pub(super) fn rebuild_impl(block: ItemImpl, scanned: Scanned) -> syn::Result<TokenStream> {
+///
+/// Says also whether any of its methods was rewritten, for the same reason `rebuild_mod` does. An
+/// impl block holds no nested container, so its own methods are the whole answer.
+pub(super) fn rebuild_impl(block: ItemImpl, scanned: Scanned) -> syn::Result<(TokenStream, bool)> {
     let hoisted = scanned.hoisted;
+    let mut transformed = false;
     // A copy kept for checking is not a member of the trait, and a trait impl may hold nothing
     // else, so a trait impl goes unchecked. An inherent copy beside it is no answer either: the
     // self type may belong to another crate, where no inherent impl is allowed.
@@ -282,7 +314,10 @@ pub(super) fn rebuild_impl(block: ItemImpl, scanned: Scanned) -> syn::Result<Tok
                 let (rewritten, original) = answers.next().expect("one answer per function");
                 let original = original.filter(|_| checked);
                 match rewritten {
-                    Some(tokens) => quote! { #tokens #original },
+                    Some(tokens) => {
+                        transformed = true;
+                        quote! { #tokens #original }
+                    }
                     None => {
                         // Not rewritten, but its marker still has to go.
                         let mut m = m.clone();
@@ -309,14 +344,17 @@ pub(super) fn rebuild_impl(block: ItemImpl, scanned: Scanned) -> syn::Result<Tok
     let trait_for = trait_
         .as_ref()
         .map(|(path, for_token)| quote! { #polarity #path #for_token });
-    Ok(quote! {
-        #(#hoisted)*
+    Ok((
+        quote! {
+            #(#hoisted)*
 
-        #(#attrs)*
-        #defaultness #unsafety impl #impl_generics #trait_for #self_ty #where_clause {
-            #(#out_items)*
-        }
-    })
+            #(#attrs)*
+            #defaultness #unsafety impl #impl_generics #trait_for #self_ty #where_clause {
+                #(#out_items)*
+            }
+        },
+        transformed,
+    ))
 }
 
 /// Can a caller *outside* the module reach this function? One the module keeps to

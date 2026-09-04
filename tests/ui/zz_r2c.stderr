@@ -1,5 +1,0 @@
-error: `#[stack_safe]` on `f` has no effect: nothing in its scope recurses, so there is no recursion to flatten. `f` itself never calls `f`, and neither it nor any function declared in its body is part of a cycle. A function that recurses only *through* one declared elsewhere has to be scanned together with it, so put `#[stack_safe]` on the enclosing module or impl block
- --> tests/ui/zz_r2c.rs:6:4
-  |
-6 | fn f(n: u64) -> u64 {
-  |    ^

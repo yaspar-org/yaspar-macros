@@ -1,0 +1,17 @@
+error: `depth` is called through the path `T0::depth`, which `#[stack_safe]` cannot rewrite: a macro resolves no paths, so it recognises a call to something in its scope only by the shape of it, and this call is part of a cycle it would otherwise have to leave on the native stack. Write it as `Self::depth(..)` or `self.depth(..)`
+  --> tests/ui/call_through_a_path.rs:20:36
+   |
+20 |         if n == 0 { 0 } else { 1 + T0::depth(n - 1) }
+   |                                    ^^
+
+error: `depth` is called through the path `<Self>::depth`, which `#[stack_safe]` cannot rewrite: a macro resolves no paths, so it recognises a call to something in its scope only by the shape of it, and this call is part of a cycle it would otherwise have to leave on the native stack. Write it as `Self::depth(..)` or `self.depth(..)`
+  --> tests/ui/call_through_a_path.rs:32:17
+   |
+32 |             1 + <Self>::depth(n - 1)
+   |                 ^
+
+error: `depth` is called through the path `crate::cm::depth`, which `#[stack_safe]` cannot rewrite: a macro resolves no paths, so it recognises a call to something in its scope only by the shape of it, and this call is part of a cycle it would otherwise have to leave on the native stack. Write it as `depth(..)` or `self::depth(..)`
+  --> tests/ui/call_through_a_path.rs:43:17
+   |
+43 |             1 + crate::cm::depth(n - 1)
+   |                 ^^^^^

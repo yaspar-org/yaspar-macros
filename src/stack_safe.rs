@@ -105,7 +105,7 @@ mod walk;
 /// container of one.
 pub fn expand_attr(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> {
     already_expanded(&item)?;
-    scan::Scope::parse(item)?.expand(Opts::parse(attr)?, true)
+    scan::Scope::parse(item)?.expand_annotated(Opts::parse(attr)?)
 }
 
 /// Refuse an item that is already an expansion of this very attribute.
@@ -251,9 +251,7 @@ impl Opts {
             if !matches!(meta, syn::Meta::Path(_)) {
                 return Err(syn::Error::new(
                     meta.span(),
-                    format!(
-                        "`{name}` is a flag and takes no value: write `#[stack_safe({name})]`"
-                    ),
+                    format!("`{name}` is a flag and takes no value: write `#[stack_safe({name})]`"),
                 ));
             }
             if *flag {

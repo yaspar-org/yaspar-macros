@@ -1,5 +1,0 @@
-error: `#[stack_safe]` cannot pass a reference derived from `t` to a recursive call: the parent frame keeps its own reference alive, so the two cannot both be `&mut`. Opt in with `#[stack_safe(use_nonlinear_mut)]`, which parks the pointers instead — see README.md for the invariant you take on
-  --> tests/ui/zz_r5a.rs:17:29
-   |
-17 |                 acc += bump(&mut t.kids[i]);
-   |                             ^

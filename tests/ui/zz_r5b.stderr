@@ -1,5 +1,0 @@
-error: cannot find attribute `stack_safe` in this scope
- --> tests/ui/zz_r5b.rs:7:7
-  |
-7 |     #[stack_safe]
-  |       ^^^^^^^^^^

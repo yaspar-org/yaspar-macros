@@ -1,0 +1,5 @@
+error: `#[stack_safe]` on this module has no effect: nothing in `m` recurses, so there is no recursion to flatten. Every function it holds — and every one their bodies declare, and every nested module and impl block — was scanned, and none of them reaches itself. A cycle that leaves this scope cannot be seen from here, so if these functions recurse through one declared elsewhere, the attribute belongs on the scope that holds them all
+ --> tests/ui/container_no_effect.rs:6:5
+  |
+6 | mod m {
+  |     ^

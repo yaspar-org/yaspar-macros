@@ -1,0 +1,7 @@
+error: `#[stack_safe]` has already rewritten this item: `__SsFromResidual` is one of the names it generates. A marker inside a scope this attribute covers is recognised by name only, since a macro resolves no paths, so an alias — `use yaspar_macros::stack_safe as ss;` and then `#[ss]` — is not recognised, is left in place, and runs again on the rewritten body. Write the inner marker as `#[stack_safe(..)]` or `#[yaspar_macros::stack_safe(..)]`
+ --> tests/ui/aliased_marker.rs:5:1
+  |
+5 | #[stack_safe]
+  | ^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `stack_safe` (in Nightly builds, run with -Z macro-backtrace for more info)
