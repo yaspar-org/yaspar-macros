@@ -1,7 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! `?` for both `Result` and `Option`.
+//! `?` for `Result`, `Option`, `ControlFlow`, and any carrier the caller adds.
 //!
 //! `?` has to be desugared by hand, because it returns early and every early exit
 //! must become `return Done(..)` instead. The obvious desugaring hardcodes `Ok` /
@@ -14,8 +14,12 @@
 //! residual is what distinguishes the carriers: an `Err(e)` carries `e` so `From::from`
 //! can widen it, whereas a `None` carries nothing.
 //!
-//! A carrier with a hand-written `Try` impl is therefore still unsupported: the
-//! stand-in has no impl for it, so the error is a missing-impl one naming
+//! Since the desugaring only ever names those two traits by path, a carrier the
+//! stand-in has never heard of is supported the moment its author implements the pair
+//! for it — that is the extension point, and `tests/carrier.rs` drives one through both
+//! halves. What is *not* supported is a carrier that implements the unstable
+//! `core::ops::Try` and nothing else, since a blanket impl over it would need that
+//! unstable trait; the error is then a missing-impl one naming
 //! `yaspar_macros_defs::Try`.
 
 use proc_macro2::TokenStream;
