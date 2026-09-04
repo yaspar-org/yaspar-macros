@@ -229,12 +229,10 @@ fn all_receiver_kinds_delegate() {
 }
 
 // ---------------------------------------------------------------------------
-// A required method with no `self` receiver cannot be forwarded — there is no
-// `self` to read the field out of — so it has to be written in the impl block.
-// Writing it there is enough: the skip list takes it out of the delegation, and
-// the methods beside it are delegated as usual. (The other half of this, an
-// *unwritten* receiverless method, is rejected by name; see
-// `tests/ui/delegate_receiverless_method.rs`.)
+// A required method with no `self` receiver has no field to be forwarded to, so it
+// has to be written in the impl block — where the skip list takes it out of the
+// delegation and the methods beside it are delegated as usual. Leaving it unwritten
+// is rejected by name; see `tests/ui/delegate_receiverless_method.rs`.
 // ---------------------------------------------------------------------------
 
 #[delegatable_trait]
@@ -274,11 +272,10 @@ fn receiverless_method_written_by_hand_coexists_with_delegation() {
 }
 
 // ---------------------------------------------------------------------------
-// A method's attributes travel with its signature. This matters most for `#[cfg]`:
+// A method's attributes travel with its signature, which matters most for `#[cfg]`:
 // an attribute macro runs before `cfg` stripping, so `never` below is recorded like
-// any other method, and re-emitting it without its attribute would put it in the
-// impl block of every wrapper — where the trait, which *was* stripped, does not have
-// it (`E0407`).
+// any other, and re-emitting it without its attribute would put it in every
+// wrapper's impl block — where the stripped trait does not have it (`E0407`).
 // ---------------------------------------------------------------------------
 
 #[delegatable_trait]
@@ -319,10 +316,10 @@ fn cfg_gated_trait_methods_are_gated_in_the_impl_too() {
 }
 
 // ---------------------------------------------------------------------------
-// An argument written as `_`, which is an ordinary thing to find in a trait
-// declaration and is *not* an expression: replaying the pattern as the forwarded
-// call's argument is "error: in expressions, `_` can only be used on the left-hand
-// side of an assignment". Each argument is renamed to a fresh binding instead.
+// An argument written as `_` is ordinary in a trait declaration and is not an
+// expression, so replaying the pattern as the forwarded call's argument is "in
+// expressions, `_` can only be used on the left-hand side of an assignment". Each
+// argument is renamed to a fresh binding instead.
 // ---------------------------------------------------------------------------
 
 #[delegatable_trait]
@@ -357,11 +354,9 @@ fn wildcard_argument_patterns_are_forwarded_positionally() {
 
 // ---------------------------------------------------------------------------
 // `unsafe fn`. A function body is not an unsafe block of its own, so the forwarding
-// call has to be wrapped: otherwise the expansion warns under
-// `unsafe_op_in_unsafe_fn`, at a span inside the generated macro where nobody can
-// silence it — and a warning is an error under `#![deny(warnings)]`. `cargo clippy
-// --all-targets -- -D warnings` is what holds this: the warning would be emitted
-// while compiling this very file.
+// call has to be wrapped, or the expansion warns under `unsafe_op_in_unsafe_fn` at a
+// span inside the generated macro where nobody can silence it. What holds this is
+// `cargo clippy --all-targets -- -D warnings`, compiling this very file.
 // ---------------------------------------------------------------------------
 
 #[delegatable_trait]
@@ -430,10 +425,9 @@ fn inherent_method_does_not_shadow_the_trait_method() {
 }
 
 // ---------------------------------------------------------------------------
-// What `target` may name. It is a *field path*, so a tuple index — the newtype,
-// which is the shape the documentation leads with — and a nested field are as good
-// as a bare name. `target = self.inner` is still refused, since `target` is a place
-// and not an expression; see `tests/ui/delegate_target_is_expression.rs`.
+// What `target` may name. A *field path*, so a tuple index — the newtype the docs
+// lead with — and a nested field are as good as a bare name. `target = self.inner`
+// is still refused; see `tests/ui/delegate_target_is_expression.rs`.
 // ---------------------------------------------------------------------------
 
 #[delegatable_trait]
@@ -802,11 +796,9 @@ fn interleaved_kinds_delegate() {
     assert_eq!(w.u(-1), -1);
 }
 
-/// A default that *mentions* an earlier parameter. The default is the trait's own
-/// text, so `A` in it names the trait's parameter and nothing at the impl site: it
-/// needs the same rewrite a signature gets, into the metavariable the arm has just
-/// bound. Emitted verbatim it is `E0425 cannot find type A in this scope`, pointing
-/// into the trait.
+/// A default that *mentions* an earlier parameter. It is the trait's own text, so `A` names the
+/// trait's parameter and nothing at the impl site, and needs the same rewrite a signature gets.
+/// Emitted verbatim it is `E0425 cannot find type A in this scope`, pointing into the trait.
 #[delegatable_trait]
 trait Chain<A, B = Vec<A>> {
     fn one(&self, a: A) -> u64;

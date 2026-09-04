@@ -745,19 +745,15 @@ pub(super) fn reject_generic_payload(ctx: &Ctx, funcs: &[ItemFn]) -> syn::Result
 // Parameter normalisation
 // ---------------------------------------------------------------------------
 
-/// Give every payload parameter that destructures a name of its own, and re-bind the pattern
-/// at the top of the body.
+/// Name every payload parameter that destructures, re-binding the pattern at the top of the body.
 ///
-/// The expansion has to rebuild the argument tuple as an *expression*, which a pattern cannot
-/// be, so a parameter has to have a name. That is a mechanical rewrite rather than a reason to
-/// refuse: `f((a, b): (u64, u64))` becomes `f(__ss_arg0: (u64, u64))` with
-/// `let (a, b): (u64, u64) = __ss_arg0;` prepended, which is what the rejection this replaces
-/// used to ask the caller to write by hand. The body then sees exactly the bindings it wrote,
-/// and the type is repeated on the `let` so that nothing about it is left to inference.
+/// The expansion rebuilds the argument tuple as an *expression*, which a pattern cannot be, so a
+/// parameter needs a name — but only the expansion does, so `f((a, b): (u64, u64))` becomes
+/// `f(__ss_arg0: (u64, u64))` with `let (a, b): (u64, u64) = __ss_arg0;` prepended. The type is
+/// repeated on the `let` so nothing is left to inference.
 ///
-/// A `&mut` parameter is the one that cannot be treated this way: it is not a value the body
-/// holds but a context slot the driver lends out and every step re-derives, so there is
-/// nothing here to take apart. It keeps a rejection of its own.
+/// A `&mut` parameter is a context slot the driver lends out rather than a value the body holds, so
+/// there is nothing to take apart; it keeps a rejection of its own.
 pub(super) fn desugar_param_patterns(func: &mut ItemFn) -> syn::Result<()> {
     let mut lets: Vec<Stmt> = Vec::new();
     for (i, arg) in func.sig.inputs.iter_mut().enumerate() {
@@ -797,12 +793,10 @@ pub(super) fn desugar_param_patterns(func: &mut ItemFn) -> syn::Result<()> {
 /// Does this body assign to `name` itself, rather than through it?
 ///
 /// Asked of a `mut` binding on a `&mut` parameter, which becomes a context slot every step
-/// re-derives: reassigning *the binding* would not be visible to the next step, while writing
-/// *through* it (`*out = ..`, `out.push(..)`) is the ordinary use and fine. Only the first is
-/// looked for, and only in this body: an assignment inside a nested item is that item's own.
-///
-/// A local of the same name shadowing the parameter is counted too, which errs towards the
-/// rejection — the message says what to do either way.
+/// re-derives: reassigning the binding would be invisible to the next step, while writing through
+/// it (`*out = ..`, `out.push(..)`) is the ordinary use. Only this body is looked at — an
+/// assignment in a nested item is that item's own — and a shadowing local of the same name counts,
+/// which errs towards the rejection.
 pub(super) fn assigns_binding(block: &Block, name: &Ident) -> bool {
     struct V<'a> {
         name: &'a Ident,

@@ -567,15 +567,13 @@ fn tuple_array_and_index_positions_keep_order() {
     same_nums(f, naive, 3);
 }
 
-/// A place that is *used as a place* after the cut has to stay one.
+/// A place used as a place after the cut has to stay one.
 ///
-/// The cut hoists whatever sits to the left of a recursive call, so that it runs
-/// before the `Call` step rather than after it. Hoisting a *value* is right; hoisting
-/// a place by value is not, because the continuation then writes to the copy and
-/// reads the original. That is invisible — the function compiles and returns a
-/// plausible answer — so the naive twin is the only thing that catches it. An indexed
-/// receiver and a `&mut` to an indexed element are the two shapes where it bit:
-/// `is_simple_place` accepts a field or a deref but not an index.
+/// The cut hoists whatever sits left of a recursive call so that it runs before the `Call` step.
+/// Hoisting a *value* is right; hoisting a place by value is not, since the continuation then writes
+/// to the copy and reads the original. Nothing about that is visible — the function compiles and
+/// returns a plausible answer — so the naive twin is the only thing that catches it. The two shapes
+/// it bit are an indexed receiver and a `&mut` to an indexed element.
 #[test]
 fn a_place_indexed_across_a_call_is_still_the_original() {
     #[derive(Clone, Copy)]
@@ -615,9 +613,8 @@ fn a_place_indexed_across_a_call_is_still_the_original() {
     same_nums(f, naive, 3);
 }
 
-/// The same shape over a non-`Copy` base, which used to be an `E0382` blamed on the
-/// user's own `let` — the hoist moved the `Vec` into the frame, so the code after the
-/// call had nothing left to read.
+/// The same shape over a non-`Copy` base, which used to be an `E0382` against the user's own `let`:
+/// the hoist moved the `Vec` into the frame, leaving the code after the call nothing to read.
 #[test]
 fn a_non_copy_place_indexed_across_a_call_is_not_moved() {
     #[stack_safe]
@@ -642,12 +639,10 @@ fn a_non_copy_place_indexed_across_a_call_is_not_moved() {
 
 /// A `#[cfg]` that is off must not run, and one that is on must.
 ///
-/// Each arm of the transform rebuilds its expression from pieces, and an attribute
-/// that was not re-emitted simply vanished — so a `#[cfg(any())]` statement was
-/// *compiled and executed*. Statements that do not themselves recurse are carried
-/// across the cut with their attributes, which is what this pins; a `#[cfg]` on a
-/// statement that *does* recurse cannot be honoured at all, since the call is cut into
-/// pieces and there is nothing left to gate, so it is now rejected instead of dropped
+/// Each arm rebuilds its expression from pieces, and an attribute that was not re-emitted simply
+/// vanished — so a `#[cfg(any())]` statement was compiled and executed. Statements that do not
+/// themselves recurse now carry their attributes across the cut, which is what this pins. One that
+/// does recurse cannot be gated at all and is rejected instead
 /// (`tests/ui/cfg_on_a_recursive_statement.rs`).
 #[test]
 fn a_disabled_cfg_statement_does_not_run() {

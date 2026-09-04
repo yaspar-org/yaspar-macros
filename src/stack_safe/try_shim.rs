@@ -14,12 +14,9 @@
 //! residual is what distinguishes the carriers: an `Err(e)` carries `e` so `From::from`
 //! can widen it, whereas a `None` carries nothing.
 //!
-//! Since the desugaring only ever names those two traits by path, a carrier the
-//! stand-in has never heard of is supported the moment its author implements the pair
-//! for it — that is the extension point, and `tests/carrier.rs` drives one through both
-//! halves. What is *not* supported is a carrier that implements the unstable
-//! `core::ops::Try` and nothing else, since a blanket impl over it would need that
-//! unstable trait; the error is then a missing-impl one naming
+//! The desugaring only names those traits by path, so a carrier the stand-in has never heard of
+//! works as soon as its author implements the pair — see `tests/carrier.rs`. One that implements
+//! only the unstable `core::ops::Try` does not, and the error names
 //! `yaspar_macros_defs::Try`.
 
 use proc_macro2::TokenStream;

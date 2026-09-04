@@ -16,13 +16,9 @@
 //! - [`Try`] and [`FromResidual`], a stable stand-in for the unstable traits of the
 //!   same names, so that `?` works on a `Result`, an `Option` and a `ControlFlow` alike.
 //!
-//! Nothing here is meant to be named by hand, with one exception: [`Try`] and
-//! [`FromResidual`] are the extension point for `?` on a carrier of one's own, since a
-//! macro that aims at stable cannot use the real traits. Implementing the pair for a
-//! local type is all it takes — see their own documentation.
-//!
-//! Everything is `pub` because the expansions refer to it by path, and the items are
-//! documented because a reader of an expansion should be able to find out what they do.
+//! Nothing here is meant to be named by hand, except [`Try`] and [`FromResidual`]: those are
+//! how a carrier of your own joins `?`. It is all `pub` because the expansions refer to it by
+//! path, and documented because a reader of an expansion should be able to find out what it does.
 
 #![no_std]
 
@@ -182,10 +178,8 @@ pub struct ControlFlowBreak<B>(pub B);
 ///
 /// # A carrier of your own
 ///
-/// This trait and [`FromResidual`] are ordinary public traits, neither sealed nor
-/// blanket-implemented, so a carrier of your own joins by implementing both — the orphan
-/// rule is satisfied because the carrier is your type. `?` on it then works inside a
-/// `#[stack_safe]` body, on the value path and on the early exit alike:
+/// Neither trait is sealed, so implementing both for your own carrier makes `?` work on it
+/// inside a `#[stack_safe]` body:
 ///
 /// ```
 /// use yaspar_macros_defs::{FromResidual, Try};
@@ -209,10 +203,8 @@ pub struct ControlFlowBreak<B>(pub B);
 /// }
 /// ```
 ///
-/// What you cannot do is reuse an existing `core::ops::Try` impl: a blanket impl over it
-/// would need that unstable trait, so a carrier that already supports `?` outside a
-/// `#[stack_safe]` body still needs the pair above to support it inside one. Without
-/// them the error is a missing-impl one naming this trait by path.
+/// An existing `core::ops::Try` impl cannot be reused: a blanket impl over it would need that
+/// unstable trait. Without the pair above, the error is a missing-impl one naming this trait.
 pub trait Try {
     type Output;
     type Residual;

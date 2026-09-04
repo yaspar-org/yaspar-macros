@@ -182,9 +182,8 @@ pub(super) fn impl_functions(block: &mut ItemImpl) -> syn::Result<Vec<ItemFn>> {
 /// Put the module back together: each rewritten function where it stood, every other item as it
 /// was, nested containers descended into, and the module's own functions re-exported beside it.
 ///
-/// Says also whether anything here was rewritten, counting the nested containers, since an
-/// annotated module that flattened nothing at all is a mistake and only the caller knows whether
-/// this module is the annotated one.
+/// Says also whether anything here was rewritten, nested containers included: an annotated module
+/// that flattened nothing is a mistake, and only the caller knows which module was annotated.
 pub(super) fn rebuild_mod(
     module: ItemMod,
     scanned: Scanned,
@@ -265,10 +264,8 @@ pub(super) fn rebuild_mod(
         .map(|f| {
             let vis = threaded_visibility(&f.vis, &vis);
             let name = &f.sig.ident;
-            // The `use` exists only because the function does, so it lives and dies with it. A
-            // proc macro sees `#[cfg]` unexpanded, so a gated member would otherwise be
-            // configured out while the `use` naming it stayed, which is an `E0432` on the
-            // module. Copying the condition across keeps the two in step.
+            // A proc macro sees `#[cfg]` unexpanded, so without the condition the member would be
+            // configured out while the `use` naming it stayed — an `E0432` on the module.
             let gates = f
                 .attrs
                 .iter()
@@ -297,8 +294,8 @@ pub(super) fn rebuild_mod(
 /// is rewritten where it stands; only what cannot live in an impl block — a group's seed enum —
 /// goes beside it.
 ///
-/// Says also whether any of its methods was rewritten, for the same reason `rebuild_mod` does. An
-/// impl block holds no nested container, so its own methods are the whole answer.
+/// Says also whether any method was rewritten, as `rebuild_mod` does. An impl block holds no nested
+/// container, so its own methods are the whole answer.
 pub(super) fn rebuild_impl(block: ItemImpl, scanned: Scanned) -> syn::Result<(TokenStream, bool)> {
     let hoisted = scanned.hoisted;
     let mut transformed = false;

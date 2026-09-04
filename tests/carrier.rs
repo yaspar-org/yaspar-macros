@@ -3,21 +3,14 @@
 
 //! `?` on a carrier this crate has never heard of.
 //!
-//! `#[stack_safe]` desugars `?` through the `Try` / `FromResidual` stand-in in
-//! `yaspar-macros-defs`, since the real traits are unstable. Those two traits are
-//! public and unsealed, so a carrier of one's own joins by implementing them — the
-//! orphan rule is satisfied because the carrier is the implementor's own type.
+//! `?` is desugared through the `Try` / `FromResidual` stand-in in `yaspar-macros-defs`, since
+//! the real traits are unstable. Both are public and unsealed, so a carrier of one's own joins by
+//! implementing them. That extension point would break silently — every `Result` and `Option` test
+//! in the suite would still pass — so this file drives a hand-written carrier through both halves,
+//! the value path and the early exit, on the same tiny stack as the rest of the suite.
 //!
-//! That is the crate's one extension point for `?`, and it is the kind of thing that
-//! breaks silently: a change to how the desugaring names those traits, or to what it
-//! expects of them, would still pass every `Result` and `Option` test in the suite.
-//! Hence this file, which drives a hand-written carrier through both halves of the
-//! desugaring — the value path (`Try::branch`) and the early exit
-//! (`FromResidual::from_residual`) — on the same tiny stack as the rest of the suite.
-//!
-//! `ControlFlow` is here for the same reason from the other direction: `core` gives `?`
-//! three carriers, so the stand-in owes all three, and nobody should have to write the
-//! pair by hand for one of them.
+//! `ControlFlow` is here from the other direction: `core` gives `?` three carriers, so the stand-in
+//! owes all three.
 
 use core::ops::ControlFlow;
 use yaspar_macros::stack_safe;
@@ -36,7 +29,7 @@ fn on_tiny_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T
 
 // ---------------------------------------------------------------------------
 // A carrier of our own: an `Option` by another name, so that nothing in the
-// expansion can be picking it up by matching on `Result` or `Option` itself.
+// expansion can be picking it up by matching on `Option` itself.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, PartialEq, Eq)]
@@ -66,9 +59,8 @@ impl<T> FromResidual<NothingLeft> for Maybe<T> {
     }
 }
 
-/// Counts down to zero, and `?`s on every level. `Nothing` below `stop`, so the
-/// early exit runs at depth `n - stop` and has to travel back out through every
-/// parked frame.
+/// Counts down to zero, `?`ing at every level. Below `stop` it answers `Nothing`, so the early exit
+/// runs at depth `n - stop` and has to travel back out through every parked frame.
 #[stack_safe]
 fn countdown(n: u64, stop: u64) -> Maybe<u64> {
     if n == 0 {
@@ -117,8 +109,7 @@ fn deep_question_mark_on_a_hand_written_carrier_is_stack_safe() {
 }
 
 // ---------------------------------------------------------------------------
-// `ControlFlow`, the third carrier `core` gives `?`. It is a carrier the caller
-// does not have to write, so the shim carries it, and the shape is the `Result`
+// `ControlFlow`, the third carrier `core` gives `?`. Its shape is the `Result`
 // one rather than the `Option` one: the residual holds the value broken with.
 // ---------------------------------------------------------------------------
 
@@ -159,9 +150,8 @@ fn deep_question_mark_on_control_flow_is_stack_safe() {
 
 #[test]
 fn deep_early_exit_on_a_hand_written_carrier_is_stack_safe() {
-    // The break path: `Nothing` is produced 200 000 frames deep — `n` reaches 4,
-    // which is below `stop` and above the `n == 0` base case — and has to be handed
-    // back out through every one of the parked frames.
+    // `Nothing` is produced 200 000 frames deep — `n` reaches 4, below `stop` and above the
+    // `n == 0` base case — and has to be handed back out through every parked frame.
     assert_eq!(on_tiny_stack(|| countdown(200_000, 5)), Maybe::Nothing);
     assert_eq!(countdown_naive(20, 5), Maybe::Nothing);
 }
