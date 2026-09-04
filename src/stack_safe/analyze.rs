@@ -574,7 +574,7 @@ pub(super) fn validate(ctx: &Ctx, block: &Block) -> syn::Result<()> {
     }
 }
 
-fn tokens_mention(ts: &TokenStream, name: &Ident) -> bool {
+pub(super) fn tokens_mention(ts: &TokenStream, name: &Ident) -> bool {
     ts.clone().into_iter().any(|t| match t {
         TokenTree::Ident(i) => i == *name,
         TokenTree::Group(g) => tokens_mention(&g.stream(), name),
