@@ -388,10 +388,13 @@ then a member like any other.
 
 Options of the macro are scoped like bindings. Those the attribute itself was given hold throughout, and a
 `#[stack_safe(..)]`
-written on a function inside it *shadows* them for that function and whatever it contains. We recognise a nested
-marker by name, i.e. `#[stack_safe]` as imported, or `yaspar_macros::stack_safe` written out. Note that the macro
-might not be recognized under an alias, e.g. given `use yaspar_macros::stack_safe as ss`, using `#[ss]` in a nested
-way is not recognized and is left for the compiler to expand on its own.
+written on a function, a nested module or a nested impl block inside it *shadows* them for that item and whatever it
+contains. We recognise a nested marker by its *name*, i.e. any path whose last segment is `stack_safe` —
+`#[stack_safe]` as imported, `#[yaspar_macros::stack_safe]`, `#[ym::stack_safe]` through a crate alias, or a
+re-export of it. What cannot be recognised is a marker under a *renaming* import: given
+`use yaspar_macros::stack_safe as ss`, `#[ss]` says nothing that ties it back to this crate, so it is left for the
+compiler to expand on its own — and since the body it lands on has already been rewritten, that second expansion is
+refused with a message saying so, rather than being left to make what it can of the machine.
 
 #### `&mut` parameters
 
@@ -546,20 +549,28 @@ returns the right answer, and still overflows on a deep input:
 * mutual recursive functions that are not fully captured by a single `#[stack_safe]` will still overflow when input size
   is too large. This is because `#[stack_safe]` can only analyze code within its reach. Other functions are treated
   opaquely.
-* a `fn` declared in a block *within* a body, e.g. inside an `if`, since only the statements of a body are taken as its
-  definitions; declare it at the top level of the body instead.
+Everything else is rejected at compile time, with the error on the offending span. Where a call *is* out of reach, that
+is now said rather than left to the runtime: a call written through a path the macro cannot resolve — `T::f(..)`,
+`<Self>::f(..)`, `crate::m::f(..)` — names a member it has no way to rewrite, so it is an error naming the spelling to
+use, and a `#[stack_safe]` on a module or an impl block that flattens nothing at all is an error too, as it already was
+on a function.
 
-Everything else is rejected at compile time, with the error on the offending span. On the signature:
+On the signature:
 
 * `async fn`, since the rewritten body is a loop over a frame stack, which an async state machine cannot hold without
   pinning; `const fn`, since the expansion allocates; and variadics;
 * a by-value `self`, since the receiver becomes a parameter the driver either lends out or carries, and it can do
   neither
   with an owned value;
-* a parameter that destructures, e.g. `f((a, b): (u64, u64))`, which has to be bound inside the body instead;
-* a `mut` binding on a `&mut` parameter, e.g. `mut out: &mut Vec<u64>`, since that parameter becomes a context slot
-  which
-  every step re-derives, so reassigning the binding would not be visible.
+* *assigning* to a `mut` binding of a `&mut` parameter, e.g. `mut out: &mut Vec<u64>` followed by `out = other;`, since
+  that parameter becomes a context slot which every step re-derives, so the new value would not be visible to the next
+  step. Writing *through* the reference is the ordinary use and is fine, so an inert `mut` is accepted;
+* `-> !`, which the driver would have to name in a position where it is not yet stable.
+
+A parameter that destructures needs no rejection: `f((a, b): (u64, u64))`, `f(Point { x, y }: P)` and `f(_: u64)` are
+given a name of their own with the pattern re-bound at the top of the body, since it is the payload that needs a name,
+not the caller. `impl Trait` nested inside a type, as in `Box<impl Iterator>` or `Vec<impl Copy>`, is accepted for the
+same reason: only the annotation had to change.
 
 On the placement of a recursive call:
 
@@ -593,13 +604,31 @@ Inside a group:
 
 On `?`:
 
-* a carrier other than `Result` or `Option`, e.g. a type with a hand-written `Try` impl, since the early exit is
+* a carrier that implements only the *unstable* `core::ops::Try`, since the early exit is
   desugared
   through a stand-in for the unstable `Try` and `FromResidual`, which has one impl per carrier; the error is a
   missing-impl one naming `yaspar_macros_defs::Try`, with a second naming `FromResidual` for the early-exit half.
 
+`Result`, `Option` and `ControlFlow` are carried out of the box, as in `core`. Any other carrier joins by implementing
+the two stand-in traits for itself, which is orphan-legal because the carrier is its author's own type:
+
+```rust
+impl<T> yaspar_macros_defs::Try for Maybe<T> {
+    type Output = T;
+    type Residual = NothingLeft;
+    fn branch(self) -> Result<T, NothingLeft> { .. }
+}
+impl<T> yaspar_macros_defs::FromResidual<NothingLeft> for Maybe<T> {
+    fn from_residual(_: NothingLeft) -> Self { Maybe::Nothing }
+}
+```
+
+`tests/carrier.rs` drives such a carrier through both halves of the desugaring. What is *not* possible is picking up an
+existing `core::ops::Try` impl: a blanket impl over it would need that unstable trait.
+
 Misusing the attribute is also an error: `#[stack_safe]` on an item that is neither a function, a module nor an impl
-block; on a bodiless `mod m;`, which shows it no body to scan; and an unknown or malformed option list.
+block; on a bodiless `mod m;`, which shows it no body to scan; and an unknown or malformed option list — where an
+unknown option suggests the nearest real one, a flag given a value says it takes none, and a repeated one says so.
 
 Two notes on the generated code. Where a group's members return different types, the arms that take a member's result out
 of the driver's union end in `::core::unreachable!`; they cannot be taken, but the panic path is present, which matters
@@ -775,8 +804,9 @@ type would otherwise win the lookup and silently be called instead.
 
 ### Usage and Examples
 
-`target` is a *field name*, not an expression, so we write `target = inner` and not `target = self.inner`. An empty impl
-block delegates everything, which is how we obtain a newtype that behaves exactly like its field:
+`target` names a *field*, not an expression, so we write `target = inner` and not `target = self.inner`. A tuple
+struct's field is named by its index, `target = 0`, and a field of a field by the path to it, `target = a.b`. An empty
+impl block delegates everything, which is how we obtain a newtype that behaves exactly like its field:
 
 ```rust
 struct Wrapper {
@@ -813,15 +843,24 @@ knows its own defaults and emits an extra arm that fills them in.
 ### Supports
 
 All three receiver kinds, i.e. `&self`, `&mut self` and a by-value `self`; generic methods with their own where-clauses;
-and a generic trait whose parameters are lifetimes, types, consts, or any interleaving of those, with or without
-defaults. The impl block may override every method, some of them, or none.
+`unsafe fn`, whose forwarder discharges the obligation onto its own caller rather than leaving an unsilenceable
+`unsafe_op_in_unsafe_fn` warning in the caller's crate; a method whose parameters are patterns rather than names, e.g.
+`fn b(&self, _: u32)`, which a forwarder cannot replay as arguments and so is given names of its own; a method carrying
+attributes, `#[cfg]` included, which travel with its signature so that a configured-out method is not delegated; and a
+generic trait whose parameters are lifetimes, types, consts, or any interleaving of those, with or without defaults —
+including a default that mentions an earlier parameter, as in `trait Pair<A, B = Vec<A>>`. The impl block may override
+every method, some of them, or none.
 
 ### Limitations
 
 Only required *methods* are delegated:
 
-* a required associated type or associated const is not, so the impl block has to supply it as usual;
-* a method with a default body is left to that default, and is delegated only if we override it ourselves.
+* a required associated type or associated const is not, so the impl block has to supply it as usual. This one is not
+  incidental: the attribute sits on the *impl* block, which names `Self` but never the field's type, and
+  `type Item = <_ as Trait>::Item;` is not allowed — so there is nothing for the macro to write;
+* a method with a default body is left to that default, and is delegated only if we override it ourselves;
+* a method with no `self` receiver cannot be forwarded to a field at all, so it has to be written in the impl block. The
+  macro says so, naming the method, rather than emitting a `self` that is not there.
 
 The helper macro is addressed through the trait's own path: the trait emits an alias beside itself, and
 `#[delegate_trait]`
