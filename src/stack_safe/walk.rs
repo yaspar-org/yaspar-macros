@@ -230,6 +230,32 @@ impl Ctx {
         }
     }
 
+    /// Does this member own the value named by `e`, as far as the macro can tell?
+    ///
+    /// Only an annotated `let` of a non-reference type counts. A reference is rooted outside the
+    /// driver and can be lent as it is; an unannotated local has no type to judge by, so it keeps
+    /// the plain borrow and whatever error that brings.
+    pub(super) fn owns_named_local(&self, member: usize, e: &syn::Expr) -> bool {
+        let syn::Expr::Path(p) = e else { return false };
+        let Some(name) = p.path.get_ident() else {
+            return false;
+        };
+        if self.param_type_of(member, name).is_some() {
+            // A parameter already travels in the payload; lend it as it is.
+            return false;
+        }
+        match self
+            .local_types
+            .borrow()
+            .get(&(member, name.to_string()))
+            .cloned()
+            .flatten()
+        {
+            Some(ty) => !matches!(syn::parse2::<syn::Type>(ty), Ok(syn::Type::Reference(_))),
+            None => false,
+        }
+    }
+
     /// A payload slot's type, from the signature or an annotated `let`.
     pub(super) fn slot_type(&self, member: usize, name: &Ident) -> Option<TokenStream> {
         self.param_type_of(member, name).or_else(|| {

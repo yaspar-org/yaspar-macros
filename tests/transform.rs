@@ -1280,3 +1280,152 @@ fn a_cycle_across_a_body_may_pass_a_trait_object() {
     let depth = 200_000;
     assert_eq!(on_tiny_stack(move || calls_through(&|| 7u64, depth)), 7);
 }
+
+/// An `impl Trait` parameter is the generic it already is, so its type has a name and can pin the
+/// payload slot it travels in.
+#[stack_safe]
+mod apit {
+    pub fn walk(n: u64, ids: impl IntoIterator<Item = u64> + Clone, acc: &mut Vec<u64>) -> u64 {
+        if n == 0 {
+            return 0;
+        }
+        let mut total = 0;
+        for id in ids.clone() {
+            acc.push(id);
+            total += walk(n - 1, ids.clone(), acc);
+        }
+        total + 1
+    }
+}
+
+#[test]
+fn impl_trait_parameter_is_named() {
+    let mut acc = Vec::new();
+    assert_eq!(apit::walk(3, vec![1u64], &mut acc), 3);
+    assert_eq!(acc, vec![1, 1, 1]);
+}
+
+#[test]
+fn impl_trait_parameter_is_flat() {
+    let deep = std::thread::Builder::new()
+        .stack_size(64 * 1024)
+        .spawn(|| {
+            let mut acc = Vec::new();
+            apit::walk(100_000, vec![7u64], &mut acc)
+        })
+        .expect("spawn")
+        .join();
+    assert_eq!(deep.ok(), Some(100_000));
+}
+
+/// A borrowed *local* is the same case as a borrowed temporary: the callee's frame outlives the
+/// caller's, so the value has to move onto the store. Naming it first must not change that.
+#[stack_safe(data_in_frame)]
+mod borrowed_local {
+    pub fn lend_walk(n: u64, acc: &mut Vec<u64>) -> u64 {
+        if n == 0 {
+            return 0;
+        }
+        let mut total = 0;
+        let mut i = 0;
+        while i < 1 {
+            let owned: Vec<u64> = vec![n];
+            total += lend(&owned, acc);
+            i += 1;
+        }
+        total
+    }
+
+    pub fn lend(xs: &Vec<u64>, acc: &mut Vec<u64>) -> u64 {
+        acc.push(xs[0]);
+        lend_walk(xs[0] - 1, acc) + 1
+    }
+}
+
+#[test]
+fn borrowed_local_is_lent() {
+    let mut acc = Vec::new();
+    assert_eq!(borrowed_local::lend_walk(3, &mut acc), 3);
+    assert_eq!(acc, vec![3, 2, 1]);
+}
+
+#[test]
+fn borrowed_local_is_flat() {
+    let deep = std::thread::Builder::new()
+        .stack_size(64 * 1024)
+        .spawn(|| {
+            let mut acc = Vec::new();
+            borrowed_local::lend_walk(100_000, &mut acc)
+        })
+        .expect("spawn")
+        .join();
+    assert_eq!(deep.ok(), Some(100_000));
+}
+
+/// A frame slot whose only use is `{:?}` is constrained by nothing but `Debug`, so the frame type
+/// has to be named for it; a construction inside the closure cannot pin the closure's own
+/// parameter type.
+#[stack_safe]
+mod debug_frame {
+    pub fn dbg_walk(n: u64) -> Result<u64, String> {
+        let tag: u8 = (n % 7) as u8;
+        if n == 0 {
+            return Ok(0);
+        }
+        let inner = step(n)?;
+        Err(format!("{tag:?} {inner}"))
+    }
+
+    pub fn step(n: u64) -> Result<u64, String> {
+        dbg_walk(n - 1)
+    }
+}
+
+#[test]
+fn debug_frame_reports() {
+    assert_eq!(debug_frame::dbg_walk(0), Ok(0));
+    assert_eq!(debug_frame::dbg_walk(1), Err("1 0".to_string()));
+}
+
+/// A `let` without an annotation still says what it holds when the initialiser names its own type,
+/// which is how a loop counter is usually written.
+#[stack_safe]
+mod suffixed_counter {
+    pub fn cnt_walk(n: u64, acc: &mut Vec<u64>) -> u64 {
+        if n == 0 {
+            return 0;
+        }
+        let mut i = 0usize;
+        let mut total = 0u64;
+        while i < 1 {
+            total += cnt_step(n, acc);
+            i += 1;
+        }
+        total
+    }
+
+    pub fn cnt_step(n: u64, acc: &mut Vec<u64>) -> u64 {
+        acc.push(n);
+        cnt_walk(n - 1, acc) + 1
+    }
+}
+
+#[test]
+fn suffixed_counter_counts() {
+    let mut acc = Vec::new();
+    assert_eq!(suffixed_counter::cnt_walk(3, &mut acc), 3);
+    assert_eq!(acc, vec![3, 2, 1]);
+}
+
+#[test]
+fn suffixed_counter_is_flat() {
+    let deep = std::thread::Builder::new()
+        .stack_size(64 * 1024)
+        .spawn(|| {
+            let mut acc = Vec::new();
+            suffixed_counter::cnt_walk(100_000, &mut acc)
+        })
+        .expect("spawn")
+        .join();
+    assert_eq!(deep.ok(), Some(100_000));
+}
