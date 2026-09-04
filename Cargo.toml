@@ -3,7 +3,7 @@ members = ["defs"]
 
 [package]
 name = "yaspar-macros"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 # A floor, not a pin: `edition = "2024"` needs 1.85 and the let-chains in `emit.rs` and
 # `context.rs` need 1.88. Any newer toolchain is fine. Checked by the `msrv` CI job.
