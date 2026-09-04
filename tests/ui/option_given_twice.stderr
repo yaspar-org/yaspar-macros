@@ -1,0 +1,5 @@
+error: `data_in_frame` is given twice; one `#[stack_safe(data_in_frame)]` is enough
+ --> tests/ui/option_given_twice.rs:5:29
+  |
+5 | #[stack_safe(data_in_frame, data_in_frame)]
+  |                             ^^^^^^^^^^^^^

@@ -27,6 +27,7 @@
 use proc_macro2::{Ident, TokenStream};
 use quote::{ToTokens, quote};
 use std::collections::HashMap;
+use syn::spanned::Spanned;
 use syn::visit_mut::VisitMut;
 use syn::{FnArg, ItemFn, ItemImpl, ItemMod};
 
@@ -82,6 +83,11 @@ pub(super) struct Scope {
     /// The functions to scan, markers and all.
     funcs: Vec<ItemFn>,
     host: Host,
+    /// A marker on the container itself, if it carried one — a nested `#[stack_safe(..)] mod m`.
+    /// Options are scoped like bindings, so this *shadows* whatever the enclosing attribute asked
+    /// for, throughout this scope. Taking it off is not optional either: left in place the compiler
+    /// would run the attribute again, on a body already rewritten.
+    own_opts: Option<Opts>,
 }
 
 /// The scope with its functions taken out: enough to say what a name in it can mean, and enough
@@ -112,6 +118,7 @@ impl Scope {
             return Ok(Scope {
                 funcs: vec![func],
                 host,
+                own_opts: None,
             });
         }
         if let Ok(module) = syn::parse2::<ItemMod>(item.clone()) {
@@ -130,17 +137,21 @@ impl Scope {
     /// A container reached by descending into one, which is grouped on its own.
     pub(super) fn of_mod(module: ItemMod) -> syn::Result<Self> {
         let mut module = module;
+        let own_opts = Opts::take_from(&mut module.attrs)?;
         Ok(Scope {
             funcs: group::module_functions(&mut module)?,
             host: Host::Mod(module),
+            own_opts,
         })
     }
 
     pub(super) fn of_impl(block: ItemImpl) -> syn::Result<Self> {
         let mut block = block;
+        let own_opts = Opts::take_from(&mut block.attrs)?;
         Ok(Scope {
             funcs: group::impl_functions(&mut block)?,
             host: Host::Impl(block),
+            own_opts,
         })
     }
 
@@ -154,6 +165,21 @@ impl Scope {
         Ok(self.expand_reporting(opts, thread_out)?.0)
     }
 
+    /// The scope the attribute was written on, which owes an answer for itself.
+    ///
+    /// A function that turns out to recurse nowhere is already an error, reported by name. A
+    /// container was not, so `#[stack_safe] mod m` over a module whose functions merely call one
+    /// another in a line compiled with no diagnostic at all — and a refactor that broke a module's
+    /// recursion was undetectable. It is the same mistake either way, so it now reads the same way.
+    pub(super) fn expand_annotated(self, opts: Opts) -> syn::Result<TokenStream> {
+        let complaint = self.host.no_effect();
+        let (tokens, transformed) = self.expand_reporting(opts, true)?;
+        match complaint {
+            Some(err) if !transformed => Err(err),
+            _ => Ok(tokens),
+        }
+    }
+
     /// The same, saying also whether anything in this scope was rewritten.
     ///
     /// Which is what an annotated container has to know: one that flattened nothing is a mistake,
@@ -163,7 +189,14 @@ impl Scope {
         opts: Opts,
         thread_out: bool,
     ) -> syn::Result<(TokenStream, bool)> {
-        let Scope { funcs, host } = self;
+        let Scope {
+            funcs,
+            host,
+            own_opts,
+        } = self;
+        // A marker on the container shadows the enclosing attribute's options for this scope, the
+        // same rule a marker on a function follows.
+        let opts = own_opts.unwrap_or(opts);
         let scanned = expand_roots(Roots {
             funcs,
             opts,
@@ -220,6 +253,31 @@ impl Host {
         }
     }
 
+    /// What to say if nothing in this scope turned out to recurse.
+    ///
+    /// `None` for a function, which reports that for itself, in its own words, from `rebuild`.
+    fn no_effect(&self) -> Option<syn::Error> {
+        let (kind, name, span) = match self {
+            Host::Fn { .. } => return None,
+            Host::Mod(module) => ("module", module.ident.to_string(), module.ident.span()),
+            Host::Impl(block) => {
+                let ty = &*block.self_ty;
+                ("impl block", quote! { #ty }.to_string(), ty.span())
+            }
+        };
+        Some(syn::Error::new(
+            span,
+            format!(
+                "`#[stack_safe]` on this {kind} has no effect: nothing in `{name}` recurses, so \
+                 there is no recursion to flatten. Every function it holds — and every one their \
+                 bodies declare, and every nested module and impl block — was scanned, and none \
+                 of them reaches itself. A cycle that leaves this scope cannot be seen from here, \
+                 so if these functions recurse through one declared elsewhere, the attribute \
+                 belongs on the scope that holds them all"
+            ),
+        ))
+    }
+
     fn rebuild(
         self,
         scanned: Scanned,
@@ -246,7 +304,7 @@ impl Host {
                 }
             }
             Host::Mod(module) => group::rebuild_mod(module, scanned, opts, thread_out),
-            Host::Impl(block) => group::rebuild_impl(block, scanned, thread_out),
+            Host::Impl(block) => group::rebuild_impl(block, scanned),
         }
     }
 }
