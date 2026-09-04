@@ -567,6 +567,114 @@ fn tuple_array_and_index_positions_keep_order() {
     same_nums(f, naive, 3);
 }
 
+/// A place that is *used as a place* after the cut has to stay one.
+///
+/// The cut hoists whatever sits to the left of a recursive call, so that it runs
+/// before the `Call` step rather than after it. Hoisting a *value* is right; hoisting
+/// a place by value is not, because the continuation then writes to the copy and
+/// reads the original. That is invisible — the function compiles and returns a
+/// plausible answer — so the naive twin is the only thing that catches it. An indexed
+/// receiver and a `&mut` to an indexed element are the two shapes where it bit:
+/// `is_simple_place` accepts a field or a deref but not an index.
+#[test]
+fn a_place_indexed_across_a_call_is_still_the_original() {
+    #[derive(Clone, Copy)]
+    struct C(u64);
+    impl C {
+        fn bump(&mut self, d: u64) {
+            self.0 += d;
+        }
+    }
+    fn add(c: &mut u64, d: u64) {
+        *c += d;
+    }
+
+    #[stack_safe]
+    fn f(n: u64, log: &Nums) -> u64 {
+        if n == 0 {
+            return 0;
+        }
+        let mut cs = [C(0); 2];
+        // The receiver is `cs[0]`, a place, and the argument recurses.
+        cs[0].bump(f(n - 1, log) + p(log, n));
+        let mut xs = [0u64; 2];
+        // Here the place is behind a `&mut`, and the *index* recurses.
+        add(&mut xs[(f(n - 1, log) % 2) as usize], p(log, 100 + n));
+        cs[0].0 + xs[0] + xs[1]
+    }
+    fn naive(n: u64, log: &Nums) -> u64 {
+        if n == 0 {
+            return 0;
+        }
+        let mut cs = [C(0); 2];
+        cs[0].bump(naive(n - 1, log) + p(log, n));
+        let mut xs = [0u64; 2];
+        add(&mut xs[(naive(n - 1, log) % 2) as usize], p(log, 100 + n));
+        cs[0].0 + xs[0] + xs[1]
+    }
+    same_nums(f, naive, 3);
+}
+
+/// The same shape over a non-`Copy` base, which used to be an `E0382` blamed on the
+/// user's own `let` — the hoist moved the `Vec` into the frame, so the code after the
+/// call had nothing left to read.
+#[test]
+fn a_non_copy_place_indexed_across_a_call_is_not_moved() {
+    #[stack_safe]
+    fn f(n: u64, log: &Nums) -> u64 {
+        if n == 0 {
+            return 0;
+        }
+        let xs: Vec<u64> = vec![7, 8];
+        let v = xs[(f(n - 1, log) % 2) as usize];
+        v + xs[0] + p(log, n)
+    }
+    fn naive(n: u64, log: &Nums) -> u64 {
+        if n == 0 {
+            return 0;
+        }
+        let xs: Vec<u64> = vec![7, 8];
+        let v = xs[(naive(n - 1, log) % 2) as usize];
+        v + xs[0] + p(log, n)
+    }
+    same_nums(f, naive, 3);
+}
+
+/// A `#[cfg]` that is off must not run, and one that is on must.
+///
+/// Each arm of the transform rebuilds its expression from pieces, and an attribute
+/// that was not re-emitted simply vanished — so a `#[cfg(any())]` statement was
+/// *compiled and executed*. Statements that do not themselves recurse are carried
+/// across the cut with their attributes, which is what this pins; a `#[cfg]` on a
+/// statement that *does* recurse cannot be honoured at all, since the call is cut into
+/// pieces and there is nothing left to gate, so it is now rejected instead of dropped
+/// (`tests/ui/cfg_on_a_recursive_statement.rs`).
+#[test]
+fn a_disabled_cfg_statement_does_not_run() {
+    #[stack_safe]
+    fn f(n: u64, log: &Nums) -> u64 {
+        if n == 0 {
+            return 0;
+        }
+        #[cfg(any())]
+        p(log, 900 + n);
+        #[cfg(all())]
+        p(log, n);
+        let below = f(n - 1, log);
+        #[cfg(any())]
+        p(log, 800 + n);
+        below + 1
+    }
+    fn naive(n: u64, log: &Nums) -> u64 {
+        if n == 0 {
+            return 0;
+        }
+        p(log, n);
+        naive(n - 1, log) + 1
+    }
+    same_nums(f, naive, 3);
+}
+
 // ===========================================================================
 // Early exit
 // ===========================================================================

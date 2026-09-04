@@ -1,0 +1,17 @@
+error: `#[stack_safe]` cannot honour a `#[cfg]` on a `let` whose initializer recurses: the recursive call in it is cut into a state machine, so the gated code does not stay in one piece and there is nothing left to gate — what the `#[cfg]` disables would compile and run. Put the `#[cfg]` on an item, or move the gated code into a function this one calls
+  --> tests/ui/cfg_on_a_recursive_statement.rs:18:5
+   |
+18 |     #[cfg(any())]
+   |     ^^^^^^^^^^^^^
+
+error: `#[stack_safe]` cannot honour a `#[cfg]` on an expression that recurses: the recursive call in it is cut into a state machine, so the gated code does not stay in one piece and there is nothing left to gate — what the `#[cfg]` disables would compile and run. Put the `#[cfg]` on an item, or move the gated code into a function this one calls
+  --> tests/ui/cfg_on_a_recursive_statement.rs:28:18
+   |
+28 |     let v = 1 + (#[cfg(any())] operand(n - 1));
+   |                  ^^^^^^^^^^^^^
+
+error: `#[stack_safe]` cannot honour a `#[cfg]` on a field of a struct expression that recurses: the recursive call in it is cut into a state machine, so the gated code does not stay in one piece and there is nothing left to gate — what the `#[cfg]` disables would compile and run. Put the `#[cfg]` on an item, or move the gated code into a function this one calls
+  --> tests/ui/cfg_on_a_recursive_statement.rs:44:9
+   |
+44 |         #[cfg(any())]
+   |         ^^^^^^^^^^^^^
