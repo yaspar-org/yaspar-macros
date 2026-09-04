@@ -658,7 +658,7 @@ fn a_disabled_cfg_statement_does_not_run() {
         }
         #[cfg(any())]
         p(log, 900 + n);
-        #[cfg(all())]
+        #[cfg(not(any()))]
         p(log, n);
         let below = f(n - 1, log);
         #[cfg(any())]
