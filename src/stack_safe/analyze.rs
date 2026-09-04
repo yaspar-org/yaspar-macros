@@ -51,6 +51,36 @@ pub(super) struct MethodSplit {
 ///
 /// The inner function must be an associated one rather than nested in the wrapper,
 /// because a nested `fn` cannot name `Self` (`E0401`).
+/// Rewrite each `impl Trait` parameter into a generic parameter with the same bounds.
+///
+/// Argument-position `impl Trait` *is* a generic parameter, so naming it turns a type the
+/// transform could not write down — and therefore could not use to pin a payload slot — into one
+/// it can. Callers are unaffected: the two forms differ only in that a named parameter can be
+/// given by turbofish.
+pub(super) fn desugar_apit(func: &mut ItemFn) {
+    let mut fresh = 0usize;
+    for arg in func.sig.inputs.iter_mut() {
+        let syn::FnArg::Typed(pt) = arg else { continue };
+        let syn::Type::ImplTrait(it) = &*pt.ty else {
+            continue;
+        };
+        let name = format_ident!("__SsApit{}", fresh);
+        fresh += 1;
+        let bounds = it.bounds.clone();
+        func.sig
+            .generics
+            .params
+            .push(syn::GenericParam::Type(syn::TypeParam {
+                attrs: vec![],
+                ident: name.clone(),
+                colon_token: Some(Default::default()),
+                bounds,
+                default: None,
+            }));
+        *pt.ty = syn::parse_quote! { #name };
+    }
+}
+
 pub(super) fn desugar_receiver(
     func: &mut ItemFn,
     group: &[Ident],
@@ -258,15 +288,26 @@ pub(super) fn rename_calls(func: &mut ItemFn, renames: &HashMap<String, Ident>) 
     V { renames }.visit_item_fn_mut(func);
 }
 
-pub(super) fn borrows_a_built_value(arg: &Expr) -> Option<&Expr> {
+/// The value a call lends the callee, when the argument is `&<something the caller owns>`.
+///
+/// A built value (`&Node::Cons(..)`, `&t.child(i)`) and a local (`&case`) are the same case: the
+/// caller owns it, and it has to outlive a call that becomes a `return`. So both are moved into
+/// the driver's store. A local is *moved*, so using it after the call is a move error — which is
+/// the clear one, unlike the `E0515` that leaving it as a borrow produces.
+pub(super) fn borrows_a_built_value<'e>(
+    ctx: &Ctx,
+    member: usize,
+    arg: &'e Expr,
+) -> Option<&'e Expr> {
     let Expr::Reference(r) = strip_parens(arg) else {
         return None;
     };
-    matches!(
-        strip_parens(&r.expr),
+    let inner = strip_parens(&r.expr);
+    let built = matches!(
+        inner,
         Expr::Call(_) | Expr::MethodCall(_) | Expr::Struct(_) | Expr::Macro(_)
-    )
-    .then_some(&*r.expr)
+    ) || ctx.owns_named_local(member, inner);
+    built.then_some(&*r.expr)
 }
 
 /// Mark every payload position some call passes a freshly built value's reference to.
@@ -295,7 +336,7 @@ pub(super) fn scan_pinned_args(ctx: &Ctx, block: &Block) -> syn::Result<()> {
                     if p.context_at.contains_key(&i) {
                         continue;
                     }
-                    if borrows_a_built_value(arg).is_some() {
+                    if borrows_a_built_value(self.ctx, self.ctx.current.get(), arg).is_some() {
                         if !self.ctx.opts.data_in_frame {
                             if self.err.is_none() {
                                 self.err = Some(syn::Error::new(
@@ -594,4 +635,108 @@ pub(super) fn pat_bindings(pat: &Pat) -> Vec<Ident> {
     let mut v = V(Vec::new());
     v.visit_pat(pat);
     v.0
+}
+
+/// Reject a payload parameter whose type is generic in the member that declares it, where another
+/// member of the cycle calls that member without declaring the same parameter.
+///
+/// A group shares one driver, so a generic parameter has one instantiation for the whole group: the
+/// driver's caller picks it, and the body must hold for every choice. A call from a member that
+/// does not carry that parameter can only be passing some concrete type, which is the one thing the
+/// rigid parameter cannot be. Left to rustc it is an `E0308` between the payload slot and the
+/// argument, reported against the attribute.
+pub(super) fn reject_generic_payload(ctx: &Ctx, funcs: &[ItemFn]) -> syn::Result<()> {
+    fn type_params(func: &ItemFn) -> Vec<Ident> {
+        func.sig
+            .generics
+            .params
+            .iter()
+            .filter_map(|p| match p {
+                syn::GenericParam::Type(t) => Some(t.ident.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn mentions(ty: &syn::Type, name: &Ident) -> bool {
+        struct V<'a> {
+            name: &'a Ident,
+            found: bool,
+        }
+        impl<'ast> Visit<'ast> for V<'_> {
+            fn visit_path(&mut self, path: &'ast syn::Path) {
+                if path.is_ident(self.name) {
+                    self.found = true;
+                }
+                syn::visit::visit_path(self, path);
+            }
+        }
+        let mut v = V { name, found: false };
+        v.visit_type(ty);
+        v.found
+    }
+
+    /// Which members each member calls.
+    fn callees(ctx: &Ctx, block: &Block) -> Vec<usize> {
+        struct V<'a> {
+            ctx: &'a Ctx,
+            out: Vec<usize>,
+        }
+        impl<'ast> Visit<'ast> for V<'_> {
+            fn visit_expr(&mut self, e: &'ast Expr) {
+                if let Some((callee, _)) = self.ctx.rec_call(e) {
+                    self.out.push(callee);
+                }
+                syn::visit::visit_expr(self, e);
+            }
+        }
+        let mut v = V {
+            ctx,
+            out: Vec::new(),
+        };
+        v.visit_block(block);
+        v.out
+    }
+
+    for (i, callee) in funcs.iter().enumerate() {
+        let params = type_params(callee);
+        if params.is_empty() {
+            continue;
+        }
+        for arg in &callee.sig.inputs {
+            let syn::FnArg::Typed(pt) = arg else { continue };
+            // A `&mut` parameter is lent by the driver rather than carried, so it is not a slot.
+            if matches!(&*pt.ty, syn::Type::Reference(r) if r.mutability.is_some()) {
+                continue;
+            }
+            let Some(generic) = params.iter().find(|g| mentions(&pt.ty, g)) else {
+                continue;
+            };
+            for (c, caller) in funcs.iter().enumerate() {
+                if c == i || !callees(ctx, &caller.block).contains(&i) {
+                    continue;
+                }
+                if type_params(caller).iter().any(|g| g == generic) {
+                    continue;
+                }
+                // `desugar_apit` names an `impl Trait` parameter for its own use; the user
+                // never wrote that name, so describe the parameter as they spelled it.
+                let what = match generic.to_string().starts_with("__SsApit") {
+                    true => "is an `impl Trait` parameter".to_string(),
+                    false => format!("is generic in `{generic}`"),
+                };
+                return Err(syn::Error::new(
+                    pt.span(),
+                    format!(
+                        "this parameter of `{}` {what}, and `{}` calls `{}` without that \
+                         parameter. A cycle shares one driver, so the parameter has a single \
+                         instantiation for the whole group and cannot also be whatever `{}` \
+                         passes: give it a concrete type",
+                        callee.sig.ident, caller.sig.ident, callee.sig.ident, caller.sig.ident,
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }

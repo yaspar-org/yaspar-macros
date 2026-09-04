@@ -626,3 +626,201 @@ fn wide_bare_loop_is_flat() {
         depth as u64 + 1
     );
 }
+
+// ---------------------------------------------------------------------------
+// A `for` loop over a borrow, with a recursive call in the body.
+//
+// The loop's iterator has to be parked in the entry payload, and an iterator over `&xs` borrows
+// the very local the payload owns — a value that cannot be returned (E0515). Under
+// `data_in_frame` the collection moves into the driver's store for the loop instead, so the
+// iterator borrows the store; `Pin` never moves what it holds, and the mark travels in the
+// payload so the loop releases it on the way out.
+// ---------------------------------------------------------------------------
+
+#[stack_safe(data_in_frame)]
+mod borrowed_loop {
+    pub fn borrowed_sum(xs: Vec<u64>, seen: &mut Vec<u64>) -> u64 {
+        let mut total = 0;
+        for x in &xs {
+            total += borrowed_step(*x, seen);
+        }
+        total
+    }
+
+    pub fn borrowed_step(n: u64, seen: &mut Vec<u64>) -> u64 {
+        if n == 0 {
+            return 0;
+        }
+        seen.push(n);
+        borrowed_sum(vec![n - 1], seen) + 1
+    }
+}
+
+#[test]
+fn borrowed_loop_is_correct() {
+    let mut seen = Vec::new();
+    assert_eq!(borrowed_loop::borrowed_step(3, &mut seen), 3);
+    assert_eq!(seen, vec![3, 2, 1]);
+}
+
+#[test]
+fn borrowed_loop_is_flat() {
+    let deep = on_tiny_stack(|| {
+        let mut seen = Vec::new();
+        borrowed_loop::borrowed_step(200_000, &mut seen)
+    });
+    assert_eq!(deep, 200_000);
+}
+
+/// The store has to be released on every way out of the loop, or it grows for the rest of the
+/// drive. `break` leaves through the loop's continuation and `?` through `Env::teardown`; both
+/// paths are exercised here, repeatedly, so a leak would show up as memory growth rather than a
+/// wrong answer.
+#[stack_safe(data_in_frame)]
+mod borrowed_loop_exits {
+    /// Sentinels the descending chain cannot reach, so every level takes both exits without
+    /// perturbing the count.
+    pub const BREAK_AT: u64 = u64::MAX - 1;
+
+    pub fn exits_scan(xs: Vec<u64>, seen: &mut Vec<u64>) -> Result<u64, u64> {
+        let mut total = 0;
+        for x in &xs {
+            if *x == BREAK_AT {
+                break;
+            }
+            if *x == u64::MAX {
+                return Err(*x);
+            }
+            total += exits_probe(*x, seen)?;
+        }
+        Ok(total)
+    }
+
+    pub fn exits_probe(n: u64, seen: &mut Vec<u64>) -> Result<u64, u64> {
+        if n == 0 {
+            return Ok(0);
+        }
+        seen.push(n);
+        Ok(exits_scan(vec![n - 1, BREAK_AT], seen)? + 1)
+    }
+}
+
+/// Kept shallow so Miri can run it: this is the case that catches a teardown running *before* the
+/// value it releases is read, which `return Err(*x)` does for an `x` borrowed out of the store.
+#[test]
+fn borrowed_loop_releases_on_break_and_question_mark() {
+    let mut seen = Vec::new();
+    assert_eq!(borrowed_loop_exits::exits_probe(4, &mut seen), Ok(4));
+    let mut seen = Vec::new();
+    assert_eq!(
+        borrowed_loop_exits::exits_scan(vec![u64::MAX], &mut seen),
+        Err(u64::MAX)
+    );
+}
+
+#[test]
+fn borrowed_loop_with_exits_is_flat() {
+    // Deep enough that a store entry leaked per iteration would be obvious.
+    let deep = on_tiny_stack(|| {
+        let mut seen = Vec::new();
+        borrowed_loop_exits::exits_probe(100_000, &mut seen)
+    });
+    assert_eq!(deep, Ok(100_000));
+}
+
+// ---------------------------------------------------------------------------
+// A loop that follows a recursive call in the same body.
+//
+// The loop's state travels in its own entry variant, and the seed dispatch only ever builds the
+// *members'* variants — so a loop state's type parameter was still an inference variable when the
+// driver closure's own type was settled, and a closure's parameter types are settled before its
+// body is checked. Nothing built inside could pin it, and the report landed on the loop's condition
+// in the user's body:
+//
+//     error[E0282]: type annotations needed
+//     while i < arms1.len() { … }
+//               ^^^^^ cannot infer type
+//
+// The entry type is now named outside the closure, `_` standing in for any slot no annotation
+// reached, which pins the rest.
+// ---------------------------------------------------------------------------
+
+struct Pair {
+    kids: Vec<Pair>,
+    val: u64,
+}
+
+impl Pair {
+    fn chain(depth: usize) -> Pair {
+        let mut node = Pair {
+            kids: vec![],
+            val: 1,
+        };
+        for _ in 0..depth {
+            node = Pair {
+                kids: vec![node],
+                val: 1,
+            };
+        }
+        node
+    }
+}
+
+#[stack_safe]
+mod call_then_loop {
+    use super::Pair;
+
+    pub fn total(acc: &mut Vec<u64>, p: &Pair, leaf: &Pair) -> u64 {
+        if p.kids.is_empty() {
+            acc.push(p.val);
+            return p.val;
+        }
+        let kids: &[Pair] = &p.kids;
+        // A recursive call, on a node with no children so the walk stays linear…
+        if scoped(acc, vec![], leaf, leaf) == 0 {
+            return 0;
+        }
+        // …then a loop, whose state threads `kids` across a call to the other member.
+        let mut sum: u64 = 0;
+        let mut i: usize = 0;
+        while i < kids.len() {
+            sum += scoped(acc, vec![i as u64], &kids[i], leaf);
+            i += 1;
+        }
+        sum
+    }
+
+    pub fn scoped(acc: &mut Vec<u64>, marks: Vec<u64>, p: &Pair, leaf: &Pair) -> u64 {
+        let _ = marks.len();
+        total(acc, p, leaf)
+    }
+}
+
+#[test]
+fn loop_after_a_call_is_typed() {
+    let t = Pair::chain(3);
+    let mut acc = Vec::new();
+    // 3 inner levels each add a `leaf` push plus the base case.
+    let leaf = Pair {
+        kids: vec![],
+        val: 1,
+    };
+    assert_eq!(call_then_loop::total(&mut acc, &t, &leaf), 1);
+}
+
+#[test]
+fn loop_after_a_call_is_flat() {
+    let deep = on_tiny_stack(|| {
+        let t = Pair::chain(200_000);
+        let mut acc = Vec::new();
+        let leaf = Pair {
+            kids: vec![],
+            val: 1,
+        };
+        let n = call_then_loop::total(&mut acc, &t, &leaf);
+        // Dropping a 200k-deep `Pair` is itself recursive, so it is leaked rather than dropped.
+        std::mem::forget(t);
+        n
+    });
+    assert_eq!(deep, 1);
+}

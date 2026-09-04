@@ -18,6 +18,8 @@ use super::walk::{Env, LoopCtx};
 struct LeafRewrite<'a> {
     /// Emitted before every escape; see `Env::restores`.
     restores: TokenStream,
+    /// Emitted before `?` and `return` only; see `Env::teardown`.
+    teardown: TokenStream,
     /// How this member's result enters its group's union; see `Env::wrap`.
     wrap: Option<(Ident, Ident)>,
     /// Innermost lowered loop, if any: the target for `break` / `continue`.
@@ -63,6 +65,8 @@ impl VisitMut for LeafRewrite<'_> {
         let entry = entry_ty();
         // Undo a pending swap before leaving; empty in every other position.
         let undo = &self.restores;
+        // Release a loop's store, but only where the member itself is abandoned.
+        let release = &self.teardown;
         match e {
             Expr::Try(t) => {
                 let inner = &t.expr;
@@ -73,18 +77,23 @@ impl VisitMut for LeafRewrite<'_> {
                         ::core::result::Result::Ok(__ss_ok) => __ss_ok,
                         ::core::result::Result::Err(__ss_res) => {
                             #undo
+                            #release
                             return #step::Done(#exit)
                         }
                     }
                 };
             }
             Expr::Return(r) => {
-                let v = match &r.expr {
+                let raw = match &r.expr {
                     Some(v) => quote! { #v },
                     None => quote! { () },
                 };
-                let v = self.wrapped(v);
-                *e = parse_quote! { { #undo return #step::Done(#v) } };
+                // Bound before the teardown: the value may read out of a store it releases, as
+                // `return Err(*x)` does for an `x` borrowed from one.
+                let v = self.wrapped(quote! { __ss_ret });
+                *e = parse_quote! {
+                    { let __ss_ret = #raw; #undo #release return #step::Done(#v) }
+                };
             }
             Expr::Continue(c) if self.depth == 0 => {
                 if c.label.is_some() {
@@ -139,6 +148,7 @@ where
 {
     let mut r = LeafRewrite {
         restores: env.restores.clone(),
+        teardown: env.teardown.clone(),
         wrap: env.wrap.clone(),
         lp: env.lp,
         depth: 0,

@@ -210,7 +210,7 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
                     let j = payload.len();
                     if ctx.member(callee).pinned[j].get() {
                         let pin = ctx.pin_slot(callee, j);
-                        payload.push(match borrows_a_built_value(arg) {
+                        payload.push(match borrows_a_built_value(ctx, ctx.current.get(), arg) {
                             Some(built) => {
                                 if !pinned_slots.contains(&pin) {
                                     pinned_slots.push(pin.clone());
@@ -468,7 +468,10 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
                         None => quote! {},
                     };
                     let body = cps_expr(ctx, &inner, &arm.body, k)?;
-                    arms.push(quote! { #pat #guard => #body, });
+                    // Attributes travel with the arm. Dropping a `#[cfg]` would leave a gated
+                    // arm in beside its twin, shadowing whatever fell through to it.
+                    let attrs = &arm.attrs;
+                    arms.push(quote! { #(#attrs)* #pat #guard => #body, });
                 }
                 Ok(quote! { match #s { #(#arms)* } })
             })
@@ -717,14 +720,73 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
 fn lower_loop(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream> {
     let step = step_ty();
     let entry = entry_ty();
+    let ctxp = ctx_param();
 
     let iter_ident = match e {
         Expr::ForLoop(_) => Some(format_ident!("__ss_it{}", ctx.loops.borrow().len())),
         _ => None,
     };
-    let idx = ctx.reserve_loop(ctx.scope_with_results(&env.scope), iter_ident.clone());
+
+    // A `for` loop over a borrow moves its collection into the store first: the iterator is
+    // parked in the payload, and one over `&local` would borrow what that payload owns.
+    let store = match e {
+        Expr::ForLoop(f) => borrowed_owner(&f.expr),
+        _ => None,
+    };
+    let store = match store {
+        None => None,
+        Some(owner) => {
+            if !ctx.opts.data_in_frame {
+                return Err(syn::Error::new(
+                    owner.span(),
+                    format!(
+                        "`#[stack_safe]` cannot park an iterator that borrows `{owner}`, because \
+                         the frame holding it owns `{owner}` too. Enable \
+                         `#[stack_safe(data_in_frame)]` to move `{owner}` into the driver's store \
+                         for the loop, or iterate it by value (`for x in {owner}`) or by index",
+                    ),
+                ));
+            }
+            let Some(elem) = ctx.current_param_type(&owner) else {
+                return Err(syn::Error::new(
+                    owner.span(),
+                    format!(
+                        "`#[stack_safe]` cannot name the type of `{owner}`, so it cannot build the \
+                         store this loop needs; `{owner}` has to be a parameter of the function. \
+                         Iterate it by value (`for x in {owner}`) or by index instead",
+                    ),
+                ));
+            };
+            let slot = ctx.loop_store_slot(ctx.loops.borrow().len(), elem.clone());
+            Some((owner, slot, ctx.fresh(), elem))
+        }
+    };
+    let store_forced: Vec<Ident> = store.iter().map(|(_, _, mark, _)| mark.clone()).collect();
+    // Not an `Env::restores`: that also runs on `continue`, which still needs the collection.
+    let release = match &store {
+        Some((_, slot, mark, _)) => quote! { #ctxp.#slot.truncate(#mark); },
+        None => TokenStream::new(),
+    };
+
+    let idx = ctx.reserve_loop(
+        ctx.scope_with_results(&env.scope),
+        iter_ident.clone(),
+        store_forced,
+    );
     let variant = entry_variant(ctx.loop_base() + idx);
     let marker = state_marker(idx);
+
+    // Leaving the loop releases the store; `?` and `return` go through `Env::teardown`.
+    // The value may come out of the store, so it is bound before the store is released.
+    let released_k = |v: TokenStream| -> syn::Result<TokenStream> {
+        if release.is_empty() {
+            return k(v);
+        }
+        let after = k(quote! { __ss_left_loop })?;
+        let release = &release;
+        Ok(quote! { { let __ss_left_loop = #v; #release #after } })
+    };
+    let k: Cont = &released_k;
 
     // Inside the loop, `continue` re-enters this entry point and `break` runs
     // the code that follows the loop.
@@ -736,7 +798,14 @@ fn lower_loop(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStrea
     // The iterator is a binding inside the loop's entry point, so a *nested*
     // loop must be able to thread it onward — otherwise this loop could not
     // resume once the inner one finished.
-    let lenv = env.in_loop(&lp).bind(iter_ident.clone());
+    // A binding of the loop's entry point like the iterator: a resume point inside the body
+    // re-enters the loop and must thread it onward.
+    let store_bindings: Vec<Ident> = store.iter().map(|(_, _, mark, _)| mark.clone()).collect();
+    let lenv = env
+        .with_teardown(release.clone())
+        .in_loop(&lp)
+        .bind(iter_ident.clone())
+        .bind(store_bindings);
     let again = quote! { #step::Tail(#entry::#variant(#marker)) };
     // The body's value is discarded, but it must still be *evaluated*: a branch
     // with no recursive call arrives here as a whole expression rather than as
@@ -795,15 +864,52 @@ fn lower_loop(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStrea
     // Entering the loop is also a tail transfer: the entry point computes the
     // loop *and* everything after it, which is exactly the rest of this frame.
     match (e, iter_ident) {
-        (Expr::ForLoop(f), Some(it)) => cps_expr(ctx, env, &f.expr, &|iter_val| {
-            Ok(quote! {
+        (Expr::ForLoop(f), Some(it)) => match &store {
+            // SAFETY: this lands in the caller's crate and the invariant is ours. The pointer is
+            // one `Pin::push` returned for a value moved into the driver's store, and `Pin` never
+            // moves a value it holds, so the address is good for as long as it is there. It is
+            // there until this loop's mark is truncated, which happens on the way out of the loop
+            // and nowhere else: `released_k` covers the exhausted branch and every `break`,
+            // `Env::teardown` covers `?` and `return`, and `continue` deliberately does not
+            // release. So every iteration that reads the iterator runs while the value is still
+            // owned by the store. Gated behind `data_in_frame`.
+            Some((owner, slot, mark, elem)) => Ok(quote! {
                 {
-                    let mut #it = ::core::iter::IntoIterator::into_iter(#iter_val);
+                    let #mark = #ctxp.#slot.mark();
+                    let __ss_owned = #ctxp.#slot.push(#owner);
+                    // The iterator's type is named because its payload slot is only built
+                    // inside the closure. The shape is enough; regionck settles the lifetime.
+                    let mut #it: <&#elem as ::core::iter::IntoIterator>::IntoIter =
+                        ::core::iter::IntoIterator::into_iter(unsafe { &*__ss_owned });
                     #step::Tail(#entry::#variant(#marker))
                 }
-            })
-        }),
+            }),
+            None => cps_expr(ctx, env, &f.expr, &|iter_val| {
+                Ok(quote! {
+                    {
+                        let mut #it = ::core::iter::IntoIterator::into_iter(#iter_val);
+                        #step::Tail(#entry::#variant(#marker))
+                    }
+                })
+            }),
+        },
         _ => Ok(quote! { #step::Tail(#entry::#variant(#marker)) }),
+    }
+}
+
+/// The local a loop's iterator borrows, for the two forms that name a place: `&xs` and
+/// `xs.iter()`. Anything else either owns what it yields or borrows something unidentifiable.
+fn borrowed_owner(e: &Expr) -> Option<Ident> {
+    let path_ident = |e: &Expr| match e {
+        Expr::Path(p) => p.path.get_ident().cloned(),
+        _ => None,
+    };
+    match e {
+        // Shared borrows only: the store lends through `&*ptr`, so leaving `&mut xs` alone keeps
+        // the borrow-checker error naming the loop.
+        Expr::Reference(r) if r.mutability.is_none() => path_ident(&r.expr),
+        Expr::MethodCall(m) if m.method == "iter" && m.args.is_empty() => path_ident(&m.receiver),
+        _ => None,
     }
 }
 
