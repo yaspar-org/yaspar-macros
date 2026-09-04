@@ -267,24 +267,21 @@ impl Ctx {
         })
     }
 
-    /// A payload parameter's declared type, if writable: not `impl Trait`, and not a pinned
-    /// position, whose slot holds a pointer instead.
+    /// The type the body binds a payload parameter to, if it is writable at all — not `impl Trait`.
+    ///
+    /// A pinned position has two types and this is the reference, not the `*const T`: the entry
+    /// payload holds the pointer and the arm rebinds the name, so a loop state or frame carrying the
+    /// name carries the rebinding. `emit::variant_payload_type` reads `pinned` for the pointer.
     pub(super) fn param_type_of(&self, member: usize, name: &Ident) -> Option<TokenStream> {
         let member = &self.members[member];
         let j = member.param_names.iter().position(|p| p == name)?;
-        if member.pinned[j].get() {
-            return None;
-        }
         let bare = member.param_bare_types.get(j)?;
         (!bare.is_empty()).then(|| bare.clone())
     }
 
     /// The declared type of a payload parameter of the member being lowered.
     pub(super) fn current_param_type(&self, name: &Ident) -> Option<TokenStream> {
-        let member = &self.members[self.current.get()];
-        let j = member.param_names.iter().position(|p| p == name)?;
-        let bare = member.param_bare_types.get(j)?;
-        (!bare.is_empty()).then(|| bare.clone())
+        self.param_type_of(self.current.get(), name)
     }
 
     /// The context-tuple index of the store for one position. The stores sit after
