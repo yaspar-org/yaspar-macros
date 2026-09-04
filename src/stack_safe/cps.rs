@@ -29,6 +29,34 @@ pub(super) fn cps_stmts(ctx: &Ctx, env: &Env, stmts: &[Stmt], k: Cont) -> syn::R
         return k(quote! { () });
     };
 
+    // A `#[cfg]` on a statement that recurses cannot ride along on the pieces the statement is cut
+    // into: the code *after* it is generated inside them, and gating that away with it would lose
+    // it. So the block is lowered twice -- with the statement and without -- and the two are
+    // written as gated bindings of one name, of which the predicate leaves exactly one.
+    if stmt_contains_rec(ctx, first)
+        && let Some(gate) = stmt_gate(first)?
+    {
+        let out = ctx.fresh();
+        let with = ctx.under_gate(gate.clone(), || {
+            let mut kept = first.clone();
+            strip_cfg(&mut kept);
+            let stmts: Vec<Stmt> = std::iter::once(kept).chain(rest.iter().cloned()).collect();
+            cps_stmts(ctx, env, &stmts, k)
+        })?;
+        // Under `not` for the same reason: the arms this lowering grows are the ones that exist
+        // when the predicate does not hold, and the driver's match holds both sets.
+        let without = ctx.under_gate(quote! { not(#gate) }, || cps_stmts(ctx, env, rest, k))?;
+        return Ok(quote! {
+            {
+                #[cfg(#gate)]
+                let #out = #with;
+                #[cfg(not(#gate))]
+                let #out = #without;
+                #out
+            }
+        });
+    }
+
     if !stmt_contains_rec(ctx, first) {
         // A trailing expression without a semicolon is the block's value. A
         // *block-like* statement (`if c { .. }`) also parses as
@@ -70,9 +98,9 @@ pub(super) fn cps_stmts(ctx: &Ctx, env: &Env, stmts: &[Stmt], k: Cont) -> syn::R
                      statement; bind the call first",
                 ));
             }
-            // The attributes are re-emitted on the `let` below, but a `#[cfg]` there would
-            // gate the binding while the call it was written around had already been made.
-            reject_cfg(&local.attrs, "a `let` whose initializer recurses")?;
+            // A `#[cfg]` here was handled by `cps_stmts` before the statement was split, so what
+            // is left cannot gate anything away; `cfg_attr` still can.
+            reject_cfg_attr(&local.attrs, "a `let` whose initializer recurses")?;
             let pat = &local.pat;
             let attrs = &local.attrs;
             cps_expr(ctx, env, &init.expr, &|v| {
@@ -85,7 +113,7 @@ pub(super) fn cps_stmts(ctx: &Ctx, env: &Env, stmts: &[Stmt], k: Cont) -> syn::R
         // have to gate this statement alone — but the code after it is generated *inside*
         // the statement, as the continuation of the call being cut here.
         Stmt::Expr(e, semi) => {
-            reject_cfg(&expr_attrs(e), "a statement that recurses")?;
+            reject_cfg_attr(&expr_attrs(e), "a statement that recurses")?;
             if semi.is_none() && rest.is_empty() {
                 return cps_expr(ctx, env, e, k);
             }
@@ -256,23 +284,103 @@ fn expr_attrs(e: &Expr) -> Vec<syn::Attribute> {
     syn::parse::Parser::parse2(parser, e.to_token_stream()).unwrap_or_default()
 }
 
-/// Refuse a `#[cfg]` on something a recursive call is cut out of.
+/// The `#[cfg]` predicate among `attrs`, if any.
 ///
-/// The pieces do not all stay in this position — the code after the call becomes an arm of another
-/// `match` — so there is nowhere left to put the attribute, and dropping it would compile and run
-/// the code the user disabled. Lint attributes are dropped, which only widens where a lint applies;
-/// `cfg` decides whether code exists at all.
+/// A recursive call under it is cut across the driver's arms, so the predicate travels with every
+/// piece: onto the arm generated for a resume point (`PayloadPoint::gates`), and onto the two
+/// bindings a gated statement becomes. Two predicates on one node are an `all(..)` of them.
+fn cfg_gate(attrs: &[syn::Attribute]) -> syn::Result<Option<TokenStream>> {
+    reject_cfg_attr(attrs, "code that recurses")?;
+    let preds: Vec<TokenStream> = attrs
+        .iter()
+        .filter(|a| a.path().is_ident("cfg"))
+        .map(|a| a.parse_args::<TokenStream>())
+        .collect::<syn::Result<_>>()?;
+    Ok(match preds.len() {
+        0 => None,
+        1 => preds.into_iter().next(),
+        _ => Some(quote! { all(#(#preds),*) }),
+    })
+}
+
+/// A statement's `#[cfg]` predicate, wherever its kind keeps its attributes.
+fn stmt_gate(stmt: &Stmt) -> syn::Result<Option<TokenStream>> {
+    match stmt {
+        Stmt::Local(local) => cfg_gate(&local.attrs),
+        Stmt::Expr(e, _) => cfg_gate(&expr_attrs(e)),
+        Stmt::Item(_) | Stmt::Macro(_) => Ok(None),
+    }
+}
+
+/// Take the `#[cfg]`s off a statement, which is what makes the two lowerings of a gated statement
+/// differ: the kept copy is the statement as if it had never been gated.
+fn strip_cfg(stmt: &mut Stmt) {
+    fn drop_cfgs(attrs: &mut Vec<syn::Attribute>) {
+        attrs.retain(|a| !a.path().is_ident("cfg"));
+    }
+    match stmt {
+        Stmt::Local(local) => drop_cfgs(&mut local.attrs),
+        Stmt::Expr(e, _) => drop_expr_cfgs(e),
+        Stmt::Item(_) | Stmt::Macro(_) => {}
+    }
+}
+
+/// The same for an expression, which keeps its attributes per variant.
+fn drop_expr_cfgs(e: &mut Expr) {
+    macro_rules! strip {
+        ($($variant:ident),*) => {
+            match e {
+                $(Expr::$variant(inner) => inner.attrs.retain(|a| !a.path().is_ident("cfg")),)*
+                _ => {}
+            }
+        };
+    }
+    strip!(
+        Array, Assign, Async, Await, Binary, Block, Break, Call, Cast, Closure, Const, Continue,
+        Field, ForLoop, Group, If, Index, Infer, Let, Lit, Loop, Macro, Match, MethodCall, Paren,
+        Path, Range, Reference, Repeat, Return, Struct, Try, TryBlock, Tuple, Unary, Unsafe, While,
+        Yield
+    );
+}
+
+/// Refuse a `#[cfg]` in a position whose pieces cannot each carry it.
+///
+/// Statements, match arms and struct-expression fields are handled: each is a place where the gate
+/// can travel to every piece. Anywhere else the pieces do not all stay in this position -- the code
+/// after the call becomes an arm of another `match` -- so dropping the attribute would compile and
+/// run what the user disabled.
 fn reject_cfg(attrs: &[syn::Attribute], what: &str) -> syn::Result<()> {
+    reject_cfg_attr(attrs, what)?;
     for attr in attrs {
-        if attr.path().is_ident("cfg") || attr.path().is_ident("cfg_attr") {
+        if attr.path().is_ident("cfg") {
             return Err(syn::Error::new_spanned(
                 attr,
                 format!(
                     "`#[stack_safe]` cannot honour a `#[cfg]` on {what}: the recursive call in \
                      it is cut into a state machine, so the gated code does not stay in one \
                      piece and there is nothing left to gate — what the `#[cfg]` disables \
-                     would compile and run. Put the `#[cfg]` on an item, or move the gated \
-                     code into a function this one calls"
+                     would compile and run. Put the `#[cfg]` on the whole statement, on a match \
+                     arm, or on an item"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a `#[cfg_attr]` on something a recursive call is cut out of.
+///
+/// Unlike `cfg`, what it expands to is arbitrary — it could name an attribute that only means
+/// something in the position the source wrote it, which the pieces are no longer in.
+fn reject_cfg_attr(attrs: &[syn::Attribute], what: &str) -> syn::Result<()> {
+    for attr in attrs {
+        if attr.path().is_ident("cfg_attr") {
+            return Err(syn::Error::new_spanned(
+                attr,
+                format!(
+                    "`#[stack_safe]` cannot honour a `#[cfg_attr]` on {what}: the recursive call \
+                     in it is cut into a state machine, and what this expands to may only mean \
+                     something where it was written. Use a plain `#[cfg]`, or put this on an item"
                 ),
             ));
         }
@@ -622,7 +730,15 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
                         }
                         None => quote! {},
                     };
-                    let body = cps_expr(ctx, &inner, &arm.body, k)?;
+                    // The arm keeps its own attributes below, but a `#[cfg]` among them also has
+                    // to reach the arms the driver grows for the calls inside this one: the code
+                    // after such a call lands there, not here.
+                    let body = match cfg_gate(&arm.attrs)? {
+                        None => cps_expr(ctx, &inner, &arm.body, k)?,
+                        Some(gate) => {
+                            ctx.under_gate(gate, || cps_expr(ctx, &inner, &arm.body, k))?
+                        }
+                    };
                     // Attributes travel with the arm. Dropping a `#[cfg]` would leave a gated
                     // arm in beside its twin, shadowing whatever fell through to it.
                     let attrs = &arm.attrs;
@@ -797,8 +913,38 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
         }
         Expr::Struct(s) => {
             let path = &s.path;
-            for f in &s.fields {
-                reject_cfg(&f.attrs, "a field of a struct expression that recurses")?;
+            // A gated field is not rebuilt with its attribute -- the literal below is assembled
+            // from names and values -- so, as for a gated statement, the expression is lowered
+            // twice and the predicate picks one: with the field, and without it.
+            if let Some((at, gate)) = s
+                .fields
+                .iter()
+                .enumerate()
+                .find_map(|(i, f)| cfg_gate(&f.attrs).map(|g| g.map(|g| (i, g))).transpose())
+                .transpose()?
+            {
+                let out = ctx.fresh();
+                let with = ctx.under_gate(gate.clone(), || {
+                    let mut kept = s.clone();
+                    kept.fields[at].attrs.retain(|a| !a.path().is_ident("cfg"));
+                    cps_expr(ctx, env, &Expr::Struct(kept), k)
+                })?;
+                let mut dropped = s.clone();
+                let mut fields = dropped.fields.into_iter().collect::<Vec<_>>();
+                fields.remove(at);
+                dropped.fields = fields.into_iter().collect();
+                let without = ctx.under_gate(quote! { not(#gate) }, || {
+                    cps_expr(ctx, env, &Expr::Struct(dropped), k)
+                })?;
+                return Ok(quote! {
+                    {
+                        #[cfg(#gate)]
+                        let #out = #with;
+                        #[cfg(not(#gate))]
+                        let #out = #without;
+                        #out
+                    }
+                });
             }
             let names: Vec<&syn::Member> = s.fields.iter().map(|f| &f.member).collect();
             let vals: Vec<&Expr> = s.fields.iter().map(|f| &f.expr).collect();
@@ -1113,6 +1259,9 @@ fn cps_seq(
 
     if !contains_rec(ctx, first) {
         let tmp = ctx.fresh();
+        if let Some(ty) = ctx.type_of(first) {
+            ctx.note_local_type(&tmp, ty);
+        }
         let head = leaf_expr(env, first)?;
         let inner = env.bind([tmp.clone()]);
         let mut acc = acc;
