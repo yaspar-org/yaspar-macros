@@ -229,6 +229,169 @@ fn all_receiver_kinds_delegate() {
 }
 
 // ---------------------------------------------------------------------------
+// A required method with no `self` receiver cannot be forwarded — there is no
+// `self` to read the field out of — so it has to be written in the impl block.
+// Writing it there is enough: the skip list takes it out of the delegation, and
+// the methods beside it are delegated as usual. (The other half of this, an
+// *unwritten* receiverless method, is rejected by name; see
+// `tests/ui/delegate_receiverless_method.rs`.)
+// ---------------------------------------------------------------------------
+
+#[delegatable_trait]
+trait Cfg {
+    fn version() -> u32;
+    fn label(&self) -> &'static str;
+}
+
+struct CfgInner;
+
+impl Cfg for CfgInner {
+    fn version() -> u32 {
+        1
+    }
+    fn label(&self) -> &'static str {
+        "inner"
+    }
+}
+
+struct CfgWrapper {
+    inner: CfgInner,
+}
+
+#[delegate_trait(target = inner)]
+impl Cfg for CfgWrapper {
+    // Written by hand, since there is nothing to forward it to.
+    fn version() -> u32 {
+        2
+    }
+}
+
+#[test]
+fn receiverless_method_written_by_hand_coexists_with_delegation() {
+    let w = CfgWrapper { inner: CfgInner };
+    assert_eq!(<CfgWrapper as Cfg>::version(), 2);
+    assert_eq!(w.label(), "inner");
+}
+
+// ---------------------------------------------------------------------------
+// A method's attributes travel with its signature. This matters most for `#[cfg]`:
+// an attribute macro runs before `cfg` stripping, so `never` below is recorded like
+// any other method, and re-emitting it without its attribute would put it in the
+// impl block of every wrapper — where the trait, which *was* stripped, does not have
+// it (`E0407`).
+// ---------------------------------------------------------------------------
+
+#[delegatable_trait]
+trait Gated {
+    /// A doc comment is an attribute too, and rides along to the forwarder.
+    fn always(&self) -> u32;
+    #[cfg(any())]
+    fn never(&self) -> u32;
+    #[cfg(not(any()))]
+    fn present(&self) -> u32;
+}
+
+struct GatedInner;
+
+impl Gated for GatedInner {
+    fn always(&self) -> u32 {
+        1
+    }
+    fn present(&self) -> u32 {
+        2
+    }
+}
+
+struct GatedWrapper {
+    inner: GatedInner,
+}
+
+#[delegate_trait(target = inner)]
+impl Gated for GatedWrapper {}
+
+#[test]
+fn cfg_gated_trait_methods_are_gated_in_the_impl_too() {
+    let w = GatedWrapper { inner: GatedInner };
+    assert_eq!(w.always(), 1);
+    // `#[cfg(not(any()))]` holds, so this one is delegated; `never` is absent from both
+    // the trait and the impl, which is what lets this file compile at all.
+    assert_eq!(w.present(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// An argument written as `_`, which is an ordinary thing to find in a trait
+// declaration and is *not* an expression: replaying the pattern as the forwarded
+// call's argument is "error: in expressions, `_` can only be used on the left-hand
+// side of an assignment". Each argument is renamed to a fresh binding instead.
+// ---------------------------------------------------------------------------
+
+#[delegatable_trait]
+trait Ignoring {
+    fn discard(&self, _: u32, kept: u32) -> u32;
+}
+
+struct IgnoringInner;
+
+impl Ignoring for IgnoringInner {
+    fn discard(&self, _: u32, kept: u32) -> u32 {
+        kept + 1
+    }
+}
+
+struct IgnoringWrapper {
+    inner: IgnoringInner,
+}
+
+#[delegate_trait(target = inner)]
+impl Ignoring for IgnoringWrapper {}
+
+#[test]
+fn wildcard_argument_patterns_are_forwarded_positionally() {
+    let w = IgnoringWrapper {
+        inner: IgnoringInner,
+    };
+    // The second argument has to arrive as the second argument, so a rename that
+    // lost the order would show up here rather than only at compile time.
+    assert_eq!(w.discard(99, 7), 8);
+}
+
+// ---------------------------------------------------------------------------
+// `unsafe fn`. A function body is not an unsafe block of its own, so the forwarding
+// call has to be wrapped: otherwise the expansion warns under
+// `unsafe_op_in_unsafe_fn`, at a span inside the generated macro where nobody can
+// silence it — and a warning is an error under `#![deny(warnings)]`. `cargo clippy
+// --all-targets -- -D warnings` is what holds this: the warning would be emitted
+// while compiling this very file.
+// ---------------------------------------------------------------------------
+
+#[delegatable_trait]
+trait Raw {
+    unsafe fn read_at(&self, p: *const u32) -> u32;
+}
+
+struct RawInner;
+
+impl Raw for RawInner {
+    unsafe fn read_at(&self, p: *const u32) -> u32 {
+        unsafe { *p }
+    }
+}
+
+struct RawWrapper {
+    inner: RawInner,
+}
+
+#[delegate_trait(target = inner)]
+impl Raw for RawWrapper {}
+
+#[test]
+fn unsafe_methods_delegate() {
+    let w = RawWrapper { inner: RawInner };
+    let n = 42u32;
+    assert_eq!(unsafe { w.read_at(&raw const n) }, 42);
+}
+
+// ---------------------------------------------------------------------------
 // The trait method is reached through the trait, not through an inherent method
 // of the same name on the field's type.
 // ---------------------------------------------------------------------------
@@ -264,6 +427,67 @@ impl Named for ShadowWrapper {}
 fn inherent_method_does_not_shadow_the_trait_method() {
     let w = ShadowWrapper { inner: Shadowed };
     assert_eq!(w.name(), "trait");
+}
+
+// ---------------------------------------------------------------------------
+// What `target` may name. It is a *field path*, so a tuple index — the newtype,
+// which is the shape the documentation leads with — and a nested field are as good
+// as a bare name. `target = self.inner` is still refused, since `target` is a place
+// and not an expression; see `tests/ui/delegate_target_is_expression.rs`.
+// ---------------------------------------------------------------------------
+
+#[delegatable_trait]
+trait Reader {
+    fn read(&self) -> u32;
+    fn also(&self) -> u32;
+}
+
+struct ReaderInner(u32);
+
+impl Reader for ReaderInner {
+    fn read(&self) -> u32 {
+        self.0
+    }
+    fn also(&self) -> u32 {
+        self.0 + 1
+    }
+}
+
+/// A newtype: the field is `0`, which is not an identifier at all.
+struct NewTypeWrapper(ReaderInner);
+
+#[delegate_trait(target = 0)]
+impl Reader for NewTypeWrapper {}
+
+struct Middle {
+    deep: ReaderInner,
+}
+
+/// A nested field, reached by a dotted path.
+struct NestedWrapper {
+    middle: Middle,
+}
+
+#[delegate_trait(target = middle.deep)]
+impl Reader for NestedWrapper {
+    fn also(&self) -> u32 {
+        999
+    }
+}
+
+#[test]
+fn target_may_be_a_tuple_index_or_a_nested_field() {
+    let n = NewTypeWrapper(ReaderInner(5));
+    assert_eq!(n.read(), 5);
+    assert_eq!(n.also(), 6);
+
+    let d = NestedWrapper {
+        middle: Middle {
+            deep: ReaderInner(10),
+        },
+    };
+    assert_eq!(d.read(), 10);
+    assert_eq!(d.also(), 999);
 }
 
 // ---------------------------------------------------------------------------
@@ -576,6 +800,120 @@ fn interleaved_kinds_delegate() {
     assert_eq!(w.t(3), 3);
     assert_eq!(w.n(), [7, 7]);
     assert_eq!(w.u(-1), -1);
+}
+
+/// A default that *mentions* an earlier parameter. The default is the trait's own
+/// text, so `A` in it names the trait's parameter and nothing at the impl site: it
+/// needs the same rewrite a signature gets, into the metavariable the arm has just
+/// bound. Emitted verbatim it is `E0425 cannot find type A in this scope`, pointing
+/// into the trait.
+#[delegatable_trait]
+trait Chain<A, B = Vec<A>> {
+    fn one(&self, a: A) -> u64;
+    fn many(&self, b: B) -> u64;
+}
+
+struct ChainImpl;
+
+impl Chain<u8> for ChainImpl {
+    fn one(&self, a: u8) -> u64 {
+        a as u64
+    }
+    fn many(&self, b: Vec<u8>) -> u64 {
+        b.len() as u64
+    }
+}
+
+struct ChainWrapper {
+    inner: ChainImpl,
+}
+
+// `B` is left out, so the trait fills in `Vec<A>` — with `A` already substituted.
+#[delegate_trait(target = inner)]
+impl Chain<u8> for ChainWrapper {}
+
+#[test]
+fn a_default_naming_an_earlier_parameter_delegates() {
+    let w = ChainWrapper { inner: ChainImpl };
+    assert_eq!(w.one(3), 3);
+    assert_eq!(w.many(vec![1, 2, 3]), 3);
+}
+
+/// The same, with a *const* parameter inside the default: `[u8; N]` has to come out
+/// as `[u8; { $__dt_ct_N }]`, since the const travels as an `expr` fragment and only
+/// braces let one stand where a const argument is expected.
+#[delegatable_trait]
+trait Sized2<const N: usize, T = [u8; N]> {
+    fn count(&self) -> usize;
+    fn buf(&self, t: T) -> usize;
+}
+
+struct Sized2Impl;
+
+impl Sized2<3> for Sized2Impl {
+    fn count(&self) -> usize {
+        3
+    }
+    fn buf(&self, t: [u8; 3]) -> usize {
+        t.iter().map(|b| *b as usize).sum()
+    }
+}
+
+struct Sized2Wrapper {
+    inner: Sized2Impl,
+}
+
+#[delegate_trait(target = inner)]
+impl Sized2<3> for Sized2Wrapper {}
+
+#[test]
+fn a_default_naming_a_const_parameter_delegates() {
+    let w = Sized2Wrapper { inner: Sized2Impl };
+    assert_eq!(w.count(), 3);
+    assert_eq!(w.buf([1, 2, 3]), 6);
+}
+
+/// A trait parameter whose name is also an associated type's, beside a binding of
+/// that associated type. `Item` is an ordinary name for a parameter, and
+/// `Iterator<Item = u8>` is an ordinary thing to return; substituting by token
+/// makes the pair into `Iterator<u32 = u8>`, an `E0220` blamed on the trait. The
+/// binding's name is not a type, so a substitution that knows the difference leaves
+/// it alone.
+#[delegatable_trait]
+trait Feed<Item> {
+    fn one(&self) -> Item;
+    fn many(&self) -> Box<dyn Iterator<Item = u8>>;
+    /// A binding in argument position, and one nested under a second parameter name.
+    fn count(&self, it: Box<dyn Iterator<Item = u8>>) -> usize;
+}
+
+struct FeedImpl;
+
+impl Feed<u32> for FeedImpl {
+    fn one(&self) -> u32 {
+        7
+    }
+    fn many(&self) -> Box<dyn Iterator<Item = u8>> {
+        Box::new([1u8, 2, 3].into_iter())
+    }
+    fn count(&self, it: Box<dyn Iterator<Item = u8>>) -> usize {
+        it.count()
+    }
+}
+
+struct FeedWrapper {
+    inner: FeedImpl,
+}
+
+#[delegate_trait(target = inner)]
+impl Feed<u32> for FeedWrapper {}
+
+#[test]
+fn a_parameter_named_like_an_associated_type_delegates() {
+    let w = FeedWrapper { inner: FeedImpl };
+    assert_eq!(w.one(), 7);
+    assert_eq!(w.many().sum::<u8>(), 6);
+    assert_eq!(w.count(Box::new([4u8, 5].into_iter())), 2);
 }
 
 // ---------------------------------------------------------------------------

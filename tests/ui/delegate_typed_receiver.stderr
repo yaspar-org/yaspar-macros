@@ -1,0 +1,20 @@
+error[E0308]: mismatched types
+  --> tests/ui/delegate_typed_receiver.rs:11:1
+   |
+11 | #[delegatable_trait]
+   | ^^^^^^^^^^^^^^^^^^^^
+   | |
+   | expected `Box<_>`, found `Base`
+   | arguments to this function are incorrect
+...
+28 | #[delegate_trait(target = inner)]
+   | --------------------------------- in this attribute macro expansion
+   |
+   = note: expected struct `Box<_>`
+              found struct `Base`
+note: method defined here
+  --> tests/ui/delegate_typed_receiver.rs:13:8
+   |
+13 |     fn consume(self: Box<Self>) -> u32;
+   |        ^^^^^^^ ----
+   = note: this error originates in the macro `__delegate_impl_Boxed` which comes from the expansion of the attribute macro `delegate_trait` (in Nightly builds, run with -Z macro-backtrace for more info)

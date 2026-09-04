@@ -1,0 +1,5 @@
+error: `target` is a field name, not an expression: write `target = inner`, not `target = self.inner`
+  --> tests/ui/delegate_target_is_expression.rs:29:27
+   |
+29 | #[delegate_trait(target = self.inner)]
+   |                           ^^^^

@@ -1,0 +1,5 @@
+error: unexpected token
+  --> tests/ui/delegate_target_trailing_tokens.rs:27:32
+   |
+27 | #[delegate_trait(target = inner, extra)]
+   |                                ^
