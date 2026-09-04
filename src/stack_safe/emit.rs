@@ -74,6 +74,21 @@ fn split_params(func: &ItemFn, self_ty: Option<&syn::Type>) -> syn::Result<Split
                 ));
             }
             FnArg::Typed(pt) => {
+                // The payload and the context tuple have one shape for the whole group, so a
+                // parameter that exists only under a predicate cannot be one of them.
+                if let Some(attr) = pt
+                    .attrs
+                    .iter()
+                    .find(|a| a.path().is_ident("cfg") || a.path().is_ident("cfg_attr"))
+                {
+                    return Err(syn::Error::new_spanned(
+                        attr,
+                        "`#[stack_safe]` cannot honour a `#[cfg]` on a parameter: the driver takes \
+                         one payload shape for the whole cycle, and a parameter that comes and \
+                         goes would change it. Write two gated definitions of the function, or \
+                         gate the parameter's *value* inside the body",
+                    ));
+                }
                 let Pat::Ident(PatIdent {
                     ident,
                     by_ref: None,
@@ -783,6 +798,15 @@ fn pretty_type(ty: &impl ToTokens) -> String {
 /// inference, `f(n - 1).wrapping_add(1)` fails with E0689 ("ambiguous numeric
 /// type"). `impl Trait` is the one return type that cannot be written down, so it
 /// goes unannotated.
+/// The return type on its own, for a payload slot; empty where [`ret_annotation`] is.
+fn ret_bare_type(sig: &syn::Signature) -> TokenStream {
+    match &sig.output {
+        ReturnType::Default => quote! { () },
+        ReturnType::Type(_, ty) if annotatable(ty) => quote! { #ty },
+        ReturnType::Type(..) => quote! {},
+    }
+}
+
 fn ret_annotation(sig: &syn::Signature) -> TokenStream {
     match &sig.output {
         ReturnType::Default => quote! { : () },
@@ -866,6 +890,7 @@ fn analyse(
     // with a union of them instead, which each member's entry takes its own variant out of.
     // `impl Trait` cannot be named, so such a return goes unannotated and unjoined.
     let rets: Vec<TokenStream> = funcs.iter().map(|f| ret_annotation(&f.sig)).collect();
+    let ret_types: Vec<TokenStream> = funcs.iter().map(|f| ret_bare_type(&f.sig)).collect();
     let differ = rets.iter().any(|r| r.to_string() != rets[0].to_string());
     // An `impl Trait` return is its own opaque type, so two members that spell one
     // identically still return *different* types, and neither one can be named to join
@@ -905,9 +930,11 @@ fn analyse(
         context: splits.into_iter().next().expect("non-empty").context,
         ret_ann: ret_ann.clone(),
         rets: rets.clone(),
+        ret_types,
         ret_union: ret_union.clone(),
         opts,
         current: Cell::new(0),
+        gates: RefCell::new(Vec::new()),
         local_types: RefCell::new(HashMap::new()),
         loop_stores: RefCell::new(Vec::new()),
     };
@@ -1131,8 +1158,18 @@ pub(super) fn expand_group(
         let st = &states[n];
         let code = &lp.code;
         let prologue = ctx.ctx_prologue();
+        let (gate, stand_in) = gating(&lp.gates);
+        // The stand-in exists only for a gated point: the variant is declared whether the predicate
+        // holds or not, so the match needs an arm either way. Nothing constructs it -- the code that
+        // would is gone -- so its pattern is what tells the compiler what the payload is: `()`,
+        // since nothing reachable travels in it.
+        let stand_in = stand_in.map(|ungated| {
+            quote! { #ungated #input::Enter(#entry::#v(())) => unreachable!("gated out"), }
+        });
         arms.push(quote! {
+            #gate
             #input::Enter(#entry::#v((#(mut #st,)*))) => { #prologue #code },
+            #stand_in
         });
     }
     // One arm per recursive call site: where the driver resumes with the result.
@@ -1141,8 +1178,14 @@ pub(super) fn expand_group(
         let payload = &frames[r];
         let value = &res.value;
         let code = &res.point.code;
+        let (gate, stand_in) = gating(&res.point.gates);
+        let stand_in = stand_in.map(|ungated| {
+            quote! { #ungated #input::Resume(#frame::#variant(()), _) => unreachable!("gated out"), }
+        });
         arms.push(quote! {
+            #gate
             #input::Resume(#frame::#variant((#(mut #payload,)*)), #value) => { #code },
+            #stand_in
         });
     }
     // With no recursive call there is no frame, so the enum is uninhabited and the
@@ -1177,13 +1220,23 @@ pub(super) fn expand_group(
     // A frame has no value outside the closure to hang an ascription on, so its slots are named
     // on the closure's parameter instead. Without this a slot whose only use constrains nothing
     // -- `{x:?}` asks for `Debug` and no more -- stays ambiguous.
+    // A frame behind a `#[cfg]` is left to inference in this annotation: when the predicate holds
+    // the code that builds it says what it is, and when it does not the arm standing in for it
+    // matches `()`, which says so there. Naming it here could only name one of the two.
     let input_ann = if resumes.is_empty() {
         TokenStream::new()
     } else {
-        let frame_args = frames
+        let frame_args: Vec<TokenStream> = frames
             .iter()
             .enumerate()
-            .map(|(r, fr)| slots_payload_type(&ctx, resumes[r].point.member, fr, self_ty, seed_lt));
+            .map(|(r, fr)| {
+                let point = &resumes[r].point;
+                match point.gates.is_empty() {
+                    true => slots_payload_type(&ctx, point.member, fr, self_ty, seed_lt),
+                    false => quote! { _ },
+                }
+            })
+            .collect();
         let input_ty_name = input_ty();
         let frame_ty_name = frame_ty();
         quote! { : #input_ty_name<_, #frame_ty_name<#(#frame_args),*>, _> }
@@ -1327,6 +1380,20 @@ pub(super) fn expand_group(
         });
     }
     Ok((out, TokenStream::new()))
+}
+
+/// The attributes an arm generated under `#[cfg]` predicates needs: the gate itself, and the gate of
+/// the arm that stands in for it otherwise.
+///
+/// An ungated arm needs neither, and must not get a stand-in: it is the only arm for its variant.
+fn gating(gates: &[TokenStream]) -> (TokenStream, Option<TokenStream>) {
+    match gates {
+        [] => (TokenStream::new(), None),
+        _ => (
+            quote! { #[cfg(all(#(#gates),*))] },
+            Some(quote! { #[cfg(not(all(#(#gates),*)))] }),
+        ),
+    }
 }
 
 /// A payload tuple's contents, each slot given its declared type where one is known.
@@ -1512,6 +1579,11 @@ fn variant_payload_type(
         return quote! { (#(#tys,)*) };
     }
     let n = variant - members;
+    // A gated loop's state is left to inference for the same reason a gated frame's is: naming it
+    // here would name the live case only, and the stand-in arm says `()` in the other.
+    if !loops[n].gates.is_empty() {
+        return quote! { _ };
+    }
     slots_payload_type(ctx, loops[n].member, &states[n], self_ty, seed_lt)
 }
 

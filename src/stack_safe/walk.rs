@@ -29,6 +29,9 @@ pub(super) struct PayloadPoint {
     pub(super) forced: Vec<Ident>,
     /// The code, still containing payload markers.
     pub(super) code: TokenStream,
+    /// The `#[cfg]` predicates this point was written under, outermost first. The arm generated
+    /// for it exists only when they all hold; see `Ctx::gates`.
+    pub(super) gates: Vec<TokenStream>,
 }
 
 /// A resume point: where execution continues once a callee returns.
@@ -111,6 +114,11 @@ pub(super) struct Ctx {
     /// resolution inside a continuation see its receiver's type; left to inference,
     /// `f(n - 1).wrapping_add(1)` is E0689.
     pub(super) rets: Vec<TokenStream>,
+    /// The same as a bare type, for slots rather than bindings. A resumed value's type is the
+    /// callee's return type, and saying so is what lets a payload carrying that value be named --
+    /// which matters when the only code that would have constructed it is `#[cfg]`-ed out and
+    /// inference has nothing else to go on.
+    pub(super) ret_types: Vec<TokenStream>,
     /// The union of the members' return types, when they differ. The driver has one
     /// result type, so a group whose members answer with different types answers with
     /// this instead, and each member's entry takes its own variant back out.
@@ -118,6 +126,11 @@ pub(super) struct Ctx {
     pub(super) opts: Opts,
     /// Which member's body is being lowered; one at a time, so one slot suffices.
     pub(super) current: Cell<usize>,
+    /// The `#[cfg]` predicates enclosing the code being lowered, outermost first. A recursive call
+    /// under one is cut across the driver's arms, so each arm it produces has to carry the same
+    /// gate -- and the frame variant it uses needs an arm for the other case, since the enum is
+    /// declared whatever the predicate says.
+    pub(super) gates: RefCell<Vec<TokenStream>>,
     /// Declared type of each annotated `let`, by `(member, name)`; `None` if bound
     /// inconsistently. Re-applied where a payload slot carries that local.
     pub(super) local_types: RefCell<HashMap<(usize, String), Option<TokenStream>>>,
@@ -316,6 +329,7 @@ impl Ctx {
             scope,
             forced: iter.into_iter().chain(also_forced).collect(),
             code: TokenStream::new(),
+            gates: self.gates.borrow().clone(),
         });
         loops.len() - 1
     }
@@ -327,6 +341,10 @@ impl Ctx {
     /// How a resumed value is taken out of the union, if there is one. The callee is
     /// known at the call site, so the variant is too.
     pub(super) fn unwrap_result(&self, callee: usize, v: &Ident) -> TokenStream {
+        let bare = &self.ret_types[callee];
+        if !bare.is_empty() {
+            self.note_local_type(v, bare.clone());
+        }
         let Some(union) = &self.ret_union else {
             let ann = &self.rets[callee];
             return quote! { let #v #ann = #v; };
@@ -370,6 +388,28 @@ impl Ctx {
         }
     }
 
+    /// The type of an expression the transform is about to bind to a temporary, where it can say:
+    /// a bare binding has the type its parameter or its annotated `let` gave it. Nothing else is
+    /// guessed. Used to keep a temporary's payload slot nameable, which is what a gated frame needs
+    /// -- there, inference has no construction to work from.
+    pub(super) fn type_of(&self, e: &syn::Expr) -> Option<TokenStream> {
+        let syn::Expr::Path(p) = e else { return None };
+        let name = p.path.get_ident()?;
+        self.slot_type(self.current.get(), name)
+    }
+
+    /// Lower `body` as written under one more `#[cfg]` predicate.
+    pub(super) fn under_gate<T>(
+        &self,
+        gate: TokenStream,
+        body: impl FnOnce() -> syn::Result<T>,
+    ) -> syn::Result<T> {
+        self.gates.borrow_mut().push(gate);
+        let out = body();
+        self.gates.borrow_mut().pop();
+        out
+    }
+
     /// Reserve a resume point for a recursive call; the code is filled in once the
     /// continuation has been generated.
     pub(super) fn reserve_resume(
@@ -385,6 +425,7 @@ impl Ctx {
                 scope,
                 forced,
                 code: TokenStream::new(),
+                gates: self.gates.borrow().clone(),
             },
             value,
         });

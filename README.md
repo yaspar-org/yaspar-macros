@@ -455,6 +455,13 @@ Within a function body, the transformation handles `if`, `match` and blocks; `fo
 own; parameters that destructure; `&mut` parameters, `&self` and `&mut self` methods; generics and where-clauses; and any
 number of recursive call sites.
 
+A `#[cfg]` travels with the construct it was written on, even though the construct is cut across the driver's arms: a
+statement, a match arm and a struct-expression field each carry their predicate to every piece, and the code that a
+failing predicate disables is not compiled. `tests/cfg_gates.rs` pins both answers with `cfg(all())` and `cfg(any())`,
+disabling code that would not compile if a gate failed to travel. What is refused instead, with the error on the span:
+a `#[cfg]` deeper inside an expression, a `#[cfg_attr]` anywhere a call is cut out of, and a `#[cfg]` on a parameter,
+which would change the payload's shape for the whole cycle.
+
 It preserves semantics as well as syntax: argument evaluation order, `&&` and `||` laziness, compound assignment, and
 the iterator expression of a loop being evaluated exactly once. Every value is dropped exactly once, with no leak and no
 double drop, even when a panic unwinds through parked frames. Each of these is checked in `tests/observable.rs` against

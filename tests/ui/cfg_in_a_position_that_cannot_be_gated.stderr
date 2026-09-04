@@ -1,0 +1,17 @@
+error: `#[stack_safe]` cannot honour a `#[cfg]` on an expression that recurses: the recursive call in it is cut into a state machine, so the gated code does not stay in one piece and there is nothing left to gate — what the `#[cfg]` disables would compile and run. Put the `#[cfg]` on the whole statement, on a match arm, or on an item
+  --> tests/ui/cfg_in_a_position_that_cannot_be_gated.rs:17:18
+   |
+17 |     let v = 1 + (#[cfg(any())] operand(n - 1));
+   |                  ^^^^^^^^^^^^^
+
+error: `#[stack_safe]` cannot honour a `#[cfg_attr]` on code that recurses: the recursive call in it is cut into a state machine, and what this expands to may only mean something where it was written. Use a plain `#[cfg]`, or put this on an item
+  --> tests/ui/cfg_in_a_position_that_cannot_be_gated.rs:26:5
+   |
+26 |     #[cfg_attr(any(), allow(unused))]
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `#[stack_safe]` cannot honour a `#[cfg]` on a parameter: the driver takes one payload shape for the whole cycle, and a parameter that comes and goes would change it. Write two gated definitions of the function, or gate the parameter's *value* inside the body
+  --> tests/ui/cfg_in_a_position_that_cannot_be_gated.rs:32:22
+   |
+32 | fn parameter(n: u64, #[cfg(any())] extra: u64) -> u64 {
+   |                      ^^^^^^^^^^^^^
