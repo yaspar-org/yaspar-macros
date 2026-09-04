@@ -83,10 +83,9 @@ pub(super) struct Scope {
     /// The functions to scan, markers and all.
     funcs: Vec<ItemFn>,
     host: Host,
-    /// A marker on the container itself, if it carried one — a nested `#[stack_safe(..)] mod m`.
-    /// Options are scoped like bindings, so this *shadows* whatever the enclosing attribute asked
-    /// for, throughout this scope. Taking it off is not optional either: left in place the compiler
-    /// would run the attribute again, on a body already rewritten.
+    /// A marker on the container itself — a nested `#[stack_safe(..)] mod m` — whose options
+    /// shadow the enclosing attribute's for this scope. Taken off either way: left in place, the
+    /// compiler would run the attribute again on a rewritten body.
     own_opts: Option<Opts>,
 }
 
@@ -165,12 +164,9 @@ impl Scope {
         Ok(self.expand_reporting(opts, thread_out)?.0)
     }
 
-    /// The scope the attribute was written on, which owes an answer for itself.
-    ///
-    /// A function that turns out to recurse nowhere is already an error, reported by name. A
-    /// container was not, so `#[stack_safe] mod m` over a module whose functions merely call one
-    /// another in a line compiled with no diagnostic at all — and a refactor that broke a module's
-    /// recursion was undetectable. It is the same mistake either way, so it now reads the same way.
+    /// The scope the attribute was written on, which owes an answer for itself: one that flattened
+    /// nothing is a mistake. It was already an error on a function; a container was silent, so a
+    /// refactor that broke a module's recursion went unnoticed.
     pub(super) fn expand_annotated(self, opts: Opts) -> syn::Result<TokenStream> {
         let complaint = self.host.no_effect();
         let (tokens, transformed) = self.expand_reporting(opts, true)?;
@@ -180,10 +176,8 @@ impl Scope {
         }
     }
 
-    /// The same, saying also whether anything in this scope was rewritten.
-    ///
-    /// Which is what an annotated container has to know: one that flattened nothing is a mistake,
-    /// and a container reached by descending into it may have been the one that did the flattening.
+    /// The same, saying also whether anything here was rewritten — counting nested containers,
+    /// which may have been the ones that did it.
     pub(super) fn expand_reporting(
         self,
         opts: Opts,
@@ -235,13 +229,9 @@ impl Host {
         }
     }
 
-    /// The name a call may reach into this scope by, other than `Self` or `self`: the leading
-    /// segment of the type an impl block is for, or the module's own ident. Generics do not matter
-    /// here, unlike for [`Host::self_ty`] — this is a name to compare a path against, not a type to
-    /// write down.
-    ///
-    /// A lone function has none. Nothing names its body from outside, and the function itself is
-    /// reached by the name it was declared with, which is the bare form already.
+    /// The name a call may reach into this scope by, other than `Self` or `self`: the impl's self
+    /// type or the module's ident. A name to compare a path against, not a type to write down, so
+    /// generics do not matter here as they do for [`Host::self_ty`]. A lone function has none.
     fn host_name(&self) -> Option<Ident> {
         match self {
             Host::Fn { .. } => None,
@@ -386,16 +376,12 @@ fn agreed_opts(defs: &[scope::Def], cycle: &[usize]) -> syn::Result<Opts> {
     Ok(opts)
 }
 
-/// Expand every module and impl block declared in this body, deepest scope first, and report
-/// whether there was one.
+/// Expand every module and impl block declared in this body, deepest first.
 ///
-/// A body is a scope of item definitions like any other, so it may hold a container, and a
-/// recursion inside that container is exactly as invisible to the native stack as one anywhere
-/// else. It is handed to the same one entry a container declared in a module is, and what comes
-/// back is written where it stood. `thread_out` is false: nothing outside the body could name the
-/// container's functions anyway.
-///
-/// A marker of its own says what that subtree wants, in full, exactly as one on a `fn` does.
+/// A body is a scope of items like any other, so it may hold a container, and a recursion in one
+/// overflows the stack just the same. Each goes through the same entry a container in a module
+/// does, and what comes back is written where it stood. Nothing outside the body can name its
+/// functions, so they are not threaded out.
 fn expand_nested_containers(func: &mut ItemFn, opts: Opts) -> syn::Result<bool> {
     struct V {
         opts: Opts,
@@ -460,15 +446,13 @@ fn expand_nested_containers(func: &mut ItemFn, opts: Opts) -> syn::Result<bool> 
     }
 }
 
-/// Refuse a recursion the scan can see and the transform cannot rewrite.
+/// Refuse a recursion the scan can see and the rewriter cannot follow.
 ///
-/// A call written through a path that says what it names but is not one of the shapes the rewriter
-/// follows — `T::g(..)` inside `impl T`, `<Self>::g(..)`, `crate::m::g(..)` inside `#[stack_safe]
-/// mod m` — cannot become an entry into a driver. Treating it as one anyway would emit a function
-/// whose other calls are flattened and whose this one still descends natively, so it is reported
-/// instead, and only where it matters: such a call closes a cycle nothing else in the graph closes.
-/// One that merely reaches a function of this scope, recursion or no recursion, is an ordinary call
-/// and stays one.
+/// `T::g(..)` inside `impl T`, `<Self>::g(..)`, `crate::m::g(..)` inside `#[stack_safe] mod m`: each
+/// plainly names a member, and none is a shape that can become an entry into the driver. Flattening
+/// the rest of the function and leaving this one call on the native stack would be worse than
+/// saying so. Reported only where it matters — where such a call is what closes a cycle. One that
+/// merely reaches a member is an ordinary call and stays one.
 fn unresolvable_recursion(
     defs: &[scope::Def],
     edges: &[Vec<bool>],
@@ -479,8 +463,8 @@ fn unresolvable_recursion(
     if blocked.is_empty() {
         return Ok(());
     }
-    // The graph as it would be if every one of these calls were an edge, which is what says whether
-    // one of them is what makes a cycle a cycle.
+    // The graph as it would be if these calls were edges, which is what says whether one of them
+    // is what makes a cycle a cycle.
     let mut optimistic = edges.to_vec();
     for b in blocked {
         optimistic[b.caller][b.callee] = true;
@@ -520,8 +504,8 @@ fn expand_roots(roots: Roots<'_>) -> syn::Result<Scanned> {
         trait_impl,
     } = roots;
     let mut roots = funcs;
-    // A container declared in a body is a scope of its own, so it is expanded before anything else
-    // looks at the body: what comes back is tokens, and the scan has nothing more to do there.
+    // A container in a body is its own scope, expanded before anything else looks at the body:
+    // what comes back is tokens, and the scan is done with it.
     let mut changed = vec![false; roots.len()];
     for (i, root) in roots.iter_mut().enumerate() {
         changed[i] = expand_nested_containers(root, scope_opts)?;

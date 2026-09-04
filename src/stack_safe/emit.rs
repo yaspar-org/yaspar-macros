@@ -39,16 +39,13 @@ struct Split {
 /// argument payload. Shared references are `Copy`, so the payload is fine for
 /// them.
 ///
-/// Payload parameters are plain (optionally `mut`) idents by the time this runs: the expansion
-/// has to rebuild the argument tuple as an *expression*, which a destructuring pattern cannot be,
-/// so [`desugar_param_patterns`] has already given each pattern a name and re-bound it in the
-/// body.
+/// Payload parameters are plain (optionally `mut`) idents by now: the argument tuple is rebuilt as
+/// an *expression*, so [`desugar_param_patterns`] has already named every pattern.
 /// Callers run [`reject_unsupported_signature`] first, so the signature is known
 /// to be one the transform can handle.
 fn split_params(func: &ItemFn, self_ty: Option<&syn::Type>) -> syn::Result<Split> {
     let sig = &func.sig;
-    // Whether a `mut` on a slot binding matters is a question about the body, so the body is
-    // needed here as well as the signature.
+    // Whether a `mut` on a slot binding matters is a question about the body.
     let func_body = func.block.clone();
 
     let mut param_pats = Vec::new();
@@ -60,10 +57,9 @@ fn split_params(func: &ItemFn, self_ty: Option<&syn::Type>) -> syn::Result<Split
     let mut param_names = Vec::new();
     let mut context: Vec<CtxEntry> = Vec::new();
     let mut context_at: HashMap<usize, usize> = HashMap::new();
-    // Compared across the group, so what is kept is the *key*: the type with its parentheses
-    // peeled and the lifetimes the user named erased. Two spellings of one type must not be
-    // presented to the user as their own mistake. The pretty form is kept beside it, since the
-    // message that names a mismatch should show what was actually written.
+    // Slots are compared by *key* — parentheses peeled, named lifetimes erased — so that two
+    // spellings of one type are not a mismatch. The pretty form is kept for the message, which
+    // should quote what was written.
     let mut slot_keys: Vec<String> = Vec::new();
     let mut slot_types: Vec<String> = Vec::new();
     let mut arg_index = 0usize;
@@ -86,10 +82,8 @@ fn split_params(func: &ItemFn, self_ty: Option<&syn::Type>) -> syn::Result<Split
                     ..
                 }) = &*pt.pat
                 else {
-                    // `desugar_param_patterns` gives every destructuring payload parameter a
-                    // name of its own and re-binds the pattern in the body, so what is left
-                    // here is a `&mut` parameter that destructures — a context slot, which is
-                    // not a value to take apart. It has its own message there.
+                    // Payload patterns are already named by `desugar_param_patterns`, so what is
+                    // left is a `&mut` that destructures — a slot, not a value to take apart.
                     return Err(syn::Error::new(
                         pt.pat.span(),
                         "`#[stack_safe]` requires plain identifier parameters; bind the pattern \
@@ -97,10 +91,9 @@ fn split_params(func: &ItemFn, self_ty: Option<&syn::Type>) -> syn::Result<Split
                     ));
                 };
                 if is_context_slot(&pt.ty) {
-                    // A `mut` on the binding is inert unless the body assigns to the binding
-                    // itself. Rebinding *through* it — `*out = ..`, `out.push(..)` — is the
-                    // ordinary use and always was fine; only reassigning the binding would be
-                    // invisible to the next step, since every step re-derives it.
+                    // A `mut` here is inert unless the body assigns to the binding itself.
+                    // Writing *through* it is the ordinary use; only reassignment would be
+                    // invisible to the next step, which re-derives the binding.
                     if let Some(m) = mutability
                         && assigns_binding(&func_body, ident)
                     {
@@ -117,10 +110,8 @@ fn split_params(func: &ItemFn, self_ty: Option<&syn::Type>) -> syn::Result<Split
                     context_at.insert(arg_index, context.len());
                     slot_keys.push(pretty_type(&slot_key(&pt.ty, self_ty)));
                     slot_types.push(pretty_type(&pt.ty));
-                    // The slot's *own* spelling is not what the driver holds: the context tuple
-                    // is one type for the whole group, and a lifetime one member happens to have
-                    // named is not a name the driver can use. What it holds is the erased form,
-                    // where that lifetime is inferred like any other in a `let`.
+                    // The context tuple is one type for the whole group, so it holds the erased
+                    // form: a lifetime one member happens to name is no name the driver can use.
                     let ty = slot_type(&pt.ty);
                     let ty = &ty;
                     context.push(CtxEntry {
@@ -133,9 +124,8 @@ fn split_params(func: &ItemFn, self_ty: Option<&syn::Type>) -> syn::Result<Split
                 } else {
                     param_pats.push(quote! { #mutability #ident });
                     param_names.push(ident.clone());
-                    // A type that cannot be written on a `let` — `impl Trait`, at the top level
-                    // or nested inside, and `!` — cannot be annotated here; such a parameter
-                    // goes unpinned. See `annotatable`.
+                    // A type no `let` can carry — `impl Trait`, nested or not, and `!` — cannot be
+                    // annotated here, and such a parameter goes unpinned. See `annotatable`.
                     let ty = &pt.ty;
                     param_types.push(if !annotatable(ty) {
                         TokenStream::new()
@@ -801,12 +791,9 @@ fn ret_annotation(sig: &syn::Signature) -> TokenStream {
     }
 }
 
-/// May this type be written on a `let` in the driver?
-///
-/// Two may not, and both are legal where the user wrote them. `impl Trait` is not allowed in the
-/// type of a binding at all — `E0562` — and it is not always the whole type: `Box<impl Iterator>`
-/// and `Vec<impl Copy>` hide one inside. And `!` is stable in return position only, so annotating
-/// a `let` with it is `E0658` on a signature that compiles perfectly without this attribute.
+/// May this type be written on a `let` in the driver? Two may not, and both are legal where the
+/// user wrote them: `impl Trait`, which `E0562` forbids on a binding and which need not be the whole
+/// type (`Box<impl Iterator>`), and `!`, which is stable in return position only.
 fn annotatable(ty: &syn::Type) -> bool {
     !names_impl_trait_or_self(ty).0 && !matches!(peel_type(ty), syn::Type::Never(_))
 }
@@ -1056,8 +1043,8 @@ pub(super) fn expand_group(
     let mut methods: Vec<Option<MethodSplit>> = Vec::with_capacity(funcs.len());
     for func in &mut funcs {
         // Before anything reads a signature: an `impl Trait` parameter becomes the generic it
-        // already is, so its type has a name the payload can be pinned with, and a parameter
-        // that destructures gets a name of its own with the pattern re-bound in the body.
+        // already is, so the payload can be pinned by name, and a parameter that destructures is
+        // given a name with the pattern re-bound in the body.
         desugar_apit(func);
         desugar_param_patterns(func)?;
         methods.push(desugar_receiver(func, &group_names)?);

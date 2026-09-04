@@ -35,10 +35,9 @@
 //!                                   __delegate_impl_Store, [inner], [], Store<u32>, u32);
 //! ```
 //!
-//! The field travels as a bracketed *token list* rather than an `ident`, because it is
-//! not always an identifier: a newtype's field is `0`, and `$field:ident` cannot hold
-//! that. A `tt` list splices into `self.$($field)*` for a name, an index and a dotted
-//! path alike.
+//! The field travels as a bracketed *token list* rather than an `ident`, because it is not always
+//! one: a newtype's field is `0`. A `tt` list splices into `self.$($field)*` for a name, an index
+//! and a dotted path alike.
 //!
 //! Every arm takes the macro's own path as its first argument and passes it on, rather
 //! than recursing through the bare name. A bare name in a macro body resolves at the
@@ -63,13 +62,11 @@
 //! the trait's parameters (`fn get<K>(..)` inside `trait Store<K>` is E0403, and the
 //! lifetime form is E0496), so every mention is the trait's own.
 //!
-//! It does have to know a mention from a coincidence, though, which is why the type and
-//! const substitutions walk the parsed signature rather than its tokens: an
-//! associated-type *binding* puts a bare identifier exactly where a type argument would
-//! go, so a token walk turns `Iterator<Item = u8>` into `Iterator<$__dt_ty_Item = u8>`
-//! for any trait whose parameter happens to be called `Item`. Lifetimes stay a token
-//! walk — a `syn::Lifetime` has nowhere to put a `$name`, and a tick cannot be mistaken
-//! for anything else.
+//! It does have to tell a mention from a coincidence, which is why the type and const
+//! substitutions walk the parsed signature rather than its tokens: an associated-type *binding*
+//! puts a bare identifier where a type argument would go, so a token walk turns
+//! `Iterator<Item = u8>` into `Iterator<$__dt_ty_Item = u8>` for any trait with a parameter called
+//! `Item`. Lifetimes stay a token walk, since a `syn::Lifetime` has nowhere to put a `$name`.
 //!
 //! # Why the skip list is matched inside `macro_rules!`
 //!
@@ -82,17 +79,11 @@
 //!
 //! # What travels with a signature
 //!
-//! The method's attributes do. That is not cosmetic: an attribute macro runs *before*
-//! `cfg` stripping, so a `#[cfg]`-gated method is recorded here like any other, and
-//! dropping its attribute would emit it into every impl unconditionally — where the
-//! trait, which *was* stripped, no longer has it. All attributes are re-emitted, not
-//! just the `cfg` family, since a trait method's attributes are valid on an impl method
-//! too and there is nothing to gain from a list that has to be extended per attribute.
-//!
-//! One consequence is worth knowing: a `#[cfg]` on a trait method from *another* crate
-//! is evaluated against the **consumer's** features, because that is where the
-//! expansion happens. A method the trait's own crate compiled in can therefore be
-//! missing from the wrapper, and vice versa.
+//! The method's attributes do, all of them: an attribute macro runs *before* `cfg` stripping, so a
+//! gated method is recorded here like any other, and dropping its `#[cfg]` would emit it into every
+//! impl unconditionally — where the trait, which *was* stripped, no longer has it. Note that a
+//! `#[cfg]` on a trait method from another crate is then evaluated against the **consumer's**
+//! features, since that is where the expansion happens.
 //!
 //! # Limitations
 //!
@@ -100,9 +91,9 @@
 //! const is not, so a trait that has one must have it supplied by the impl block as
 //! usual. Methods with a default body are left to their default.
 //!
-//! A method needs a plain `self`, `&self` or `&mut self` receiver to be forwarded:
-//! without a receiver there is no `self` to read the field out of, and a receiver
-//! written as a type (`self: Box<Self>`) is a type a field does not have. Either one is
+//! Forwarding needs a `self`, `&self` or `&mut self` receiver: without one there is no `self` to
+//! read the field out of, and a typed receiver (`self: Box<Self>`) is a type the field does not
+//! have. Either one is
 //! rejected by name, and writing the method in the impl block is the way through — the
 //! skip list honours it there like any other override.
 //!
@@ -168,11 +159,9 @@ use syn::{
 
 /// `target = <field>` — the field every missing method is forwarded to.
 ///
-/// A dotted list of [`Member`]s rather than a bare name, so that a tuple index — the
-/// newtype case, `#[delegate_trait(target = 0)]` — and a nested field
-/// (`target = inner.deep`) work as well. It is a field *path* and not an expression:
-/// the tokens are spliced in after `self.` inside the helper macro, and nothing else
-/// would mean anything there.
+/// A dotted list of [`Member`]s rather than a bare name, so that a tuple index (`target = 0`) and a
+/// nested field (`target = inner.deep`) work too. A field *path*, not an expression: the tokens are
+/// spliced in after `self.` in the helper macro, where nothing else would mean anything.
 struct DelegateTraitArgs {
     target: Punctuated<Member, Token![.]>,
 }
@@ -278,9 +267,8 @@ pub fn expand_trait_def(attr: TokenStream, item: TokenStream) -> syn::Result<Tok
     let arity_guard = if params.is_empty() {
         TokenStream::new()
     } else {
-        // A defaulted parameter may be left out, so what the trait accepts is a *range*.
-        // Saying "takes 2" of a `trait Pair<A, B = u8>` sends the reader looking for a
-        // second argument they are entitled to omit.
+        // A defaulted parameter may be left out, so what the trait accepts is a *range*: saying
+        // "takes 2" of a `trait Pair<A, B = u8>` sends the reader after an argument they may omit.
         let most = params.0.len();
         let fewest = most - params.defaults();
         let expected = if fewest == most {
@@ -463,10 +451,8 @@ struct Param {
 impl Param {
     /// The tokens this parameter is replaced by in a recorded signature.
     ///
-    /// A const parameter travels as an `expr` fragment, so every use of it is
-    /// *braced*: `[u8; { $n }]` and `Holder<{ $n }>`. Braces are what let an
-    /// expression stand where a const argument is expected, and they are accepted in
-    /// both positions, so one form serves them all.
+    /// A const parameter travels as an `expr` fragment, so every use is *braced* — `[u8; { $n }]`,
+    /// `Holder<{ $n }>` — which is what lets an expression stand where a const argument goes.
     fn substitution(&self) -> TokenStream {
         let m = &self.meta;
         match self.kind {
@@ -482,10 +468,9 @@ enum ParamKind {
     Const,
 }
 
-/// `trait Store<K = Vec<u8>>` / `trait Buf<const N: usize = 4>` — kept as the syntax
-/// node rather than as tokens, because it needs the same parameter substitution a
-/// signature does: `trait Pair<A, B = Vec<A>>` has to emit `Vec<$__dt_ty_A>`, and that
-/// rewrite is type-directed.
+/// `trait Store<K = Vec<u8>>` / `trait Buf<const N: usize = 4>`. Kept as a syntax node rather than
+/// tokens because it needs the same substitution a signature does: `trait Pair<A, B = Vec<A>>` has
+/// to emit `Vec<$__dt_ty_A>`.
 enum ParamDefault {
     Type(Type),
     Const(Expr),
@@ -615,10 +600,9 @@ impl TraitParams {
                     let m = &p.meta;
                     quote! { $#m }
                 } else {
-                    // A default may name an earlier parameter — `trait Pair<A, B = Vec<A>>`
-                    // — and `A` binds nothing at the impl site. It needs the same rewrite
-                    // a signature gets, and the metavariables it becomes are the ones this
-                    // arm has just bound.
+                    // A default may name an earlier parameter — `trait Pair<A, B = Vec<A>>` —
+                    // where `A` binds nothing at the impl site, so it needs the same rewrite a
+                    // signature gets, into the metavariables this arm has just bound.
                     self.rewrite_default(p.default.as_ref().expect("trailing params have defaults"))
                 }
             });
@@ -662,8 +646,8 @@ impl TraitParams {
     /// Replace every mention of one of the trait's *lifetime* parameters with the
     /// metavariable that stands for it.
     ///
-    /// This one stays a token walk, where the type and const substitutions do not: a
-    /// `syn::Lifetime` is an identifier behind a tick and cannot hold a `$name`, so
+    /// A token walk, where the type and const substitutions are not: a `syn::Lifetime` is an
+    /// identifier behind a tick and cannot hold a `$name`, so
     /// there is nothing to put in its place at the syntax level. It is also the one
     /// case where a token walk is safe, because a tick has exactly one meaning — a
     /// lifetime — and nothing else in a signature is spelled that way.
@@ -710,18 +694,13 @@ impl TraitParams {
 /// Substitutes the trait's type and const parameters, in *type* and *expression*
 /// positions only.
 ///
-/// A token walk cannot do this. Replacing every identifier that reads like a parameter
-/// name also hits the ones that are not types at all — most sharply an associated-type
-/// *binding*, whose name is an identifier in the same place a type argument would be:
-/// a `trait Feed<Item>` turns `Box<dyn Iterator<Item = u8>>` into
-/// `Iterator<$__dt_ty_Item = u8>`, an `E0220` blamed on the trait. `Item`, `Output`,
-/// `Error`, `Target` and `Key` are all ordinary parameter names, so this is not exotic.
-///
-/// Walking the parsed signature instead makes the distinction structural: a binding
-/// name is a plain `Ident` field of `syn::AssocType`, never a [`Type`], so it is
-/// unreachable from here. The remaining gap is a macro invocation in a type or
-/// expression position, whose body syn keeps as opaque tokens; a parameter mentioned
-/// inside one is not substituted.
+/// A token walk cannot do this: replacing every identifier that reads like a parameter name also
+/// hits an associated-type *binding*, whose name sits exactly where a type argument would. A
+/// `trait Feed<Item>` then turns `Box<dyn Iterator<Item = u8>>` into `Iterator<$__dt_ty_Item = u8>`,
+/// an `E0220` blamed on the trait — and `Item`, `Output`, `Error` and `Key` are ordinary parameter
+/// names. Walking the parsed signature makes the distinction structural, since a binding name is an
+/// `Ident` field of `syn::AssocType` and never a [`Type`]. The gap left is a macro invocation, whose
+/// body syn keeps as opaque tokens.
 struct Substitute<'a>(&'a TraitParams);
 
 impl VisitMut for Substitute<'_> {
@@ -730,12 +709,10 @@ impl VisitMut for Substitute<'_> {
         // and after the replacement there is nothing left to descend into.
         syn::visit_mut::visit_type_mut(self, ty);
 
-        // A single, unqualified, argument-less segment is the whole of what a type or
-        // const parameter can be written as. Anything longer — `K::Assoc` — is left
-        // alone deliberately: substitution alone cannot make it work, since `K::Assoc`
-        // is shorthand for `<K as Bound>::Assoc` and the bound does not survive the
-        // trip to the impl site. Left as `K`, it is at least `E0412 cannot find type K`
-        // rather than an `E0223 ambiguous associated type` about `<u8>::Assoc`.
+        // A single unqualified segment is all a type or const parameter can be written as. Longer
+        // — `K::Assoc`, shorthand for `<K as Bound>::Assoc` — is left alone on purpose: the bound
+        // does not survive the trip to the impl site, so substituting would trade `E0412 cannot find
+        // type K` for an `E0223 ambiguous associated type` about `<u8>::Assoc`.
         let Type::Path(path) = ty else { return };
         if path.qself.is_some() || path.path.leading_colon.is_some() {
             return;
@@ -754,10 +731,9 @@ impl VisitMut for Substitute<'_> {
     fn visit_expr_mut(&mut self, expr: &mut Expr) {
         syn::visit_mut::visit_expr_mut(self, expr);
 
-        // Only a const parameter can be named by an expression — an array length,
-        // `[u8; N]`, or a const argument, `Holder<N>`, which syn also hands over as an
-        // expression. A type parameter's name in expression position is not the
-        // trait's parameter and must be left alone.
+        // Only a const parameter can be named by an expression: an array length `[u8; N]` or a
+        // const argument `Holder<N>`. A type parameter's name in expression position is something
+        // else and must be left alone.
         let Expr::Path(path) = expr else { return };
         if path.qself.is_some() || path.path.leading_colon.is_some() {
             return;
@@ -793,29 +769,20 @@ fn path_alias_name(trait_name: &Ident) -> Ident {
 /// `$field` and `$trait_path` are left as `macro_rules!` metavariables: this token
 /// stream is emitted *inside* the helper macro, which is where they are bound.
 ///
-/// The trait method's own attributes come first, ahead of the `#[inline]`. All of them
-/// are re-emitted rather than a `cfg`-only subset: a trait method's attributes are
-/// valid on an impl method too, and passing them all through keeps a `#[doc]`,
-/// `#[must_use]` or `#[allow]` on the forwarder where the author put it, while a filter
-/// would have to grow an entry per attribute anybody ever wants. Note that this makes a
-/// `#[cfg]` on a *cross-crate* trait method evaluate against the **consumer's**
-/// features, not the defining crate's, since that is where the expansion happens; a
-/// method the trait crate compiled in can therefore be absent from the wrapper, and
-/// vice versa. Gate on a feature the trait crate re-exports if that matters.
+/// The trait method's own attributes come first, ahead of the `#[inline]` — all of them, not a
+/// `cfg`-only subset, since they are valid on an impl method too and a filter would need an entry
+/// per attribute anyone ever wants. A `#[cfg]` on a *cross-crate* trait method therefore evaluates
+/// against the **consumer's** features, so a method the trait's crate compiled in can be absent from
+/// the wrapper. Gate on a feature the trait's crate re-exports if that matters.
 fn delegating_method(attrs: &[Attribute], sig: &Signature, params: &TraitParams) -> TokenStream {
     let method_name = &sig.ident;
 
-    // Nothing can be forwarded without a receiver: there is no `self` to read the
-    // field out of. Left alone, the emitted `<_ as Trait>::version(self.inner)` fails
-    // as `E0424 expected value, found module self`, blamed on the trait's attribute,
-    // with a `fn version&self()` suggestion. The user's move is to write the method in
-    // the impl block, which the skip list already honours — so this arm is only ever
-    // reached when they have not.
-    //
-    // A `compile_error!` rather than quietly dropping the method from the recorded set:
-    // dropping it leaves `E0046 not all trait items implemented`, which is true but
-    // reads like the delegation is broken. It is worth one extra diagnostic — the
-    // `E0046` still follows — to say which method, and why, and what to do.
+    // Without a receiver there is no `self` to read the field out of. Left alone, the emitted
+    // `<_ as Trait>::version(self.inner)` comes out as `E0424 expected value, found module self`
+    // against the trait's attribute, suggesting `fn version&self()`. A `compile_error!` rather than
+    // dropping the method from the recorded set, which would leave only `E0046` — true, but reading
+    // as though the delegation were broken. The answer is to write the method in the impl block,
+    // which the skip list honours, so this arm is only reached when it has not been.
     let unforwardable = match sig.receiver() {
         None => Some(format!(
             "`#[delegate_trait]`: `{method_name}` has no `self` receiver, so there is no field to \
@@ -829,20 +796,16 @@ fn delegating_method(attrs: &[Attribute], sig: &Signature, params: &TraitParams)
         Some(_) => None,
     };
     if let Some(msg) = unforwardable {
-        // Spanned at the trait's declaration of the method, which is the line that has
-        // to change; the impl block that asked for it comes out as the macro backtrace.
+        // Spanned at the trait's declaration, the line that has to change; the impl block that
+        // asked for it shows up as the macro backtrace.
         return quote_spanned! { sig.ident.span() => ::core::compile_error!(#msg); };
     }
 
-    // A declaration's argument *patterns* are not expressions, so they cannot be
-    // replayed as the call's arguments: `fn b(&self, _: u32)` is a perfectly ordinary
-    // trait method, and `_` on the right of a call is "error: in expressions, `_` can
-    // only be used on the left-hand side of an assignment". Rename each one to a fresh
-    // binding and forward that instead.
-    //
-    // `_` is the only pattern a *bodyless* fn can carry today — `mut n: u32` is a
-    // future-incompatibility warning of rustc's own and anything richer is `E0642` — so
-    // the rename is what makes the reachable case work, and what keeps the rest working
+    // Argument *patterns* are not expressions, so they cannot be replayed as the call's arguments:
+    // `fn b(&self, _: u32)` is an ordinary trait method, and `_` in an argument is "in expressions,
+    // `_` can only be used on the left-hand side of an assignment". So each is renamed to a fresh
+    // binding. `_` is the only pattern a bodyless fn can carry today — `mut n: u32` is rustc's own
+    // future-incompatibility warning, anything richer is `E0642` — and the rename covers the rest
     // if that ever loosens.
     let mut sig = sig.clone();
     let mut args: Vec<Ident> = Vec::new();
@@ -884,9 +847,9 @@ fn delegating_method(attrs: &[Attribute], sig: &Signature, params: &TraitParams)
     let call = quote! {
         <_ as $trait_path>::#method_name(#target_expr #(, #args)*) #await_tok
     };
-    // An `unsafe fn` body is not itself an unsafe block. Without this the forwarder
-    // warns under `unsafe_op_in_unsafe_fn` — unsilenceably, since the span belongs to
-    // the generated macro — and that is a hard error under `#![deny(warnings)]`.
+    // An `unsafe fn` body is not itself an unsafe block, so without this the forwarder warns under
+    // `unsafe_op_in_unsafe_fn` — unsilenceably, the span being the generated macro's — which is a
+    // hard error under `#![deny(warnings)]`.
     let body = if matches!(sig.safety, Safety::Unsafe(_)) {
         quote! { unsafe { #call } }
     } else {

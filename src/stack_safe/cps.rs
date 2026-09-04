@@ -170,19 +170,18 @@ fn hoist_place(ctx: &Ctx, place: &Expr) -> (Vec<TokenStream>, Expr) {
 /// because the local it is rooted at travels in the frame, and nothing left in the place
 /// can run user code.
 ///
-/// The root is taken too when it is not itself a place (`foo()[i]`): binding *it* by
-/// value keeps the location, since a reference copied out of a temporary still points
-/// where it did, and an owned temporary is one the source was about to drop anyway. Only
-/// a path root stays, and it must: its identity is the whole point.
+/// A root that is not itself a place (`foo()[i]`) is taken too: binding it by value keeps the
+/// location, since a reference copied out of a temporary still points where it did. Only a path root
+/// stays, and it must — its identity is the whole point.
 ///
-/// Unlike [`hoist_place`], which prepares a place for `ptr::from_mut` a few tokens
-/// later, this prepares one to be evaluated in a *later* invocation of the body closure,
-/// so a method call in the chain is a root to bind rather than a projection to keep.
+/// Unlike [`hoist_place`], which prepares a place for a `ptr::from_mut` a few tokens later, this one
+/// is evaluated in a *later* invocation of the body closure, so a method call in the chain is a root
+/// to bind rather than a projection to keep.
 fn split_place(ctx: &Ctx, place: &Expr, later: &[&Expr]) -> (Vec<(Ident, Expr)>, Expr) {
     struct S<'a> {
         ctx: &'a Ctx,
-        /// Expressions the source evaluates *after* this place: a path read from the
-        /// place can be written there, and the continuation would then read the new value.
+        /// What the source evaluates *after* this place: a path read from it could be written
+        /// there in between, and the continuation would then read the new value.
         later: &'a [&'a Expr],
         values: Vec<(Ident, Expr)>,
     }
@@ -194,8 +193,8 @@ fn split_place(ctx: &Ctx, place: &Expr, later: &[&Expr]) -> (Vec<(Ident, Expr)>,
             *e = parse_quote! { #tmp };
         }
 
-        /// A value inside the place — an index, say. It is read where the source reads
-        /// it, unless reading it plainly cannot run code and cannot change in between.
+        /// A value inside the place, an index say: read where the source reads it, unless reading
+        /// it plainly cannot run code and cannot change in between.
         fn take(&mut self, e: &mut Expr) {
             let stable = match &*e {
                 Expr::Lit(_) => true,
@@ -246,11 +245,8 @@ fn mentions_ident(e: &Expr, id: &Ident) -> bool {
     tokens_mention(&e.to_token_stream(), id)
 }
 
-/// The outer attributes of an expression, whatever kind of expression it is.
-///
-/// `syn` keeps them in each variant's own `attrs` field and offers no accessor across
-/// variants, but an expression's attributes are the first thing in its tokens, so they
-/// can simply be read back.
+/// The outer attributes of an expression, whatever kind it is. `syn` keeps them per variant with no
+/// accessor across variants, but they are the first thing in the tokens, so they can be read back.
 fn expr_attrs(e: &Expr) -> Vec<syn::Attribute> {
     let parser = |input: syn::parse::ParseStream| {
         let attrs = input.call(syn::Attribute::parse_outer)?;
@@ -262,13 +258,10 @@ fn expr_attrs(e: &Expr) -> Vec<syn::Attribute> {
 
 /// Refuse a `#[cfg]` on something a recursive call is cut out of.
 ///
-/// Every arm here rebuilds its expression from pieces, and the pieces do not all stay in
-/// this position: the code after the call becomes an arm of another `match`, in another
-/// invocation of the body closure. So there is no one place left to put the attribute,
-/// and dropping it is not an option — the code the user disabled would compile and run.
-///
-/// Lint attributes are dropped, which only widens where a lint applies. `cfg` and
-/// `cfg_attr` decide whether code exists at all, so they are an error instead.
+/// The pieces do not all stay in this position — the code after the call becomes an arm of another
+/// `match` — so there is nowhere left to put the attribute, and dropping it would compile and run
+/// the code the user disabled. Lint attributes are dropped, which only widens where a lint applies;
+/// `cfg` decides whether code exists at all.
 fn reject_cfg(attrs: &[syn::Attribute], what: &str) -> syn::Result<()> {
     for attr in attrs {
         if attr.path().is_ident("cfg") || attr.path().is_ident("cfg_attr") {
@@ -287,12 +280,10 @@ fn reject_cfg(attrs: &[syn::Attribute], what: &str) -> syn::Result<()> {
     Ok(())
 }
 
-/// CPS an expression that the rebuilt expression will use as a *place*: evaluate the
-/// values inside it where the source evaluates them, then hand `k` the place itself,
-/// together with the environment the temporaries are bound in.
-///
-/// `later` is what the source evaluates after this place — a method call's arguments —
-/// which decides whether a plain path inside the place has to be read now.
+/// CPS an expression the rebuilt expression will use as a *place*: evaluate the values inside it
+/// where the source does, then hand `k` the place itself and the environment its temporaries are
+/// bound in. `later` is what the source evaluates after the place — a method call's arguments —
+/// which decides whether a plain path inside it has to be read now.
 fn cps_place(
     ctx: &Ctx,
     env: &Env,
@@ -342,8 +333,8 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
     if !contains_rec(ctx, e) {
         return k(leaf_expr(env, e)?);
     }
-    // Everything below rebuilds this expression from pieces, so an attribute on it has
-    // no position to keep. Only `#[cfg]` matters; see `reject_cfg`.
+    // Everything below rebuilds this expression from pieces, so an attribute on it has no position
+    // to keep. Only `#[cfg]` matters; see `reject_cfg`.
     reject_cfg(&expr_attrs(e), "an expression that recurses")?;
 
     let step = step_ty();
@@ -773,9 +764,8 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
             let member = &f.member;
             cps_expr(ctx, env, &f.base, &|v| k(quote! { (#v).#member }))
         }
-        // An index is a *place*, and the rebuilt expression may use it as one — `&mut
-        // xs[i]`, `xs[i].bump(..)`, a field of it. So it is spliced back as a place
-        // rather than bound by value; only the values inside it are evaluated here.
+        // An index is a *place* and may be used as one — `&mut xs[i]`, `xs[i].bump(..)` — so it is
+        // spliced back as a place rather than bound by value; only the values inside it run here.
         Expr::Index(_) => cps_place(ctx, env, e, &[], &|_, place| k(quote! { (#place) })),
         Expr::Tuple(t) => {
             let elems: Vec<&Expr> = t.elems.iter().collect();
@@ -795,10 +785,9 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
         Expr::MethodCall(mc) => {
             let method = &mc.method;
             let turbofish = &mc.turbofish;
-            // The receiver is a place, and the method may take it by `&mut`, so it is
-            // spliced back as a place rather than bound by value — see [`split_place`].
-            // Rust evaluates it before the arguments, so its own values are bound first
-            // and the arguments are sequenced after them.
+            // The receiver is a place and the method may take it by `&mut`, so it is spliced back
+            // as one — see [`split_place`]. Rust evaluates it before the arguments, so its values
+            // are bound first and the arguments sequenced after.
             let args: Vec<&Expr> = mc.args.iter().collect();
             cps_place(ctx, env, &mc.receiver, &args, &|env, recv| {
                 cps_seq(ctx, env, &args, Vec::new(), &|v| {
@@ -1107,9 +1096,8 @@ fn cps_seq(
         return k(&acc);
     };
 
-    // One of these operands recurses, so all of them are rebuilt into positions the
-    // source did not write them in — an argument bound to a temporary, an element
-    // produced by a continuation. A `#[cfg]` on any of them cannot travel there.
+    // One operand recurses, so all of them move into positions the source did not write them in: a
+    // temporary, or a value produced by a continuation. A `#[cfg]` cannot travel there.
     reject_cfg(
         &expr_attrs(first),
         "an operand of an expression that recurses",

@@ -9,23 +9,18 @@
 //! functions of an annotated container, and whatever their bodies declare — so that a cycle is
 //! found wherever it runs.
 //!
-//! A definition is addressed by its root and the *ordinals* of the definitions that lead to it
-//! there, so that a member of a cycle can be taken back out of the body that declares it. An
-//! ordinal is a definition's position among the ones its host body declares, counted in the order
-//! the walk visits them and without descending into any of them, since each is a scope of its own.
-//! A block is descended into like anything else, so a `fn` inside an `if`, a `match` arm or a bare
-//! `{ }` is found and addressed like one written at the top of the body — which it has to be, or a
-//! cycle running through it would be left to the native stack.
+//! A definition is addressed by its root and the *ordinals* leading to it, so that a member of a
+//! cycle can be taken back out of the body that declares it. An ordinal is a definition's position
+//! among the ones its body declares, in visit order, not descending into any of them since each is
+//! its own scope. Blocks *are* descended into, so a `fn` inside an `if` or a `match` arm is found
+//! like one at the top of the body — it has to be, or a cycle through it stays on the native stack.
 //!
-//! The one thing an ordinal has to survive is a member of a cycle being *taken*, since the
-//! definitions after it in the same body keep their addresses. What is left behind is therefore
-//! counted too: see [`addressable`].
+//! Ordinals have to survive a member being [`take`]n, since the definitions after it keep their
+//! addresses, so what is left behind is counted too: see [`addressable`].
 //!
-//! A `fn` declared in a block is treated as being in scope throughout the body that holds the
-//! block, which is one step more generous than Rust — the name is really only in scope inside the
-//! block. It costs nothing here: the extra candidates it admits are functions of the same name in
-//! one body, and a call to one of them is a call to *some* function of that name in that body,
-//! which is a member of the same scope either way.
+//! A `fn` in a block counts as in scope throughout the body, which is one step more generous than
+//! Rust. It costs nothing: the extra candidates are same-named functions in one body, and a call to
+//! one of them is a call to some function of that name in that body either way.
 
 use proc_macro2::{Ident, Span, TokenStream, TokenTree};
 use syn::spanned::Spanned;
@@ -108,12 +103,9 @@ pub(super) fn collect(roots: &mut [ItemFn], opts: Opts) -> syn::Result<Vec<Def>>
     Ok(defs)
 }
 
-/// The functions this body declares, with their ordinals, their names, and whatever their own
-/// markers asked for — taken off as they are read, since the walk is what hands options down.
-///
-/// Anywhere in the body, not just at the top of it: a `fn` inside an `if` or a `match` arm is a
-/// definition of the body like any other. Not descended into, since each one is a scope of its own
-/// and gets its turn.
+/// The functions this body declares — anywhere in it, not just at the top — with their ordinals,
+/// names and own options, taken off as they are read since the walk is what hands options down.
+/// Not descended into: each is its own scope and gets its turn.
 fn nested_mut(func: &mut ItemFn) -> syn::Result<Vec<(usize, Ident, Option<Opts>)>> {
     struct V {
         found: Vec<(usize, Ident, Option<Opts>)>,
@@ -153,9 +145,8 @@ fn nested_mut(func: &mut ItemFn) -> syn::Result<Vec<(usize, Ident, Option<Opts>)
 
 /// Does this item take up an ordinal in the body that holds it?
 ///
-/// A `fn` does, being what a path addresses. So does the placeholder [`take`] leaves behind, and
-/// the tokens [`put_back`] writes there: the definitions after one that has been taken keep the
-/// addresses they were given, so what stands in its place has to keep its slot.
+/// A `fn` does, being what a path addresses — and so does the placeholder [`take`] leaves behind,
+/// since the definitions after it keep the addresses they were given.
 fn addressable(item: &Item) -> bool {
     matches!(item, Item::Fn(_) | Item::Verbatim(_))
 }
@@ -305,10 +296,9 @@ fn placeholder(tokens: TokenStream) -> Item {
 /// the scope goes by where it is written — the impl block's own type, or the annotated module's
 /// ident — since a call may spell that out instead of saying `Self` or `self`.
 ///
-/// Beside the edges come the calls that name a definition in scope through a path the *rewriter*
-/// cannot follow. They are no edges: an edge says the call becomes an entry into a driver, and one
-/// left as a native call would make a half-flattened function that still grows the stack. What
-/// becomes of them is [`scan`](super::scan)'s to report.
+/// Beside the edges come the calls that name a definition through a path the *rewriter* cannot
+/// follow. They are not edges — an edge says the call becomes an entry into the driver — and
+/// reporting them is [`scan`](super::scan)'s job.
 pub(super) fn edges(
     roots: &[ItemFn],
     defs: &[Def],
@@ -412,12 +402,9 @@ pub(super) fn cycles(defs: &[Def], reaches: &[Vec<bool>]) -> Vec<Vec<usize>> {
 struct Mention {
     name: Ident,
     written: Written,
-    /// The path as written, when it says plainly enough what it names for the scan to resolve it,
-    /// but is not one of the shapes the transform *rewrites* — `T::g(..)` inside `impl T`,
-    /// `<Self>::g(..)`, `crate::m::g(..)` inside `#[stack_safe] mod m`. Such a call is reported
-    /// rather than turned into an edge, since an edge whose call site stays a native call would
-    /// leave a function half flattened and still growing the stack. With the span of the path, for
-    /// the report.
+    /// A path plain enough to resolve but not one the transform rewrites — `T::g(..)` inside
+    /// `impl T`, `<Self>::g(..)`, `crate::m::g(..)` inside `#[stack_safe] mod m`. Reported rather
+    /// than made an edge, since a half-flattened function still grows the stack. Carries the span.
     unrewritable: Option<(String, Span)>,
 }
 
@@ -427,12 +414,10 @@ enum Written {
     /// `g(..)`: a path of one segment. It reaches a function declared in a body, or a free
     /// function — never an associated item, which is not in scope under a bare name.
     Bare,
-    /// `self::g(..)`, and `super::m::g(..)` or `crate::a::m::g(..)` inside `#[stack_safe] mod m`:
-    /// this module's `g`, whichever body the call is written in. It reaches a free root, since that
-    /// is what a module holds, and never a function declared in a body, which no module path names.
-    /// A bare `crate::g` or `super::g` is *not* this: a macro does not know its own module path, so
-    /// unless the path names the annotated module on the way through it cannot tell whether they
-    /// name something in this scope.
+    /// `self::g(..)`, or `super::m::g(..)` / `crate::a::m::g(..)` inside `#[stack_safe] mod m`:
+    /// this module's `g`, from whichever body. It reaches a free root, never a function declared in
+    /// a body, which no module path names. A bare `crate::g` is *not* this — a macro does not know
+    /// its own module path, so unless the path names the annotated module it cannot tell.
     InThisModule,
     /// `self.g(..)`, `Self::g(self, ..)`, `other.g(..)`, `T::g(..)` inside `impl T`, or any
     /// `<..>::g(..)`: only an associated item.
@@ -447,10 +432,9 @@ enum Written {
 ///
 /// Not descended into: a nested function, which is a scope of its own and gets its own row.
 ///
-/// `host` is what the scope is called where it is written — the impl block's own type, or the
-/// annotated module's ident. A call may name a member through it (`T::g(..)`, `crate::m::g(..)`)
-/// rather than through `Self` or `self`, and such a call has to be seen, or the cycle it takes part
-/// in is not found and the recursion is left on the native stack with nothing said about it.
+/// `host` is what the scope is called where it is written — the impl block's type, or the annotated
+/// module's ident. A call may name a member through it (`T::g(..)`, `crate::m::g(..)`) rather than
+/// through `Self` or `self`, and missing those leaves the cycle unfound and the recursion native.
 fn mentioned(func: &ItemFn, assoc: bool, host: Option<&Ident>) -> Vec<Mention> {
     struct V<'a> {
         found: Vec<Mention>,
@@ -477,11 +461,9 @@ fn mentioned(func: &ItemFn, assoc: bool, host: Option<&Ident>) -> Vec<Mention> {
             });
         }
 
-        /// How a call names what it calls, where the path has more than one segment or a qself.
-        ///
-        /// Only the shapes that say plainly that they name *this* scope. Anything else may name
-        /// anything at all — a macro resolves no paths — and reading it as a member would put a
-        /// function that never recurses into a cycle.
+        /// How a call names what it calls, for a path with several segments or a qself. Only the
+        /// shapes that plainly name *this* scope: anything else may name anything, and reading it
+        /// as a member would put a function that never recurses into a cycle.
         fn qualified(&mut self, name: Ident, p: &syn::ExprPath) {
             let segments = &p.path.segments;
             let last = segments.len() - 1;
@@ -581,8 +563,8 @@ fn mentioned(func: &ItemFn, assoc: bool, host: Option<&Ident>) -> Vec<Mention> {
     v.found
 }
 
-/// A path as the user wrote it, for a message that has to quote it back: `to_token_stream`
-/// renders `crate::m::g` as `crate :: m :: g`.
+/// A path as the user wrote it, for a message that quotes it back: `to_token_stream` would render
+/// `crate::m::g` as `crate :: m :: g`.
 fn pretty_path(p: &syn::ExprPath) -> String {
     let mut out = quote::ToTokens::to_token_stream(p).to_string();
     for (from, to) in [

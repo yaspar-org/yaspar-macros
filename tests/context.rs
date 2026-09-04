@@ -1001,15 +1001,13 @@ fn both_options_across_a_body_is_flat() {
 // ===========================================================================
 // Signature shapes
 //
-// Each of these was refused, and each refusal was mechanical rather than
-// necessary: the transform needs a *name* for every payload parameter, because it
-// rebuilds the argument list as an expression, and it needs to write some types on
-// a `let`. Both are satisfiable without asking the caller to change a signature.
+// Each of these was refused for a mechanical reason: the transform needs a name for
+// every payload parameter, since it rebuilds the argument list as an expression, and
+// it needs to write some types on a `let`. Neither asks the caller for anything.
 // ===========================================================================
 
-/// A parameter that destructures. The transform gives it a name of its own and
-/// re-binds the pattern at the top of the body — which is exactly what the rejection
-/// used to tell the caller to do by hand.
+/// A parameter that destructures: named, with the pattern re-bound at the top of the body — exactly
+/// what the rejection used to ask the caller to write by hand.
 #[stack_safe]
 fn tuple_param((a, b): (u64, u64)) -> u64 {
     if a == 0 {
@@ -1056,8 +1054,8 @@ fn deep_destructuring_parameter_is_flat() {
     assert_eq!(on_tiny_stack(move || tuple_param((depth, 0))), depth);
 }
 
-/// `impl Trait` is not always the whole type. Nested inside one, it was annotated
-/// anyway, giving `E0562` on the user's own signature.
+/// `impl Trait` is not always the whole type. Nested, it was annotated anyway — `E0562` on the
+/// user's own signature.
 #[stack_safe]
 fn nested_impl_trait_return(n: u64) -> Box<impl Iterator<Item = u64> + use<>> {
     if n == 0 {
@@ -1082,9 +1080,8 @@ fn a_nested_impl_trait_is_accepted() {
     assert_eq!(nested_impl_trait_param(vec![1u8, 2, 3], 4), 3);
 }
 
-/// A parenthesised `&mut` is the `&mut` parameter it plainly is. It used to travel in
-/// the payload instead of becoming a context slot, and the report was an `E0505`
-/// naming the expansion's own types with the span on the attribute.
+/// A parenthesised `&mut` is the `&mut` parameter it plainly is. It used to travel in the payload
+/// instead of becoming a slot, reported as an `E0505` naming the expansion's own types.
 #[stack_safe]
 #[allow(unused_parens)]
 fn parenthesised_slot(n: u64, out: (&mut Vec<u64>)) {
@@ -1109,8 +1106,8 @@ fn deep_parenthesised_slot_is_flat() {
     assert_eq!(out[out.len() - 1], depth);
 }
 
-/// An inert `mut` on a slot binding. Assigning *through* the reference was always
-/// fine; the rejection was aimed at reassigning the binding, which this does not do.
+/// An inert `mut` on a slot binding. The rejection was aimed at reassigning the binding, which this
+/// does not do; writing through the reference was always fine.
 #[stack_safe]
 fn inert_mut_slot(n: u64, mut out: &mut Vec<u64>) {
     if n == 0 {
@@ -1132,9 +1129,8 @@ fn deep_inert_mut_on_a_slot_is_flat() {
     assert_eq!(out.len(), 2 * depth as usize);
 }
 
-/// Two members of one cycle spelling the same slot type differently: one names a
-/// lifetime, the other elides it. They are the same type, and saying otherwise
-/// presented two spellings of it as the caller's mistake.
+/// Two members of one cycle spelling one slot type differently — one names the lifetime, the other
+/// elides it. Refusing that presented two spellings of the same type as the caller's mistake.
 #[stack_safe]
 mod lifetime_spellings {
     pub fn named<'a>(n: u64, out: &'a mut Vec<u64>) {
