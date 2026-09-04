@@ -14,10 +14,10 @@ use syn::{FnArg, Item, ItemFn, Pat, PatIdent, ReturnType, Stmt};
 
 use super::Opts;
 use super::analyze::{
-    MethodSplit, desugar_apit, desugar_receiver, reject_generic_payload, scan_context_args,
-    scan_pinned_args, validate,
+    MethodSplit, assigns_binding, desugar_apit, desugar_param_patterns, desugar_receiver,
+    reject_generic_payload, scan_context_args, scan_pinned_args, validate,
 };
-use super::context::CtxEntry;
+use super::context::{CtxEntry, is_context_slot, peel_type, slot_key, slot_type};
 use super::cps::cps_stmts;
 use super::loop_state::{solve_payloads, substitute};
 use super::names::*;
@@ -27,8 +27,10 @@ use super::walk::{Ctx, Env, Member};
 struct Split {
     context: Vec<CtxEntry>,
     member: Member,
-    /// Token form of each context slot's declared type, so a group can check that
-    /// its members agree on them.
+    /// What a group compares its members' slots by: the declared type with parentheses peeled,
+    /// lifetimes erased and `Self` resolved. See `context::slot_key`.
+    slot_keys: Vec<String>,
+    /// Each slot's type as the user wrote it, for the message that names a mismatch.
     slot_types: Vec<String>,
 }
 
@@ -37,13 +39,17 @@ struct Split {
 /// argument payload. Shared references are `Copy`, so the payload is fine for
 /// them.
 ///
-/// Payload parameters must be plain (optionally `mut`) idents: the expansion has
-/// to rebuild the argument tuple as an *expression*, which is impossible from a
-/// destructuring pattern.
+/// Payload parameters are plain (optionally `mut`) idents by the time this runs: the expansion
+/// has to rebuild the argument tuple as an *expression*, which a destructuring pattern cannot be,
+/// so [`desugar_param_patterns`] has already given each pattern a name and re-bound it in the
+/// body.
 /// Callers run [`reject_unsupported_signature`] first, so the signature is known
 /// to be one the transform can handle.
-fn split_params(func: &ItemFn) -> syn::Result<Split> {
+fn split_params(func: &ItemFn, self_ty: Option<&syn::Type>) -> syn::Result<Split> {
     let sig = &func.sig;
+    // Whether a `mut` on a slot binding matters is a question about the body, so the body is
+    // needed here as well as the signature.
+    let func_body = func.block.clone();
 
     let mut param_pats = Vec::new();
     let mut param_anns: Vec<TokenStream> = Vec::new();
@@ -54,6 +60,11 @@ fn split_params(func: &ItemFn) -> syn::Result<Split> {
     let mut param_names = Vec::new();
     let mut context: Vec<CtxEntry> = Vec::new();
     let mut context_at: HashMap<usize, usize> = HashMap::new();
+    // Compared across the group, so what is kept is the *key*: the type with its parentheses
+    // peeled and the lifetimes the user named erased. Two spellings of one type must not be
+    // presented to the user as their own mistake. The pretty form is kept beside it, since the
+    // message that names a mismatch should show what was actually written.
+    let mut slot_keys: Vec<String> = Vec::new();
     let mut slot_types: Vec<String> = Vec::new();
     let mut arg_index = 0usize;
     for arg in &sig.inputs {
@@ -75,26 +86,43 @@ fn split_params(func: &ItemFn) -> syn::Result<Split> {
                     ..
                 }) = &*pt.pat
                 else {
+                    // `desugar_param_patterns` gives every destructuring payload parameter a
+                    // name of its own and re-binds the pattern in the body, so what is left
+                    // here is a `&mut` parameter that destructures — a context slot, which is
+                    // not a value to take apart. It has its own message there.
                     return Err(syn::Error::new(
                         pt.pat.span(),
                         "`#[stack_safe]` requires plain identifier parameters; bind the pattern \
                          inside the body instead",
                     ));
                 };
-                let is_mut_ref =
-                    matches!(&*pt.ty, syn::Type::Reference(r) if r.mutability.is_some());
-                if is_mut_ref {
-                    if let Some(m) = mutability {
+                if is_context_slot(&pt.ty) {
+                    // A `mut` on the binding is inert unless the body assigns to the binding
+                    // itself. Rebinding *through* it — `*out = ..`, `out.push(..)` — is the
+                    // ordinary use and always was fine; only reassigning the binding would be
+                    // invisible to the next step, since every step re-derives it.
+                    if let Some(m) = mutability
+                        && assigns_binding(&func_body, ident)
+                    {
                         return Err(syn::Error::new(
                             m.span(),
-                            "`#[stack_safe]` does not support a `mut` binding for a `&mut` \
-                             parameter: the parameter becomes a context slot that every step \
-                             re-derives, so reassigning the binding would not be visible",
+                            "`#[stack_safe]` does not support *assigning* to a `mut` binding of a \
+                             `&mut` parameter: the parameter becomes a context slot that every \
+                             step re-derives from the driver, so the new value would not be seen \
+                             by the next step. Writing through the reference is fine; to walk a \
+                             structure by reassigning, take the place as an ordinary parameter or \
+                             use `#[stack_safe(use_nonlinear_mut)]`",
                         ));
                     }
                     context_at.insert(arg_index, context.len());
+                    slot_keys.push(pretty_type(&slot_key(&pt.ty, self_ty)));
                     slot_types.push(pretty_type(&pt.ty));
-                    let ty = &pt.ty;
+                    // The slot's *own* spelling is not what the driver holds: the context tuple
+                    // is one type for the whole group, and a lifetime one member happens to have
+                    // named is not a name the driver can use. What it holds is the erased form,
+                    // where that lifetime is inferred like any other in a `let`.
+                    let ty = slot_type(&pt.ty);
+                    let ty = &ty;
                     context.push(CtxEntry {
                         name: ident.clone(),
                         mutable: true,
@@ -105,15 +133,16 @@ fn split_params(func: &ItemFn) -> syn::Result<Split> {
                 } else {
                     param_pats.push(quote! { #mutability #ident });
                     param_names.push(ident.clone());
-                    // `impl Trait` is the one parameter type that cannot be
-                    // written down; such a parameter goes unpinned.
+                    // A type that cannot be written on a `let` — `impl Trait`, at the top level
+                    // or nested inside, and `!` — cannot be annotated here; such a parameter
+                    // goes unpinned. See `annotatable`.
                     let ty = &pt.ty;
-                    param_types.push(if matches!(&**ty, syn::Type::ImplTrait(_)) {
+                    param_types.push(if !annotatable(ty) {
                         TokenStream::new()
                     } else {
                         quote! { : #ty }
                     });
-                    param_bare_types.push(if matches!(&**ty, syn::Type::ImplTrait(_)) {
+                    param_bare_types.push(if !annotatable(ty) {
                         TokenStream::new()
                     } else {
                         quote! { #ty }
@@ -125,7 +154,7 @@ fn split_params(func: &ItemFn) -> syn::Result<Split> {
                         }
                         _ => None,
                     });
-                    param_anns.push(if matches!(&**ty, syn::Type::ImplTrait(_)) {
+                    param_anns.push(if !annotatable(ty) {
                         TokenStream::new()
                     } else {
                         quote! { let #mutability #ident: #ty = #ident; }
@@ -176,6 +205,7 @@ fn split_params(func: &ItemFn) -> syn::Result<Split> {
             param_types,
             param_bare_types,
         },
+        slot_keys,
         slot_types,
     })
 }
@@ -766,9 +796,19 @@ fn pretty_type(ty: &impl ToTokens) -> String {
 fn ret_annotation(sig: &syn::Signature) -> TokenStream {
     match &sig.output {
         ReturnType::Default => quote! { : () },
-        ReturnType::Type(_, ty) if !matches!(&**ty, syn::Type::ImplTrait(_)) => quote! { : #ty },
+        ReturnType::Type(_, ty) if annotatable(ty) => quote! { : #ty },
         ReturnType::Type(..) => quote! {},
     }
+}
+
+/// May this type be written on a `let` in the driver?
+///
+/// Two may not, and both are legal where the user wrote them. `impl Trait` is not allowed in the
+/// type of a binding at all — `E0562` — and it is not always the whole type: `Box<impl Iterator>`
+/// and `Vec<impl Copy>` hide one inside. And `!` is stable in return position only, so annotating
+/// a `let` with it is `E0658` on a signature that compiles perfectly without this attribute.
+fn annotatable(ty: &syn::Type) -> bool {
+    !names_impl_trait_or_self(ty).0 && !matches!(peel_type(ty), syn::Type::Never(_))
 }
 
 fn reject_unsupported_signature(sig: &syn::Signature) -> syn::Result<()> {
@@ -801,18 +841,23 @@ fn reject_unsupported_signature(sig: &syn::Signature) -> syn::Result<()> {
 /// parameters split into a payload and context slots, what the members have to agree on, and what
 /// the driver answers with. The body scans run here too, since everything the arms are built from
 /// depends on their answers.
-fn analyse(funcs: &[ItemFn], opts: Opts, assoc: bool) -> syn::Result<Ctx> {
+fn analyse(
+    funcs: &[ItemFn],
+    opts: Opts,
+    assoc: bool,
+    self_ty: Option<&syn::Type>,
+) -> syn::Result<Ctx> {
     let mut splits = Vec::new();
     for func in funcs {
         reject_unsupported_signature(&func.sig)?;
-        splits.push(split_params(func)?);
+        splits.push(split_params(func, self_ty)?);
     }
 
     // The whole group shares one context tuple and one result type, so its
     // members have to agree on both.
     let first = &splits[0];
     for (split, func) in splits.iter().zip(funcs).skip(1) {
-        if split.slot_types != first.slot_types {
+        if split.slot_keys != first.slot_keys {
             return Err(syn::Error::new(
                 func.sig.span(),
                 format!(
@@ -1011,8 +1056,10 @@ pub(super) fn expand_group(
     let mut methods: Vec<Option<MethodSplit>> = Vec::with_capacity(funcs.len());
     for func in &mut funcs {
         // Before anything reads a signature: an `impl Trait` parameter becomes the generic it
-        // already is, so its type has a name the payload can be pinned with.
+        // already is, so its type has a name the payload can be pinned with, and a parameter
+        // that destructures gets a name of its own with the pattern re-bound in the body.
         desugar_apit(func);
+        desugar_param_patterns(func)?;
         methods.push(desugar_receiver(func, &group_names)?);
     }
 
@@ -1046,7 +1093,7 @@ pub(super) fn expand_group(
         ));
     }
 
-    let ctx = analyse(&funcs, opts, assoc)?;
+    let ctx = analyse(&funcs, opts, assoc, self_ty)?;
 
     let (items, main_arms) = member_arms(&ctx, &funcs)?;
     let (entry, input, drive) = (entry_ty(), input_ty(), drive_fn());

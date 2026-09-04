@@ -1,0 +1,5 @@
+error: `#[stack_safe]` does not support *assigning* to a `mut` binding of a `&mut` parameter: the parameter becomes a context slot that every step re-derives from the driver, so the new value would not be seen by the next step. Writing through the reference is fine; to walk a structure by reassigning, take the place as an ordinary parameter or use `#[stack_safe(use_nonlinear_mut)]`
+  --> tests/ui/slot_reassigned.rs:14:22
+   |
+14 | fn reassigns(n: u64, mut out: &mut Vec<u64>, other: &mut Vec<u64>) {
+   |                      ^^^
