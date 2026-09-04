@@ -2543,3 +2543,79 @@ fn a_cfg_gated_member_does_not_break_the_thread_out() {
     // `kept` is threaded out, so it is callable unqualified here.
     assert_eq!(on_tiny_stack(move || kept(depth)), depth);
 }
+
+// ---------------------------------------------------------------------------
+// A lent parameter carried on into a loop and a frame.
+//
+// The position is pinned, so the entry payload holds a `*const T` while the arm
+// rebinds the name to the `&T` it was written with. A loop state or frame carrying
+// the name carries the rebinding, so its slot type is the reference: answering with
+// the pointer, or with nothing (leaving `_`), is what this catches.
+// ---------------------------------------------------------------------------
+
+fn extend(mut v: Vec<u64>, x: u64) -> Vec<u64> {
+    v.push(x);
+    v
+}
+
+#[stack_safe(data_in_frame)]
+mod lend_into_loop {
+    use super::extend;
+
+    /// Lends `down` a local of its own, which pins that position.
+    pub fn lend_up(n: u64, tail: &Vec<u64>) -> u64 {
+        if n == 0 {
+            return tail.len() as u64;
+        }
+        let sub: Vec<u64> = extend(tail.clone(), n);
+        lend_down(n - 1, &sub)
+    }
+
+    /// Carries the pinned parameter into a lowered loop, cloning it there.
+    pub fn lend_down(n: u64, tail: &Vec<u64>) -> u64 {
+        let mut acc = 0;
+        let mut i = 0u64;
+        while i < 2 {
+            let sub: Vec<u64> = extend(tail.clone(), i);
+            acc += sub.len() as u64;
+            acc += lend_up(n, &sub);
+            i += 1;
+        }
+        acc
+    }
+}
+
+// `&Vec` on purpose: the slot has to be a reference to an owned value.
+#[allow(clippy::ptr_arg)]
+fn up_naive(n: u64, tail: &Vec<u64>) -> u64 {
+    if n == 0 {
+        return tail.len() as u64;
+    }
+    let sub: Vec<u64> = extend(tail.clone(), n);
+    down_naive(n - 1, &sub)
+}
+
+// `&Vec` on purpose: the slot has to be a reference to an owned value.
+#[allow(clippy::ptr_arg)]
+fn down_naive(n: u64, tail: &Vec<u64>) -> u64 {
+    let mut acc = 0;
+    let mut i = 0u64;
+    while i < 2 {
+        let sub: Vec<u64> = extend(tail.clone(), i);
+        acc += sub.len() as u64;
+        acc += up_naive(n, &sub);
+        i += 1;
+    }
+    acc
+}
+
+#[test]
+fn lend_a_local_carried_into_a_loop_agrees_with_naive() {
+    for n in 0..5u64 {
+        assert_eq!(
+            lend_into_loop::lend_up(n, &vec![]),
+            up_naive(n, &vec![]),
+            "up({n})"
+        );
+    }
+}
