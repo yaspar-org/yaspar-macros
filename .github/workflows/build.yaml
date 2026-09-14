@@ -75,13 +75,20 @@ jobs:
     permissions:
       contents: read
     env:
-      # Pinned deliberately: Miri tracks the compiler's aliasing model, so a floating
-      # nightly would let this job's verdict change without a commit. Bump on purpose.
-      NIGHTLY: nightly-2026-08-25
       MIRIFLAGS: ${{ matrix.miriflags }}
     steps:
       - name: Checkout sources
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Pinned deliberately: Miri tracks the compiler's aliasing model, so a floating
+      # nightly would let this job's verdict change without a commit. Bump on purpose.
+      #
+      # The pin lives in `.github/miri-nightly` rather than inline in this file, because
+      # `miri-nightly-bump.yaml` has to commit it: a push that touches anything under
+      # `.github/workflows/` needs the `workflows` permission, and `GITHUB_TOKEN` cannot
+      # be granted it at all, so a pin spelled here is one no bot can ever move.
+      - name: Read the pinned nightly
+        run: echo "NIGHTLY=$(cat .github/miri-nightly)" >> "$GITHUB_ENV"
 
       - name: Install pinned nightly with Miri
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
