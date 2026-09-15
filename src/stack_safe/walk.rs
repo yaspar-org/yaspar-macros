@@ -174,13 +174,6 @@ impl Ctx {
         out
     }
 
-    /// A number no other store key has, for keying a store to one call site.
-    pub(super) fn fresh_key(&self) -> usize {
-        let n = self.counter.get();
-        self.counter.set(n + 1);
-        n
-    }
-
     pub(super) fn fresh(&self) -> Ident {
         let n = self.counter.get();
         self.counter.set(n + 1);
@@ -209,7 +202,7 @@ impl Ctx {
     }
 
     /// Each store's element type in slot order: parameter positions, then the ones a lowering asked
-    /// for. A parked root's type is left to inference, since it is a local and may have no annotation.
+    /// for.
     pub(super) fn pin_elements(&self) -> Vec<Option<TokenStream>> {
         let params = self
             .pinned_positions()
@@ -231,12 +224,15 @@ impl Ctx {
         self.store_slot(StoreKey::Loop(loop_idx), Some(elem))
     }
 
-    /// Reserve the store a call site parks a local in, so that it can lend a place inside it.
+    /// Reserve the store a call site parks `root` in, so that it can lend a place inside it.
     ///
-    /// The element type is the local's, which the macro cannot name, so inference settles it from
-    /// the `push`.
-    pub(super) fn root_store_slot(&self, call_site: usize) -> syn::Index {
-        self.store_slot(StoreKey::Root(call_site), None)
+    /// The element type is named from `root`'s annotation, which a place lend requires anyway (see
+    /// [`Self::owns_annotated_local`]). Leaving it to the `push` would tie the slot's type to a
+    /// lowering that `#[cfg]` may drop.
+    pub(super) fn root_store_slot(&self, root: &Ident) -> syn::Index {
+        let member = self.current.get();
+        let elem = self.slot_type(member, root);
+        self.store_slot(StoreKey::Root(member, root.to_string()), elem)
     }
 
     /// The context-tuple index of a store, reserving it on first ask.
@@ -620,10 +616,16 @@ impl<'a> Env<'a> {
 }
 
 /// What a store was reserved for, so that asking twice hands back the same slot.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(super) enum StoreKey {
     /// The collection a `for` loop borrows.
     Loop(usize),
-    /// The local a call site parks to lend a place inside it.
-    Root(usize),
+    /// The local a call site parks to lend a place inside it, as `(member, name)`.
+    ///
+    /// Keyed by the local rather than by the call site, because one site can be lowered more than
+    /// once — the code after a `#[cfg]`ed statement is lowered under the gate and again under its
+    /// negation — and a slot only one of those lowerings pushes into would be dead in the other
+    /// configuration. Sharing is safe: the store is a stack, so parking the same local again, in
+    /// another branch or deeper in the descent, stacks rather than clashes.
+    Root(usize, String),
 }

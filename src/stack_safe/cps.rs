@@ -487,7 +487,7 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
                             // place inside it. `take_last` in the resume arm hands it back, so the
                             // code after the call still owns it — a lend, as the source wrote it.
                             Some(Lend::Place { root, place }) => {
-                                let slot = ctx.root_store_slot(ctx.fresh_key());
+                                let slot = ctx.root_store_slot(&root);
                                 if !pinned_slots.contains(&slot) {
                                     pinned_slots.push(slot.clone());
                                 }
