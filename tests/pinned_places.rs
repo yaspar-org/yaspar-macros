@@ -73,6 +73,43 @@ fn lend_two(n: usize, a: &u64, b: &u64) -> u64 {
     deeper + left.rest + right.rest
 }
 
+/// A place lend that sits after a `#[cfg]`ed statement which itself recurses.
+///
+/// Such a statement makes the macro lower everything after it twice — once under the gate, once
+/// under its negation — so this site asks for a store twice. Both asks have to land in the same
+/// slot: a slot only the dropped lowering pushes into has nothing to give it a type, which is
+/// `type annotations needed` pointing at the attribute.
+#[stack_safe(data_in_frame)]
+fn lend_a_place_after_a_gated_call(n: usize, t: &u64) -> u64 {
+    if n == 0 {
+        return *t;
+    }
+    #[cfg(not(any()))]
+    if *t == u64::MAX {
+        return lend_a_place_after_a_gated_call(n - 1, &0);
+    }
+    let row: Vec<u64> = vec![n as u64, 5];
+    let deeper = lend_a_place_after_a_gated_call(n - 1, &row[0]);
+    deeper + row[1]
+}
+
+/// Two call sites lending places out of the *same* local, in branches that both survive.
+///
+/// They share one store, and the descent through them nests, so the store has to behave as a stack.
+#[stack_safe(data_in_frame)]
+fn lend_the_same_local_twice(n: usize, t: &u64) -> u64 {
+    if n == 0 {
+        return *t;
+    }
+    let row: Vec<u64> = vec![n as u64, 5];
+    let deeper = if n.is_multiple_of(2) {
+        lend_the_same_local_twice(n - 1, &row[0])
+    } else {
+        lend_the_same_local_twice(n - 1, &row[1])
+    };
+    deeper + row[0]
+}
+
 #[test]
 fn a_whole_local_needs_no_annotation() {
     assert_eq!(lend_a_local(DEEP, &0), DEEP as u64);
@@ -95,6 +132,21 @@ fn two_lends_in_one_call() {
 }
 
 /// The parked value is dropped exactly once when the callee's subtree unwinds through it.
+#[test]
+fn a_place_lend_after_a_gated_call_shares_one_slot() {
+    assert_eq!(
+        lend_a_place_after_a_gated_call(DEEP, &1),
+        1 + 5 * DEEP as u64
+    );
+}
+
+#[test]
+fn the_same_local_lent_from_two_sites() {
+    // `f(n) = f(n - 1) + n`, and the deepest frame answers with `row[1]`, which is 5.
+    let expect: u64 = (1..=DEEP as u64).sum::<u64>() + 5;
+    assert_eq!(lend_the_same_local_twice(DEEP, &1), expect);
+}
+
 #[test]
 fn a_panic_leaves_the_store_to_drop_what_it_holds() {
     use std::sync::atomic::{AtomicUsize, Ordering};
