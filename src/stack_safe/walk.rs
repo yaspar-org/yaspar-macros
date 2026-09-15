@@ -7,7 +7,7 @@
 use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, quote};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::names::entry_variant;
 use syn::Expr;
@@ -134,9 +134,14 @@ pub(super) struct Ctx {
     /// Declared type of each annotated `let`, by `(member, name)`; `None` if bound
     /// inconsistently. Re-applied where a payload slot carries that local.
     pub(super) local_types: RefCell<HashMap<(usize, String), Option<TokenStream>>>,
+    /// Every name a member binds with a plain `let`, whether or not that `let` said a type.
+    pub(super) locals: RefCell<HashSet<(usize, String)>>,
     /// `(loop index, element type)` per `for` loop over a borrow: the collection moves into the
     /// store so the iterator borrows that, not a local the frame owns.
-    pub(super) loop_stores: RefCell<Vec<(usize, TokenStream)>>,
+    /// The stores a lowering asks for, in the order it asks: one per borrowing loop, and one per
+    /// call site that parks a local to lend a place inside it. Kept in one list so that a slot index
+    /// settles when it is handed out.
+    pub(super) loop_stores: RefCell<Vec<(StoreKey, Option<TokenStream>)>>,
 }
 
 impl Ctx {
@@ -169,6 +174,13 @@ impl Ctx {
         out
     }
 
+    /// A number no other store key has, for keying a store to one call site.
+    pub(super) fn fresh_key(&self) -> usize {
+        let n = self.counter.get();
+        self.counter.set(n + 1);
+        n
+    }
+
     pub(super) fn fresh(&self) -> Ident {
         let n = self.counter.get();
         self.counter.set(n + 1);
@@ -196,34 +208,55 @@ impl Ctx {
         self.members[member].param_pointees[position].clone()
     }
 
-    /// Each store's element type in slot order: parameter positions, then one per borrowing loop.
+    /// Each store's element type in slot order: parameter positions, then the ones a lowering asked
+    /// for. A parked root's type is left to inference, since it is a local and may have no annotation.
     pub(super) fn pin_elements(&self) -> Vec<Option<TokenStream>> {
         let params = self
             .pinned_positions()
             .iter()
             .map(|&(i, j)| self.pin_element(i, j))
             .collect::<Vec<_>>();
-        let loops = self
+        let asked = self
             .loop_stores
             .borrow()
             .iter()
-            .map(|(_, elem)| Some(elem.clone()))
+            .map(|(_, elem)| elem.clone())
             .collect::<Vec<_>>();
-        params.into_iter().chain(loops).collect()
+        params.into_iter().chain(asked).collect()
     }
 
     /// Reserve a borrowing loop's store, returning its context-tuple index. The element type is
     /// named here because `C` in `&mut C` settles before the closure body is checked.
     pub(super) fn loop_store_slot(&self, loop_idx: usize, elem: TokenStream) -> syn::Index {
+        self.store_slot(StoreKey::Loop(loop_idx), Some(elem))
+    }
+
+    /// Reserve the store a call site parks a local in, so that it can lend a place inside it.
+    ///
+    /// The element type is the local's, which the macro cannot name, so inference settles it from
+    /// the `push`.
+    pub(super) fn root_store_slot(&self, call_site: usize) -> syn::Index {
+        self.store_slot(StoreKey::Root(call_site), None)
+    }
+
+    /// The context-tuple index of a store, reserving it on first ask.
+    fn store_slot(&self, key: StoreKey, elem: Option<TokenStream>) -> syn::Index {
         let mut stores = self.loop_stores.borrow_mut();
-        let at = match stores.iter().position(|(n, _)| *n == loop_idx) {
+        let at = match stores.iter().position(|(k, _)| *k == key) {
             Some(at) => at,
             None => {
-                stores.push((loop_idx, elem));
+                stores.push((key, elem));
                 stores.len() - 1
             }
         };
         syn::Index::from(self.context.len() + self.pinned_positions().len() + at)
+    }
+
+    /// Record that the member being lowered binds `name` with a `let`.
+    pub(super) fn note_local(&self, name: &Ident) {
+        self.locals
+            .borrow_mut()
+            .insert((self.current.get(), name.to_string()));
     }
 
     /// Record an annotated `let` binding of the member being lowered.
@@ -243,18 +276,18 @@ impl Ctx {
         }
     }
 
-    /// Does this member own the value named by `e`, as far as the macro can tell?
+    /// Does this member own the value named by `e`, and say so with an annotation?
     ///
-    /// Only an annotated `let` of a non-reference type counts. A reference is rooted outside the
-    /// driver and can be lent as it is; an unannotated local has no type to judge by, so it keeps
-    /// the plain borrow and whatever error that brings.
-    pub(super) fn owns_named_local(&self, member: usize, e: &syn::Expr) -> bool {
+    /// Lending a place *inside* a local parks the local, so getting this wrong would park something
+    /// the code only borrows: `let args = &node.args; f(&args[i])` projects through a reference and
+    /// must stay a plain borrow. A whole-local lend has no such trap — a wrong guess there cannot
+    /// typecheck — so only this one asks for the annotation.
+    pub(super) fn owns_annotated_local(&self, member: usize, e: &syn::Expr) -> bool {
         let syn::Expr::Path(p) = e else { return false };
         let Some(name) = p.path.get_ident() else {
             return false;
         };
         if self.param_type_of(member, name).is_some() {
-            // A parameter already travels in the payload; lend it as it is.
             return false;
         }
         match self
@@ -267,6 +300,30 @@ impl Ctx {
             Some(ty) => !matches!(syn::parse2::<syn::Type>(ty), Ok(syn::Type::Reference(_))),
             None => false,
         }
+    }
+
+    /// Does this member own the value named by `e`, as far as the macro can tell?
+    ///
+    /// A `let` of this body owns what it binds, so lending it needs the store. A reference is rooted
+    /// outside the driver and can be lent as it is, and so can a name this body does not bind — a
+    /// parameter, a `static`, an outer binding.
+    pub(super) fn owns_named_local(&self, member: usize, e: &syn::Expr) -> bool {
+        let syn::Expr::Path(p) = e else { return false };
+        let Some(name) = p.path.get_ident() else {
+            return false;
+        };
+        if self.param_type_of(member, name).is_some() {
+            // A parameter already travels in the payload; lend it as it is.
+            return false;
+        }
+        let annotated_reference = self
+            .local_types
+            .borrow()
+            .get(&(member, name.to_string()))
+            .cloned()
+            .flatten()
+            .is_some_and(|ty| matches!(syn::parse2::<syn::Type>(ty), Ok(syn::Type::Reference(_))));
+        !annotated_reference && self.locals.borrow().contains(&(member, name.to_string()))
     }
 
     /// A payload slot's type, from the signature or an annotated `let`.
@@ -560,4 +617,13 @@ impl<'a> Env<'a> {
             ..self.clone()
         }
     }
+}
+
+/// What a store was reserved for, so that asking twice hands back the same slot.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum StoreKey {
+    /// The collection a `for` loop borrows.
+    Loop(usize),
+    /// The local a call site parks to lend a place inside it.
+    Root(usize),
 }

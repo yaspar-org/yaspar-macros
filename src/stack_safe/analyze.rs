@@ -288,26 +288,82 @@ pub(super) fn rename_calls(func: &mut ItemFn, renames: &HashMap<String, Ident>) 
     V { renames }.visit_item_fn_mut(func);
 }
 
-/// The value a call lends the callee, when the argument is `&<something the caller owns>`.
+/// What a call lends the callee, when the argument is `&<something the caller owns>`.
 ///
-/// A built value (`&Node::Cons(..)`, `&t.child(i)`) and a local (`&case`) are the same case: the
-/// caller owns it, and it has to outlive a call that becomes a `return`. So both are moved into
-/// the driver's store. A local is *moved*, so using it after the call is a move error — which is
-/// the clear one, unlike the `E0515` that leaving it as a borrow produces.
+/// Either way the value has to outlive a call that becomes a `return`, so it goes into the driver's
+/// store. What differs is what the store takes: a value the caller owns outright is moved in, while a
+/// place inside a local means the *local* is parked and handed back when the frame resumes, since the
+/// code after the call usually still wants the rest of it.
+pub(super) enum Lend<'e> {
+    /// `&Node::Cons(..)`, `&t.child(i)`, `&case`: the value itself moves into the store.
+    Whole(&'e Expr),
+    /// `&def.body`, `&xs[i]`: the local is parked, and the pointer is to the place inside it.
+    Place {
+        /// The local to park.
+        root: Ident,
+        /// The place to point at, rooted at that local.
+        place: &'e Expr,
+    },
+}
+
+/// The value a call lends the callee, if it lends one.
 pub(super) fn borrows_a_built_value<'e>(
     ctx: &Ctx,
     member: usize,
     arg: &'e Expr,
-) -> Option<&'e Expr> {
+) -> Option<Lend<'e>> {
     let Expr::Reference(r) = strip_parens(arg) else {
         return None;
     };
     let inner = strip_parens(&r.expr);
-    let built = matches!(
+    let whole = matches!(
         inner,
         Expr::Call(_) | Expr::MethodCall(_) | Expr::Struct(_) | Expr::Macro(_)
     ) || ctx.owns_named_local(member, inner);
-    built.then_some(&*r.expr)
+    if whole {
+        return Some(Lend::Whole(&r.expr));
+    }
+    lent_place_root(ctx, member, arg).map(|(place, root)| Lend::Place {
+        root: root.clone(),
+        place,
+    })
+}
+
+/// The local a lent *place* is rooted at, when a call passes `&<local>.f`, `&<local>[i]` and the
+/// like and that local is one this member owns.
+///
+/// Only a whole local can move into the driver's store, so a place inside one is a rejection rather
+/// than a case to handle: moving the local would take the rest of it away from the code after the
+/// call, which is usually why the place was written in the first place. A place rooted at a
+/// parameter, or at a local holding a reference, is rooted outside the driver and needs no store.
+fn lent_place_root<'e>(ctx: &Ctx, member: usize, arg: &'e Expr) -> Option<(&'e Expr, &'e Ident)> {
+    let Expr::Reference(r) = strip_parens(arg) else {
+        return None;
+    };
+    let mut place = strip_parens(&r.expr);
+    let mut projected = false;
+    loop {
+        match place {
+            Expr::Field(f) => {
+                projected = true;
+                place = strip_parens(&f.base);
+            }
+            Expr::Index(i) => {
+                projected = true;
+                place = strip_parens(&i.expr);
+            }
+            Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => {
+                projected = true;
+                place = strip_parens(&u.expr);
+            }
+            Expr::Path(p) => {
+                let name = p.path.get_ident()?;
+                let owned = ctx.owns_annotated_local(member, place);
+                return (projected && owned).then_some((&*r.expr, name));
+            }
+            _ => return None,
+        }
+    }
 }
 
 /// Mark every payload position some call passes a freshly built value's reference to.

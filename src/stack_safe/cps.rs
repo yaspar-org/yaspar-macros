@@ -12,7 +12,7 @@ use syn::visit_mut::VisitMut;
 use syn::{Block, Expr, Pat, Stmt, parse_quote};
 
 use super::analyze::{
-    borrows_a_built_value, contains_rec, pat_bindings, stmt_contains_rec, tokens_mention,
+    Lend, borrows_a_built_value, contains_rec, pat_bindings, stmt_contains_rec, tokens_mention,
 };
 use super::context::{CtxArg, classify_ctx_arg};
 use super::leaf::{leaf_expr, leaf_stmt};
@@ -467,6 +467,9 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
         //
         // One store per position, so positions of different types do not have to agree.
         let mut pinned_slots: Vec<syn::Index> = Vec::new();
+        // The locals this call parks so that it can lend a place inside one: the store holding it,
+        // and the name to hand it back to when the frame resumes.
+        let mut parked: Vec<(syn::Index, Ident)> = Vec::new();
         for (i, arg) in call.args.iter().enumerate() {
             match ctx.member(callee).context_at.get(&i) {
                 None => {
@@ -474,11 +477,32 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
                     if ctx.member(callee).pinned[j].get() {
                         let pin = ctx.pin_slot(callee, j);
                         payload.push(match borrows_a_built_value(ctx, ctx.current.get(), arg) {
-                            Some(built) => {
+                            Some(Lend::Whole(built)) => {
                                 if !pinned_slots.contains(&pin) {
                                     pinned_slots.push(pin.clone());
                                 }
                                 parse_quote! { #ctxp.#pin.push(#built) }
+                            }
+                            // The local is parked in a store of its own, and the pointer is to the
+                            // place inside it. `take_last` in the resume arm hands it back, so the
+                            // code after the call still owns it — a lend, as the source wrote it.
+                            Some(Lend::Place { root, place }) => {
+                                let slot = ctx.root_store_slot(ctx.fresh_key());
+                                if !pinned_slots.contains(&slot) {
+                                    pinned_slots.push(slot.clone());
+                                }
+                                parked.push((slot.clone(), root.clone()));
+                                let owned = ctx.fresh();
+                                let projected = project_from(place, &root, &owned);
+                                parse_quote! {
+                                    {
+                                        let #owned = #ctxp.#slot.push(#root);
+                                        // SAFETY: `Pin` never moves a value it holds, so this
+                                        // address is good until the value is taken back or dropped,
+                                        // and both happen in this frame's own continuation.
+                                        ::core::ptr::from_ref(unsafe { #projected })
+                                    }
+                                }
                             }
                             None => parse_quote! { ::core::ptr::from_ref(#arg) },
                         });
@@ -516,8 +540,10 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
             // Its payload is solved from the same scope a loop's would be: the
             // bindings in scope at the call, plus the parked pointers, minus whatever
             // the resume code turns out not to mention.
-            let r =
-                ctx.reserve_resume(ctx.scope_with_results(&env.scope), saved.clone(), v.clone());
+            // A parked local is not carried: the resume arm takes it back out of the store.
+            let mut scope = ctx.scope_with_results(&env.scope);
+            scope.retain(|name| !parked.iter().any(|(_, root)| root == name));
+            let r = ctx.reserve_resume(scope, saved.clone(), v.clone());
             let frame_var = frame_variant(r);
             let marker = frame_marker(r);
 
@@ -536,6 +562,14 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
                 let (saved, idx) = (saved_slot(*slot), syn::Index::from(*slot));
                 quote! { #ctxp.#idx = #saved; }
             });
+            // What was parked is owned again, and taking it back is what leaves the store at the
+            // mark, so the truncate below finds nothing of this call's to drop.
+            let take_backs = parked.iter().map(|(slot, root)| {
+                quote! {
+                    let #root = #ctxp.#slot.take_last().expect("parked by this frame");
+                }
+            });
+            let take_backs = quote! { #(#take_backs)* };
             // Whatever this call lent the callee dies with the callee, i.e. now.
             let unpin = marks
                 .iter()
@@ -544,6 +578,7 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
             ctx.set_resume_code(
                 r,
                 quote! {
+                    #take_backs
                     #unpin
                     #(#restores)*
                     #prologue
@@ -1190,6 +1225,35 @@ fn lower_loop(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStrea
     }
 }
 
+/// A lent place, rewritten to read through the pointer the store handed back.
+///
+/// `&def.body` parks `def`, so the pointer has to be taken from the parked copy: the root is
+/// replaced by a *reference* to it, giving `&(&*owned).body`. A reference rather than a bare
+/// dereference, so that reaching the place cannot autoref a raw pointer — `&(*owned)[0]` would.
+fn project_from(place: &Expr, root: &Ident, owned: &Ident) -> Expr {
+    struct V<'a> {
+        root: &'a Ident,
+        owned: &'a Ident,
+    }
+
+    impl VisitMut for V<'_> {
+        fn visit_expr_mut(&mut self, e: &mut Expr) {
+            if let Expr::Path(p) = &*e
+                && p.qself.is_none()
+                && p.path.is_ident(self.root)
+            {
+                let owned = self.owned;
+                *e = parse_quote! { (&*#owned) };
+                return;
+            }
+            syn::visit_mut::visit_expr_mut(self, e);
+        }
+    }
+
+    let mut out = place.clone();
+    V { root, owned }.visit_expr_mut(&mut out);
+    parse_quote! { &#out }
+}
 /// The local a loop's iterator borrows, for the two forms that name a place: `&xs` and
 /// `xs.iter()`. Anything else either owns what it yields or borrows something unidentifiable.
 fn borrowed_owner(e: &Expr) -> Option<Ident> {

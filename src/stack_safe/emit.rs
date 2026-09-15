@@ -8,7 +8,7 @@
 use proc_macro2::{Ident, TokenStream};
 use quote::{ToTokens, format_ident, quote};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use syn::spanned::Spanned;
 use syn::{FnArg, Item, ItemFn, Pat, PatIdent, ReturnType, Stmt};
 
@@ -936,6 +936,7 @@ fn analyse(
         current: Cell::new(0),
         gates: RefCell::new(Vec::new()),
         local_types: RefCell::new(HashMap::new()),
+        locals: RefCell::new(HashSet::new()),
         loop_stores: RefCell::new(Vec::new()),
     };
 
@@ -1466,6 +1467,8 @@ fn note_annotated_lets(ctx: &Ctx, block: &syn::Block) {
     #[derive(Default)]
     struct Found {
         annotated: HashMap<String, Vec<(String, TokenStream)>>,
+        /// Every name a plain `let` binds, which is what the store may have to take ownership of.
+        bound: HashSet<String>,
         poisoned: HashSet<String>,
     }
 
@@ -1488,11 +1491,22 @@ fn note_annotated_lets(ctx: &Ctx, block: &syn::Block) {
                     };
                     let ty = &pt.ty;
                     let ty = quote! { #ty };
+                    self.0.bound.insert(id.ident.to_string());
                     self.0
                         .annotated
                         .entry(id.ident.to_string())
                         .or_default()
                         .push((ty.to_string(), ty));
+                }
+                Pat::Ident(id) if local.init.is_some() => {
+                    self.0.bound.insert(id.ident.to_string());
+                    if let Some(ty) = local.init.as_ref().and_then(|i| self_typing(&i.expr)) {
+                        self.0
+                            .annotated
+                            .entry(id.ident.to_string())
+                            .or_default()
+                            .push((ty.to_string(), ty));
+                    }
                 }
                 Pat::Ident(id) => match local.init.as_ref().and_then(|i| self_typing(&i.expr)) {
                     Some(ty) => self
@@ -1531,8 +1545,14 @@ fn note_annotated_lets(ctx: &Ctx, block: &syn::Block) {
     syn::visit::Visit::visit_block(&mut v, block);
     let Found {
         annotated,
+        bound,
         poisoned,
     } = v.0;
+    for name in &bound {
+        if !poisoned.contains(name) {
+            ctx.note_local(&format_ident!("{name}"));
+        }
+    }
     for (name, tys) in annotated {
         if poisoned.contains(&name) {
             continue;

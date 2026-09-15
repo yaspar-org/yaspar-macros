@@ -130,6 +130,23 @@ impl<D> Pin<D> {
         &chunk[chunk.len() - 1] as *const D
     }
 
+    /// Take the value pushed last back out, without dropping it.
+    ///
+    /// A frame that parked a value to lend a place inside it owns that value again once the callee
+    /// has returned, so the resume arm takes it back rather than letting [`Pin::truncate`] drop it.
+    /// The slot's chunk keeps its capacity, exactly as `truncate` leaves it.
+    pub fn take_last(&mut self) -> Option<D> {
+        // Taking the last value of a chunk leaves it empty, and `push` only ever appends to the
+        // last one, so an empty chunk on top is dropped rather than searched past.
+        while self.chunks.last().is_some_and(Vec::is_empty) {
+            self.chunks.pop();
+        }
+        let chunk = self.chunks.last_mut()?;
+        let d = chunk.pop()?;
+        self.len -= 1;
+        Some(d)
+    }
+
     /// Drop everything pushed since `mark`.
     ///
     /// A chunk that lies entirely above the mark is dropped whole, so unwinding a deep
@@ -279,5 +296,39 @@ impl<B, C> FromResidual<ControlFlowBreak<B>> for core::ops::ControlFlow<B, C> {
     #[inline]
     fn from_residual(r: ControlFlowBreak<B>) -> Self {
         core::ops::ControlFlow::Break(r.0)
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::Pin;
+
+    /// A parked value comes back out, and what stays behind is still dropped once.
+    #[test]
+    fn take_last_returns_the_parked_value() {
+        let mut pin: Pin<alloc::string::String> = Pin::new();
+        let mark = pin.mark();
+        let p = pin.push(alloc::string::String::from("parked"));
+        assert_eq!(unsafe { &*p }, "parked");
+        assert_eq!(pin.take_last().as_deref(), Some("parked"));
+        assert_eq!(pin.mark(), mark, "taking it back leaves nothing behind");
+        assert_eq!(pin.take_last(), None, "and nothing else to take");
+    }
+
+    /// Taking one back does not move the values still parked, which is what the pointers rely on.
+    #[test]
+    fn take_last_leaves_other_addresses_alone() {
+        let mut pin: Pin<u64> = Pin::new();
+        let first = pin.push(1);
+        let second = pin.push(2);
+        assert_eq!(pin.take_last(), Some(2));
+        assert_eq!(unsafe { *first }, 1);
+        let third = pin.push(3);
+        assert_eq!(unsafe { *first }, 1);
+        assert_eq!(
+            third, second,
+            "the slot is reused, as `truncate` would leave it"
+        );
+        pin.truncate(0);
     }
 }
