@@ -73,6 +73,123 @@ fn lend_two(n: usize, a: &u64, b: &u64) -> u64 {
     deeper + left.rest + right.rest
 }
 
+/// Three shapes lent from one function: a value built at the call site, a parked struct, and a
+/// parked collection. One store holds them all, as variants of one enum, and a lend that lands
+/// *above* a parked value in that store must not be what the resume arm takes back.
+#[stack_safe(data_in_frame)]
+fn lend_three_shapes(n: usize, t: &u64, d: &Def) -> u64 {
+    if n == 0 {
+        return *t + d.rest;
+    }
+    let def: Def = Def {
+        body: n as u64,
+        rest: 1,
+    };
+    let row: Vec<u64> = vec![n as u64, 5];
+    // The first call parks `row` and *then* lends a built `Def`, so `row` is not on top.
+    let a = lend_three_shapes(n - 1, &row[0], &Def { body: 0, rest: 0 });
+    let b = lend_three_shapes(n - 1, &def.body, d);
+    a + b + def.rest + row[1]
+}
+
+/// What `lend_three_shapes` says, written as the compiler would run it.
+fn lend_three_shapes_naive(n: usize, t: &u64, d: &Def) -> u64 {
+    if n == 0 {
+        return *t + d.rest;
+    }
+    let def: Def = Def {
+        body: n as u64,
+        rest: 1,
+    };
+    let row: Vec<u64> = vec![n as u64, 5];
+    let a = lend_three_shapes_naive(n - 1, &row[0], &Def { body: 0, rest: 0 });
+    let b = lend_three_shapes_naive(n - 1, &def.body, d);
+    a + b + def.rest + row[1]
+}
+
+/// A parked local inside a borrowing loop, so the loop's collection and the park share the store.
+///
+/// The collection is pushed on the way into the loop and lives until the loop is left, while each
+/// iteration parks a local *above* it and takes it back. The take therefore has to leave the
+/// collection where it is, or the iterator would be reading a dropped value.
+#[stack_safe(data_in_frame)]
+fn park_inside_a_borrowing_loop(n: usize, v: Vec<u64>, t: &u64) -> u64 {
+    if n == 0 {
+        return *t;
+    }
+    let mut acc = 0;
+    for x in &v {
+        let row: Vec<u64> = vec![*x, 5];
+        acc += park_inside_a_borrowing_loop(n - 1, vec![*x], &row[0]);
+        acc += row[1];
+    }
+    acc
+}
+
+/// What `park_inside_a_borrowing_loop` says, written as the compiler would run it.
+fn park_inside_a_borrowing_loop_naive(n: usize, v: Vec<u64>, t: &u64) -> u64 {
+    if n == 0 {
+        return *t;
+    }
+    let mut acc = 0;
+    for x in &v {
+        let row: Vec<u64> = vec![*x, 5];
+        acc += park_inside_a_borrowing_loop_naive(n - 1, vec![*x], &row[0]);
+        acc += row[1];
+    }
+    acc
+}
+
+/// Two members of one group, each parking a local of its own type: the variants of the shared
+/// store come from different members, and the descent alternates between them.
+#[stack_safe(data_in_frame)]
+mod two_members {
+    use super::Def;
+
+    pub(super) fn even(n: usize, t: &u64) -> u64 {
+        if n == 0 {
+            return *t;
+        }
+        let row: Vec<u64> = vec![n as u64, 5];
+        odd(n - 1, &row[0]) + row[1]
+    }
+
+    pub(super) fn odd(n: usize, t: &u64) -> u64 {
+        if n == 0 {
+            return *t;
+        }
+        let def: Def = Def {
+            body: n as u64,
+            rest: 3,
+        };
+        even(n - 1, &def.body) + def.rest
+    }
+}
+
+/// What `two_members` says, written as the compiler would run it.
+mod two_members_naive {
+    use super::Def;
+
+    pub(super) fn even(n: usize, t: &u64) -> u64 {
+        if n == 0 {
+            return *t;
+        }
+        let row: Vec<u64> = vec![n as u64, 5];
+        odd(n - 1, &row[0]) + row[1]
+    }
+
+    pub(super) fn odd(n: usize, t: &u64) -> u64 {
+        if n == 0 {
+            return *t;
+        }
+        let def: Def = Def {
+            body: n as u64,
+            rest: 3,
+        };
+        even(n - 1, &def.body) + def.rest
+    }
+}
+
 /// A place lend that sits after a `#[cfg]`ed statement which itself recurses.
 ///
 /// Such a statement makes the macro lower everything after it twice — once under the gate, once
@@ -132,6 +249,92 @@ fn two_lends_in_one_call() {
 }
 
 /// The parked value is dropped exactly once when the callee's subtree unwinds through it.
+#[test]
+fn a_park_inside_a_borrowing_loop() {
+    // Branching by the collection's length, so the same applies as above.
+    for n in 0..5 {
+        let v = vec![1, 2, 3];
+        assert_eq!(
+            park_inside_a_borrowing_loop(n, v.clone(), &1),
+            park_inside_a_borrowing_loop_naive(n, v, &1),
+            "n = {n}"
+        );
+    }
+}
+
+#[test]
+fn two_members_park_their_own_shapes() {
+    for n in 0..10 {
+        assert_eq!(
+            two_members::even(n, &1),
+            two_members_naive::even(n, &1),
+            "n = {n}"
+        );
+    }
+}
+
+/// The alternation is still flat, however many variants the shared store has. Named for the skip
+/// pattern the Miri jobs use: it is about frames, not aliasing.
+#[test]
+fn two_members_parking_is_flat() {
+    two_members::even(DEEP, &1);
+}
+
+/// Every shape a frame holds is dropped exactly once when the descent unwinds through it.
+#[test]
+fn a_panic_drops_every_shape_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Clone)]
+    struct Counted(u64);
+
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[stack_safe(data_in_frame)]
+    fn boom(n: usize, t: &u64, c: &Counted) -> u64 {
+        if n == 0 {
+            panic!("from the deepest call");
+        }
+        // one parked local and one value built here, in that order, so the store holds both shapes
+        let held: Counted = Counted(*t + 1);
+        let deeper = boom(n - 1, &held.0, &Counted(0));
+        deeper + held.0 + c.0
+    }
+
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let caught = std::panic::catch_unwind(|| boom(64, &0, &Counted(0)));
+    std::panic::set_hook(prev);
+    assert!(caught.is_err(), "the panic propagates");
+    assert_eq!(
+        DROPS.load(Ordering::Relaxed),
+        // one parked local and one built value per level, plus the one this test owns; the
+        // deepest call panics before binding either
+        64 + 64 + 1,
+        "each value the store held is dropped once"
+    );
+}
+
+#[test]
+fn three_shapes_share_one_store() {
+    // Doubling recursion, so a handful of levels is thousands of store operations and every
+    // interleaving of the three shapes. Kept small on purpose: this one runs under Miri.
+    for n in 0..6 {
+        let d = Def { body: 0, rest: 2 };
+        assert_eq!(
+            lend_three_shapes(n, &1, &d),
+            lend_three_shapes_naive(n, &1, &d),
+            "n = {n}"
+        );
+    }
+}
+
 #[test]
 fn a_place_lend_after_a_gated_call_shares_one_slot() {
     assert_eq!(

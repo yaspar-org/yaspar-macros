@@ -48,6 +48,18 @@ pub(super) fn entry_variant(n: usize) -> Ident {
 pub(super) fn state_marker(n: usize) -> Ident {
     format_ident!("__ss_st{}", n)
 }
+/// The enum every value the driver holds travels in, so that one store serves them all: one
+/// variant per shape, generic over that shape like the entry and frame enums are.
+pub(super) fn pinned_ty() -> Ident {
+    format_ident!("__SsPinned")
+}
+pub(super) fn pinned_variant(n: usize) -> Ident {
+    format_ident!("P{}", n)
+}
+pub(super) fn pinned_param(n: usize) -> Ident {
+    format_ident!("__SsP{}", n)
+}
+
 /// The frame enum: one variant per *resume point*, carrying the locals live across
 /// that call. This is what replaces a boxed continuation.
 pub(super) fn frame_ty() -> Ident {

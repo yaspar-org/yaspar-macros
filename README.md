@@ -428,8 +428,14 @@ The store answers both. It exists before the arm runs, so pushing hands back an 
 pre-sized and never regrown, so no value ever moves. That costs one allocation per 64 values rather than one per value.
 
 Each call site records the store's length (a mark) before pushing and truncates back to it on resume, carrying that mark
-in its frame, so what a call lends its callee dies exactly with the callee's subtree. There is one store per argument
-position, so a call may grow several arguments at once even when their types differ.
+in its frame, so what a call lends its callee dies exactly with the callee's subtree. There is one store per driver
+however many shapes it holds: they travel as variants of a generated enum, so a call may grow several arguments at once
+even when their types differ, and a descent allocates one chunked buffer rather than one per shape.
+
+A lend need not be a value built there. `rec(n - 1, &row[0])` on a local of the frame — a `let` that says its type —
+lends a *place inside* it: the local moves into the store, the callee is given the address of the place, and the resume
+arm hands the local back, so the code after the call still owns it. It is taken back by index rather than "the value
+pushed last", since a later lend to the same call sits on top of it.
 
 The two options compose, including at one call site. A recursion may hand its child a place derived from a `&mut`
 parameter *and*, in the same argument list, a reference to a value built there. We park the slot for the child's subtree
@@ -532,8 +538,8 @@ On the placement of a recursive call:
   left-hand side of an assignment or of a compound assignment;
 * in any other position it cannot be hoisted out of, e.g. an array-repeat expression, which asks for it to be bound to a
   `let` first;
-* on a reference to a value built at the call site, e.g. `rec(n, &Node::Cons(v, rest))`, unless we opt in with
-  `data_in_frame` — see below;
+* on a reference to a value the frame owns, i.e. one built at the call site, e.g. `rec(n, &Node::Cons(v, rest))`, or a
+  place inside a local, e.g. `rec(n, &row[0])`, unless we opt in with `data_in_frame` — see below;
 * inside the place passed for a context parameter, e.g. `f(&mut t.kids[f(..) as usize])`, since that place is taken as a
   pointer before the call is made, so the inner call would recurse natively;
 * with the wrong number of arguments, which is reported as such rather than left to the type checker;
@@ -620,6 +626,10 @@ MIRIFLAGS="-Zmiri-strict-provenance" cargo +nightly miri test --test group \
     -- lend unsafe_options --skip _is_flat
 MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-strict-provenance" cargo +nightly miri test --test group \
     -- lend unsafe_options --skip _is_flat
+MIRIFLAGS="-Zmiri-strict-provenance" cargo +nightly miri test --test pinned_places \
+    -- three_shapes park_inside two_members_park_their a_panic_drops
+MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-strict-provenance" cargo +nightly miri test --test pinned_places \
+    -- three_shapes park_inside two_members_park_their a_panic_drops
 MIRIFLAGS="-Zmiri-strict-provenance" cargo +nightly miri test --test loops \
     -- borrowed_loop_is_correct borrowed_loop_releases_on_break_and_question_mark
 MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-strict-provenance" cargo +nightly miri test --test loops \
