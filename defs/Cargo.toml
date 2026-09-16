@@ -1,6 +1,6 @@
 [package]
 name = "yaspar-macros-defs"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 # Kept in step with the macro crate, the only thing that depends on this one.
 rust-version = "1.88"

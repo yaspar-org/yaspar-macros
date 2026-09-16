@@ -136,12 +136,11 @@ pub(super) struct Ctx {
     pub(super) local_types: RefCell<HashMap<(usize, String), Option<TokenStream>>>,
     /// Every name a member binds with a plain `let`, whether or not that `let` said a type.
     pub(super) locals: RefCell<HashSet<(usize, String)>>,
-    /// `(loop index, element type)` per `for` loop over a borrow: the collection moves into the
-    /// store so the iterator borrows that, not a local the frame owns.
-    /// The stores a lowering asks for, in the order it asks: one per borrowing loop, and one per
-    /// call site that parks a local to lend a place inside it. Kept in one list so that a slot index
-    /// settles when it is handed out.
-    pub(super) loop_stores: RefCell<Vec<(StoreKey, Option<TokenStream>)>>,
+    /// The shared store's variants a lowering asks for, in the order it asks: one per borrowing
+    /// `for` loop, whose collection moves into the store so that the iterator borrows that rather
+    /// than a local the frame owns, and one per local a call site parks to lend a place inside it.
+    /// Kept in one list so that a variant index settles when it is handed out.
+    pub(super) asked_stores: RefCell<Vec<(StoreKey, TokenStream)>>,
 }
 
 impl Ctx {
@@ -181,9 +180,6 @@ impl Ctx {
     }
 
     /// Every pinned payload position, in a fixed order, as `(member, position)`.
-    ///
-    /// One store per position rather than one per function: each holds a different
-    /// type, and a store's element type is a single inferred one.
     fn pinned_positions(&self) -> Vec<(usize, usize)> {
         let mut out = Vec::new();
         for (i, p) in self.members.iter().enumerate() {
@@ -201,43 +197,99 @@ impl Ctx {
         self.members[member].param_pointees[position].clone()
     }
 
-    /// Each store's element type in slot order: parameter positions, then the ones a lowering asked
-    /// for.
-    pub(super) fn pin_elements(&self) -> Vec<Option<TokenStream>> {
-        let params = self
-            .pinned_positions()
-            .iter()
-            .map(|&(i, j)| self.pin_element(i, j))
-            .collect::<Vec<_>>();
-        let asked = self
-            .loop_stores
-            .borrow()
-            .iter()
-            .map(|(_, elem)| elem.clone())
-            .collect::<Vec<_>>();
-        params.into_iter().chain(asked).collect()
+    /// The pinned positions whose element type the macro can name, in variant order.
+    fn named_positions(&self) -> Vec<(usize, usize)> {
+        self.pinned_positions()
+            .into_iter()
+            .filter(|&(i, j)| self.pin_element(i, j).is_some())
+            .collect()
     }
 
-    /// Reserve a borrowing loop's store, returning its context-tuple index. The element type is
-    /// named here because `C` in `&mut C` settles before the closure body is checked.
-    pub(super) fn loop_store_slot(&self, loop_idx: usize, elem: TokenStream) -> syn::Index {
-        self.store_slot(StoreKey::Loop(loop_idx), Some(elem))
+    /// The pinned positions whose element type it cannot: an enum variant needs a type, so each of
+    /// these keeps a store of its own, whose element type the `push` settles as it always did.
+    fn unnamed_positions(&self) -> Vec<(usize, usize)> {
+        self.pinned_positions()
+            .into_iter()
+            .filter(|&(i, j)| self.pin_element(i, j).is_none())
+            .collect()
     }
 
-    /// Reserve the store a call site parks `root` in, so that it can lend a place inside it.
+    /// The context-tuple index of the shared store, which sits after those own stores.
     ///
-    /// The element type is named from `root`'s annotation, which a place lend requires anyway (see
-    /// [`Self::owns_annotated_local`]). Leaving it to the `push` would tie the slot's type to a
-    /// lowering that `#[cfg]` may drop.
-    pub(super) fn root_store_slot(&self, root: &Ident) -> syn::Index {
-        let member = self.current.get();
-        let elem = self.slot_type(member, root);
-        self.store_slot(StoreKey::Root(member, root.to_string()), elem)
+    /// Their number is known from the analysis, before any lowering asks for a store, which is what
+    /// keeps this index fixed.
+    fn shared_slot(&self) -> syn::Index {
+        syn::Index::from(self.context.len() + self.unnamed_positions().len())
     }
 
-    /// The context-tuple index of a store, reserving it on first ask.
-    fn store_slot(&self, key: StoreKey, elem: Option<TokenStream>) -> syn::Index {
-        let mut stores = self.loop_stores.borrow_mut();
+    /// How many stores of their own the unnameable positions need, each initialised untyped.
+    pub(super) fn own_store_count(&self) -> usize {
+        self.unnamed_positions().len()
+    }
+
+    /// The shared store's element types in variant order: the nameable pinned positions, then the
+    /// stores a lowering asked for. Empty when nothing is held, in which case no store is emitted.
+    pub(super) fn shared_elements(&self) -> Vec<TokenStream> {
+        let mut out: Vec<TokenStream> = self
+            .named_positions()
+            .iter()
+            .map(|&(i, j)| self.pin_element(i, j).expect("nameable"))
+            .collect();
+        out.extend(self.asked_stores.borrow().iter().map(|(_, e)| e.clone()));
+        out
+    }
+
+    /// Where a value lent to a call travels: which variant of the shared store, or a store of this
+    /// position's own.
+    pub(super) fn held_pin(&self, member: usize, position: usize) -> Held {
+        match self.pin_element(member, position) {
+            Some(_) => Held::Shared {
+                slot: self.shared_slot(),
+                variant: self
+                    .named_positions()
+                    .iter()
+                    .position(|&p| p == (member, position))
+                    .expect("only called for a pinned position"),
+            },
+            None => Held::Own {
+                slot: syn::Index::from(
+                    self.context.len()
+                        + self
+                            .unnamed_positions()
+                            .iter()
+                            .position(|&p| p == (member, position))
+                            .expect("only called for a pinned position"),
+                ),
+            },
+        }
+    }
+
+    /// Reserve the shared store's variant for a borrowing loop's collection. The element type is
+    /// named here because `C` in `&mut C` settles before the closure body is checked.
+    pub(super) fn held_loop(&self, loop_idx: usize, elem: TokenStream) -> Held {
+        self.held_asked(StoreKey::Loop(loop_idx), elem)
+    }
+
+    /// Reserve the variant a call site parks `root` in, so that it can lend a place inside it.
+    ///
+    /// Keyed by the local, not by the call site: one site can be lowered more than once — the code
+    /// after a `#[cfg]`ed statement is lowered under the gate and again under its negation — and a
+    /// variant only one of those lowerings constructs is dead in the other configuration. Sharing
+    /// is safe: the store is a stack, so parking the same local again, in another branch or deeper
+    /// in the descent, stacks rather than clashes.
+    pub(super) fn held_root(&self, root: &Ident) -> Held {
+        let member = self.current.get();
+        let elem = self
+            .slot_type(member, root)
+            .expect("a place lend requires an annotated local; see `owns_annotated_local`");
+        self.held_asked(StoreKey::Root(member, root.to_string()), elem)
+    }
+
+    /// The shared store's variant for one asked-for entity, reserving it on first ask.
+    fn held_asked(&self, key: StoreKey, elem: TokenStream) -> Held {
+        let slot = self.shared_slot();
+        let named = self.named_positions().len();
+        let mut stores = self.asked_stores.borrow_mut();
         let at = match stores.iter().position(|(k, _)| *k == key) {
             Some(at) => at,
             None => {
@@ -245,7 +297,10 @@ impl Ctx {
                 stores.len() - 1
             }
         };
-        syn::Index::from(self.context.len() + self.pinned_positions().len() + at)
+        Held::Shared {
+            slot,
+            variant: named + at,
+        }
     }
 
     /// Record that the member being lowered binds `name` with a `let`.
@@ -348,17 +403,6 @@ impl Ctx {
     /// The declared type of a payload parameter of the member being lowered.
     pub(super) fn current_param_type(&self, name: &Ident) -> Option<TokenStream> {
         self.param_type_of(self.current.get(), name)
-    }
-
-    /// The context-tuple index of the store for one position. The stores sit after
-    /// the user's own context slots.
-    pub(super) fn pin_slot(&self, member: usize, position: usize) -> syn::Index {
-        let at = self
-            .pinned_positions()
-            .iter()
-            .position(|&pair| pair == (member, position))
-            .expect("only called for a pinned position");
-        syn::Index::from(self.context.len() + at)
     }
 
     /// The context rebindings, in slot order. Emitted at the top of the body closure and of
@@ -615,17 +659,40 @@ impl<'a> Env<'a> {
     }
 }
 
-/// What a store was reserved for, so that asking twice hands back the same slot.
+/// Where a value the driver holds travels.
+///
+/// One store holds them all, as variants of one enum, so that a descent allocates one chunked
+/// buffer however many shapes it parks. A position whose type cannot be named cannot be a variant,
+/// so it falls back to a store of its own.
+#[derive(Clone)]
+pub(super) enum Held {
+    Shared { slot: syn::Index, variant: usize },
+    Own { slot: syn::Index },
+}
+
+impl Held {
+    /// The context-tuple index of the store this value lives in.
+    pub(super) fn slot(&self) -> syn::Index {
+        match self {
+            Held::Shared { slot, .. } | Held::Own { slot } => slot.clone(),
+        }
+    }
+
+    /// Which variant wraps it, if the store is the shared one.
+    pub(super) fn variant(&self) -> Option<usize> {
+        match self {
+            Held::Shared { variant, .. } => Some(*variant),
+            Held::Own { .. } => None,
+        }
+    }
+}
+
+/// What a store or variant was reserved for, so that asking twice hands back the same one.
 #[derive(Clone, PartialEq, Eq)]
 pub(super) enum StoreKey {
     /// The collection a `for` loop borrows.
     Loop(usize),
-    /// The local a call site parks to lend a place inside it, as `(member, name)`.
-    ///
-    /// Keyed by the local rather than by the call site, because one site can be lowered more than
-    /// once — the code after a `#[cfg]`ed statement is lowered under the gate and again under its
-    /// negation — and a slot only one of those lowerings pushes into would be dead in the other
-    /// configuration. Sharing is safe: the store is a stack, so parking the same local again, in
-    /// another branch or deeper in the descent, stacks rather than clashes.
+    /// The local a call site parks to lend a place inside it, as `(member, name)`. See
+    /// [`Ctx::held_root`] for why it is keyed by the local.
     Root(usize, String),
 }

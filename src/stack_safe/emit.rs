@@ -937,7 +937,7 @@ fn analyse(
         gates: RefCell::new(Vec::new()),
         local_types: RefCell::new(HashMap::new()),
         locals: RefCell::new(HashSet::new()),
-        loop_stores: RefCell::new(Vec::new()),
+        asked_stores: RefCell::new(Vec::new()),
     };
 
     reject_generic_payload(&ctx, funcs)?;
@@ -1117,14 +1117,31 @@ pub(super) fn expand_group(
     // reference each other's markers.
     let mut ctx_inits: Vec<TokenStream> = ctx.context.iter().map(CtxEntry::init_expr).collect();
     let pin = pin_ty();
-    for elem in ctx.pin_elements() {
-        // Naming the element type here, rather than leaving it to the `push`, is what
-        // lets one member's entry payload be inferred from another's arm.
-        ctx_inits.push(match elem {
-            Some(elem) => quote! { #pin::<#elem>::new() },
-            None => quote! { #pin::new() },
-        });
+    // A position whose pointee type cannot be named keeps a store of its own, left to inference.
+    for _ in 0..ctx.own_store_count() {
+        ctx_inits.push(quote! { #pin::new() });
     }
+    // Everything else shares one store, holding one enum. Naming its element types here, rather
+    // than leaving them to the `push`es, is what lets one member's entry payload be inferred from
+    // another's arm — and what keeps a variant only a `#[cfg]`ed lowering constructs from having no
+    // type at all.
+    let shared_elements = ctx.shared_elements();
+    let pinned_decl = if shared_elements.is_empty() {
+        TokenStream::new()
+    } else {
+        let en = pinned_ty();
+        ctx_inits.push(quote! { #pin::<#en<#(#shared_elements),*>>::new() });
+        let params: Vec<Ident> = (0..shared_elements.len()).map(pinned_param).collect();
+        let variants: Vec<Ident> = (0..shared_elements.len()).map(pinned_variant).collect();
+        quote! {
+            // A variant is constructed under one `#[cfg]` and not another, and a group's members
+            // need not all park something.
+            #[allow(dead_code)]
+            enum #en<#(#params),*> {
+                #(#variants(#params),)*
+            }
+        }
+    };
     let loop_base = ctx.loop_base();
     let loops = ctx.loops.take();
     let resumes = ctx.resumes.take();
@@ -1262,6 +1279,8 @@ pub(super) fn expand_group(
         #defs_imports
         #(#items)*
 
+        #pinned_decl
+
         enum #entry<#(#entry_params),*> {
             #(#entry_variants(#entry_params),)*
         }
@@ -1361,6 +1380,8 @@ pub(super) fn expand_group(
                 #(#items)*
 
                 #ret_union_decl
+
+                #pinned_decl
 
                 enum #entry<#(#entry_params),*> {
                     #(#entry_variants(#entry_params),)*

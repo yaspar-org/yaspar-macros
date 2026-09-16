@@ -118,6 +118,7 @@ jobs:
           cargo miri test --test context -- --skip deep_ --skip _is_flat --skip _is_stack_safe
           cargo miri test --test transform -- lends_the_callee two_values_of three_lent_values_with
           cargo miri test --test group -- lend unsafe_options --skip _is_flat
+          cargo miri test --test pinned_places -- three_shapes park_inside two_members_park_their a_panic_drops
 
   deny:
     name: Dependency Audit

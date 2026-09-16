@@ -130,6 +130,36 @@ impl<D> Pin<D> {
         &chunk[chunk.len() - 1] as *const D
     }
 
+    /// Push `d` and hand back the address of a place inside it, which `project` reaches.
+    ///
+    /// One store serves values of several shapes by holding an enum, so a caller that wants a
+    /// pointer to what is *inside* a variant would have to dereference the pushed pointer itself.
+    /// It happens here instead, where the safety argument for that dereference is one line: the
+    /// value was just pushed and [`Pin`] never moves what it holds.
+    pub fn push_projected<E: ?Sized>(&mut self, d: D, project: impl FnOnce(&D) -> &E) -> *const E {
+        let at = self.push(d);
+        // SAFETY: `at` is the value pushed on the line above, and nothing has run since; `Pin`
+        // never moves a value it holds, so the address is live. The reference `project` receives
+        // does not outlive this call — only the address it returns does, and that address is the
+        // pushed value's, which lives until `truncate` or `take_last` reaches it.
+        core::ptr::from_ref(project(unsafe { &*at }))
+    }
+
+    /// Take the value at `at` back out, dropping everything pushed after it.
+    ///
+    /// One store holds every shape a descent parks, so a frame that parked a value and then lent
+    /// another one to the same call cannot ask for "the last": the lend sits on top of it. It knows
+    /// where its own value went, though — the store's length before the call, plus its position
+    /// among that call's pushes — and what is above it belongs to the call that has just returned,
+    /// so dropping it here is what [`Pin::truncate`] would have done a moment later.
+    pub fn take_at(&mut self, at: usize) -> Option<D> {
+        if at >= self.len {
+            return None;
+        }
+        self.truncate(at + 1);
+        self.take_last()
+    }
+
     /// Take the value pushed last back out, without dropping it.
     ///
     /// A frame that parked a value to lend a place inside it owns that value again once the callee
@@ -313,6 +343,54 @@ mod pin_tests {
         assert_eq!(pin.take_last().as_deref(), Some("parked"));
         assert_eq!(pin.mark(), mark, "taking it back leaves nothing behind");
         assert_eq!(pin.take_last(), None, "and nothing else to take");
+    }
+
+    /// The projection points *inside* the pushed value, and stays valid as more is pushed.
+    #[test]
+    fn push_projected_points_inside_the_value() {
+        struct Held {
+            head: u64,
+            tail: u64,
+        }
+
+        let mut pin: Pin<Held> = Pin::new();
+        let head = pin.push_projected(Held { head: 1, tail: 2 }, |h| &h.head);
+        let tail = pin.push_projected(Held { head: 3, tail: 4 }, |h| &h.tail);
+        assert_eq!((unsafe { *head }, unsafe { *tail }), (1, 4));
+        for i in 0..(Pin::<Held>::CHUNK as u64 * 2) {
+            pin.push(Held { head: i, tail: i });
+        }
+        assert_eq!(
+            (unsafe { *head }, unsafe { *tail }),
+            (1, 4),
+            "later pushes do not move either"
+        );
+        pin.truncate(0);
+    }
+
+    /// Taking a value out from under a later push drops what was above it.
+    #[test]
+    fn take_at_drops_what_sits_above() {
+        let mut pin: Pin<alloc::string::String> = Pin::new();
+        let mark = pin.mark();
+        pin.push(alloc::string::String::from("parked"));
+        pin.push(alloc::string::String::from("lent later"));
+        assert_eq!(pin.take_at(mark).as_deref(), Some("parked"));
+        assert_eq!(pin.mark(), mark, "and the store is back where it started");
+        assert_eq!(pin.take_at(mark), None, "nothing at that index any more");
+    }
+
+    /// It reaches past a chunk boundary, so the index is the store's own and not a chunk's.
+    #[test]
+    fn take_at_crosses_chunks() {
+        let mut pin: Pin<u64> = Pin::new();
+        let mark = pin.mark();
+        for i in 0..(Pin::<u64>::CHUNK as u64 * 3) {
+            pin.push(i);
+        }
+        assert_eq!(pin.take_at(mark + Pin::<u64>::CHUNK), Some(64));
+        assert_eq!(pin.mark(), mark + Pin::<u64>::CHUNK);
+        pin.truncate(mark);
     }
 
     /// Taking one back does not move the values still parked, which is what the pointers rely on.

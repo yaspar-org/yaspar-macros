@@ -18,7 +18,7 @@ use super::context::{CtxArg, classify_ctx_arg};
 use super::leaf::{leaf_expr, leaf_stmt};
 use super::names::*;
 use super::try_shim;
-use super::walk::{Cont, Ctx, Env, LoopCtx};
+use super::walk::{Cont, Ctx, Env, Held, LoopCtx};
 
 fn cps_block(ctx: &Ctx, env: &Env, block: &Block, k: Cont) -> syn::Result<TokenStream> {
     cps_stmts(ctx, env, &block.stmts, k)
@@ -467,42 +467,42 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
         //
         // One store per position, so positions of different types do not have to agree.
         let mut pinned_slots: Vec<syn::Index> = Vec::new();
-        // The locals this call parks so that it can lend a place inside one: the store holding it,
-        // and the name to hand it back to when the frame resumes.
-        let mut parked: Vec<(syn::Index, Ident)> = Vec::new();
+        // The locals this call parks so that it can lend a place inside one: where each is held,
+        // the name to hand it back to when the frame resumes, and how many of this call's pushes
+        // came before it, which is where in the store it sits.
+        let mut parked: Vec<(Held, Ident, usize)> = Vec::new();
+        // How many values this call has pushed so far, counted in argument order.
+        let mut pushes = 0usize;
         for (i, arg) in call.args.iter().enumerate() {
             match ctx.member(callee).context_at.get(&i) {
                 None => {
                     let j = payload.len();
                     if ctx.member(callee).pinned[j].get() {
-                        let pin = ctx.pin_slot(callee, j);
+                        let held = ctx.held_pin(callee, j);
+                        let slot = held.slot();
                         payload.push(match borrows_a_built_value(ctx, ctx.current.get(), arg) {
                             Some(Lend::Whole(built)) => {
-                                if !pinned_slots.contains(&pin) {
-                                    pinned_slots.push(pin.clone());
-                                }
-                                parse_quote! { #ctxp.#pin.push(#built) }
-                            }
-                            // The local is parked in a store of its own, and the pointer is to the
-                            // place inside it. `take_last` in the resume arm hands it back, so the
-                            // code after the call still owns it — a lend, as the source wrote it.
-                            Some(Lend::Place { root, place }) => {
-                                let slot = ctx.root_store_slot(&root);
                                 if !pinned_slots.contains(&slot) {
                                     pinned_slots.push(slot.clone());
                                 }
-                                parked.push((slot.clone(), root.clone()));
-                                let owned = ctx.fresh();
-                                let projected = project_from(place, &root, &owned);
-                                parse_quote! {
-                                    {
-                                        let #owned = #ctxp.#slot.push(#root);
-                                        // SAFETY: `Pin` never moves a value it holds, so this
-                                        // address is good until the value is taken back or dropped,
-                                        // and both happen in this frame's own continuation.
-                                        ::core::ptr::from_ref(unsafe { #projected })
-                                    }
+                                pushes += 1;
+                                push_into(&held, built, &|_| None)
+                            }
+                            // The local is parked, and the pointer is to the place inside it.
+                            // `take_last` in the resume arm hands it back, so the code after the
+                            // call still owns it — a lend, as the source wrote it.
+                            Some(Lend::Place { root, place }) => {
+                                let held = ctx.held_root(&root);
+                                let slot = held.slot();
+                                if !pinned_slots.contains(&slot) {
+                                    pinned_slots.push(slot.clone());
                                 }
+                                parked.push((held.clone(), root.clone(), pushes));
+                                pushes += 1;
+                                let root_name = root.clone();
+                                push_into(&held, &root_expr(&root), &|owned| {
+                                    Some(project_from(place, &root_name, owned))
+                                })
                             }
                             None => parse_quote! { ::core::ptr::from_ref(#arg) },
                         });
@@ -542,7 +542,7 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
             // the resume code turns out not to mention.
             // A parked local is not carried: the resume arm takes it back out of the store.
             let mut scope = ctx.scope_with_results(&env.scope);
-            scope.retain(|name| !parked.iter().any(|(_, root)| root == name));
+            scope.retain(|name| !parked.iter().any(|(_, root, _)| root == name));
             let r = ctx.reserve_resume(scope, saved.clone(), v.clone());
             let frame_var = frame_variant(r);
             let marker = frame_marker(r);
@@ -564,10 +564,14 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
             });
             // What was parked is owned again, and taking it back is what leaves the store at the
             // mark, so the truncate below finds nothing of this call's to drop.
-            let take_backs = parked.iter().map(|(slot, root)| {
-                quote! {
-                    let #root = #ctxp.#slot.take_last().expect("parked by this frame");
-                }
+            // In reverse, so that each take drops only what this call pushed after it.
+            let take_backs = parked.iter().rev().map(|(held, root, at)| {
+                let mark = marks
+                    .iter()
+                    .find(|(slot, _)| *slot == held.slot())
+                    .map(|(_, mark)| mark.clone())
+                    .expect("a call that parks takes a mark for that store");
+                take_back(held, root, &mark, *at)
             });
             let take_backs = quote! { #(#take_backs)* };
             // Whatever this call lent the callee dies with the callee, i.e. now.
@@ -1085,14 +1089,17 @@ fn lower_loop(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStrea
                     ),
                 ));
             };
-            let slot = ctx.loop_store_slot(ctx.loops.borrow().len(), elem.clone());
-            Some((owner, slot, ctx.fresh(), elem))
+            let held = ctx.held_loop(ctx.loops.borrow().len(), elem.clone());
+            Some((owner, held, ctx.fresh(), elem))
         }
     };
     let store_forced: Vec<Ident> = store.iter().map(|(_, _, mark, _)| mark.clone()).collect();
     // Not an `Env::restores`: that also runs on `continue`, which still needs the collection.
     let release = match &store {
-        Some((_, slot, mark, _)) => quote! { #ctxp.#slot.truncate(#mark); },
+        Some((_, held, mark, _)) => {
+            let slot = held.slot();
+            quote! { #ctxp.#slot.truncate(#mark); }
+        }
         None => TokenStream::new(),
     };
 
@@ -1201,17 +1208,21 @@ fn lower_loop(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStrea
             // `Env::teardown` covers `?` and `return`, and `continue` deliberately does not
             // release. So every iteration that reads the iterator runs while the value is still
             // owned by the store. Gated behind `data_in_frame`.
-            Some((owner, slot, mark, elem)) => Ok(quote! {
+            Some((owner, held, mark, elem)) => {
+                let slot = held.slot();
+                let push = push_into(held, &root_expr(owner), &|_| None);
+                Ok(quote! {
                 {
                     let #mark = #ctxp.#slot.mark();
-                    let __ss_owned = #ctxp.#slot.push(#owner);
+                    let __ss_owned = #push;
                     // The iterator's type is named because its payload slot is only built
                     // inside the closure. The shape is enough; regionck settles the lifetime.
                     let mut #it: <&#elem as ::core::iter::IntoIterator>::IntoIter =
                         ::core::iter::IntoIterator::into_iter(unsafe { &*__ss_owned });
                     #step::Tail(#entry::#variant(#marker))
                 }
-            }),
+                })
+            }
             None => cps_expr(ctx, env, &f.expr, &|iter_val| {
                 Ok(quote! {
                     {
@@ -1225,11 +1236,71 @@ fn lower_loop(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStrea
     }
 }
 
+/// `x` as an expression, for a value that travels into the store by name.
+fn root_expr(name: &Ident) -> Expr {
+    parse_quote! { #name }
+}
+
+/// Push `value` into the store `held` names, handing back a pointer to what `project` reaches
+/// inside it — the value itself when `project` answers `None`.
+///
+/// The shared store holds an enum, so the projection runs inside `Pin::push_projected`, on a
+/// reference to the value just pushed. A store of a position's own holds the value bare, and there
+/// only the whole-value form arises: a place lend always parks a local, which is nameable.
+fn push_into(held: &Held, value: &Expr, project: &dyn Fn(&Ident) -> Option<Expr>) -> Expr {
+    let ctxp = ctx_param();
+    let slot = held.slot();
+    match held.variant() {
+        None => parse_quote! { #ctxp.#slot.push(#value) },
+        Some(v) => {
+            let (en, var) = (pinned_ty(), pinned_variant(v));
+            let owned = format_ident!("__ss_held");
+            let inner = match project(&owned) {
+                Some(place) => place,
+                None => parse_quote! { #owned },
+            };
+            parse_quote! {
+                #ctxp.#slot.push_projected(#en::#var(#value), |__ss_d| match __ss_d {
+                    #en::#var(#owned) => #inner,
+                    #[allow(unreachable_patterns)]
+                    _ => ::core::unreachable!("the store holds what this push put in it"),
+                })
+            }
+        }
+    }
+}
+
+/// Take a parked local back out of the store, as the resume arm does.
+///
+/// `mark` is where the store stood before this call pushed anything and `at` counts the pushes
+/// before this one, so `mark + at` is where the value sits: a later lend to the same call, or
+/// anything a nested call left, is above it and dies here rather than a moment later in the
+/// truncate. The variant is checked rather than assumed, so an unbalanced push is a panic instead
+/// of somebody else's value.
+fn take_back(held: &Held, root: &Ident, mark: &Ident, at: usize) -> TokenStream {
+    let ctxp = ctx_param();
+    let slot = held.slot();
+    let at = syn::Index::from(at);
+    let taken = quote! { #ctxp.#slot.take_at(#mark + #at).expect("parked by this frame") };
+    match held.variant() {
+        None => quote! { let #root = #taken; },
+        Some(v) => {
+            let (en, var) = (pinned_ty(), pinned_variant(v));
+            quote! {
+                let #root = match #taken {
+                    #en::#var(__ss_v) => __ss_v,
+                    #[allow(unreachable_patterns)]
+                    _ => ::core::unreachable!("the store hands back what this frame parked"),
+                };
+            }
+        }
+    }
+}
+
 /// A lent place, rewritten to read through the pointer the store handed back.
 ///
-/// `&def.body` parks `def`, so the pointer has to be taken from the parked copy: the root is
-/// replaced by a *reference* to it, giving `&(&*owned).body`. A reference rather than a bare
-/// dereference, so that reaching the place cannot autoref a raw pointer — `&(*owned)[0]` would.
+/// `&def.body` parks `def`, so the place has to be reached through the parked copy: the root is
+/// replaced by the reference the store's projection binds, giving `&owned.body`.
 fn project_from(place: &Expr, root: &Ident, owned: &Ident) -> Expr {
     struct V<'a> {
         root: &'a Ident,
@@ -1243,7 +1314,7 @@ fn project_from(place: &Expr, root: &Ident, owned: &Ident) -> Expr {
                 && p.path.is_ident(self.root)
             {
                 let owned = self.owned;
-                *e = parse_quote! { (&*#owned) };
+                *e = parse_quote! { #owned };
                 return;
             }
             syn::visit_mut::visit_expr_mut(self, e);
