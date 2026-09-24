@@ -17,7 +17,7 @@
 //!
 //! ```text
 //! let mut __ss_frames = __SsFrames::new();
-//! let mut __ss_input = __SsIn::Enter(__ss_entry);
+//! let mut __ss_input: __SsIn<_, __SsFrame<..>, _> = __SsIn::Enter(__ss_entry);
 //! '__ss_drive: loop {
 //!     match __ss_input { .. }
 //! }
@@ -32,7 +32,9 @@
 use proc_macro2::TokenStream;
 use quote::quote;
 
-use super::names::{done_local, drive_label, frame_local, frames_local, input_local, input_ty};
+use super::names::{
+    done_local, drive_label, frame_local, frames_local, frames_ty, input_local, input_ty,
+};
 
 /// This body is finished: hand the value to the frame below, or answer with it.
 ///
@@ -90,21 +92,28 @@ pub(super) fn tail(entry: TokenStream) -> TokenStream {
 ///
 /// `input_ann` names what the macro knows of the frame enum's payload types, for the same reason
 /// the closure's parameter annotation named them: a payload type only the arms construct is
-/// otherwise still an inference variable where the arms need it. The stack is derived from the
-/// state rather than annotated in turn, so that the frame type is said once — see [`In::frames`].
-///
-/// [`In::frames`]: yaspar_macros_defs::In::frames
+/// otherwise still an inference variable where the arms need it.
 pub(super) fn machine(
     entry: &TokenStream,
     input_ann: &TokenStream,
     arms: &[TokenStream],
 ) -> TokenStream {
-    let (frames, input, input_ty) = (frames_local(), input_local(), input_ty());
-    let drive = drive_label();
+    let (frames, frames_ty, frame) = (frames_local(), frames_ty(), frame_local());
+    let (input, input_ty, drive) = (input_local(), input_ty(), drive_label());
     quote! {
         {
+            let mut #frames = #frames_ty::new();
             let mut #input #input_ann = #input_ty::Enter(#entry);
-            let mut #frames = #input.frames();
+            // Never runs: nothing is parked yet. It is here to say that the stack holds the
+            // frames the state carries, which only a *construction* can say. The annotation
+            // above names the payload types the macro knows and writes `_` for the ones only
+            // inference can fill, so annotating the stack in turn would repeat those as
+            // unrelated holes — and then the frame a `push` describes and the frame a resume arm
+            // takes apart are two different types, leaving that arm's binding with nothing to be
+            // inferred from.
+            if let ::core::option::Option::Some(#frame) = #frames.pop() {
+                #input = #input_ty::Resume(#frame, ::core::unreachable!("nothing is parked yet"));
+            }
             #drive: loop {
                 match #input { #(#arms)* }
             }
