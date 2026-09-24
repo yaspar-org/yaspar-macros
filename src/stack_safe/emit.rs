@@ -19,6 +19,7 @@ use super::analyze::{
 };
 use super::context::{CtxEntry, is_context_slot, peel_type, slot_key, slot_type};
 use super::cps::cps_stmts;
+use super::driver;
 use super::loop_state::{solve_payloads, substitute};
 use super::names::*;
 use super::walk::{Ctx, Env, Member};
@@ -492,9 +493,9 @@ struct Pieces<'a> {
     ctx_inits: &'a [TokenStream],
     /// `: R`, naming the driver's result type.
     ret_ann: &'a TokenStream,
-    /// Names the entry type parameters the macro knows, outside the closure.
+    /// Names the entry type parameters the macro knows, before the body is checked.
     anchor: &'a TokenStream,
-    /// `: In<_, Frame<..>, _>`, naming the frame type parameters on the closure's parameter.
+    /// `: In<_, Frame<..>, _>`, naming the frame type parameters on the loop's state.
     input_ann: &'a TokenStream,
     /// The union of the members' return types, when they differ. It is named by the
     /// shared machine's own signature, so it cannot live inside it.
@@ -530,7 +531,7 @@ fn lifted(
     } = pieces;
     let members: Vec<Ident> = funcs.iter().map(|f| f.sig.ident.clone()).collect();
     let (seed_ty, machine, ctxp) = (seed_ty(&members), machine_fn(&members), ctx_param());
-    let (entry, drive, lt) = (entry_ty(), drive_fn(), seed_lifetime());
+    let (entry, lt) = (entry_ty(), seed_lifetime());
     // The shared machine answers with whatever the driver answers with, which is the
     // union when the members' return types differ.
     let ret = {
@@ -685,7 +686,6 @@ fn lifted(
         .map(|(w, _)| w)
         .collect();
 
-    let arms = arms.to_vec();
     let seed_decl = quote! {
         #ret_union_decl
 
@@ -696,6 +696,7 @@ fn lifted(
             #(#variants,)*
         }
     };
+    let loop_expr = driver::machine(&quote! { __ss_entry }, input_ann, arms);
     let machine_decl = quote! {
         #allows
         fn #machine #seed_generics (__ss_seed: #seed_ty #seed_args) #ret #where_clause {
@@ -706,11 +707,7 @@ fn lifted(
                 #(#dispatch)*
             };
             #anchor
-            let __ss_out #ret_ann = #drive(
-                &mut #ctxp,
-                __ss_entry,
-                |#ctxp, __ss_input #input_ann| match __ss_input { #(#arms)* },
-            );
+            let __ss_out #ret_ann = #loop_expr;
             __ss_out
         }
     };
@@ -970,7 +967,6 @@ fn member_arms(ctx: &Ctx, funcs: &[ItemFn]) -> syn::Result<(Vec<Item>, Vec<Token
     let mut declared: HashMap<String, &Ident> = HashMap::new();
     let mut items: Vec<Item> = Vec::new();
     let mut main_arms: Vec<TokenStream> = Vec::new();
-    let step = step_ty();
     let entry = entry_ty();
 
     let input = input_ty();
@@ -1021,8 +1017,7 @@ fn member_arms(ctx: &Ctx, funcs: &[ItemFn]) -> syn::Result<(Vec<Item>, Vec<Token
         };
         // Each member's own result enters the union under its own variant.
         let done = |v: TokenStream| -> syn::Result<TokenStream> {
-            let v = ctx.wrap_result(i, v);
-            Ok(quote! { #step::Done(#v) })
+            Ok(driver::done(ctx.wrap_result(i, v)))
         };
         ctx.current.set(i);
         let arm = cps_stmts(ctx, &env, &stmts, &done)?;
@@ -1111,7 +1106,7 @@ pub(super) fn expand_group(
     let ctx = analyse(&funcs, opts, assoc, self_ty)?;
 
     let (items, main_arms) = member_arms(&ctx, &funcs)?;
-    let (entry, input, drive) = (entry_ty(), input_ty(), drive_fn());
+    let (entry, input) = (entry_ty(), input_ty());
 
     // Resolve every payload — loop states and resume frames together, since they
     // reference each other's markers.
@@ -1235,15 +1230,13 @@ pub(super) fn expand_group(
         let entry_ty_name = entry_ty();
         quote! { let _: &#entry_ty_name<#(#entry_args),*> = &__ss_entry; }
     };
-    // A frame has no value outside the closure to hang an ascription on, so its slots are named
-    // on the closure's parameter instead. Without this a slot whose only use constrains nothing
-    // -- `{x:?}` asks for `Debug` and no more -- stays ambiguous.
+    // Nothing the body builds is in scope outside it to hang an ascription on, so a frame's slots
+    // are named on the two locals the loop holds instead. Without this a slot whose only use
+    // constrains nothing -- `{x:?}` asks for `Debug` and no more -- stays ambiguous.
     // A frame behind a `#[cfg]` is left to inference in this annotation: when the predicate holds
     // the code that builds it says what it is, and when it does not the arm standing in for it
     // matches `()`, which says so there. Naming it here could only name one of the two.
-    let input_ann = if resumes.is_empty() {
-        TokenStream::new()
-    } else {
+    let frame_named = {
         let frame_args: Vec<TokenStream> = frames
             .iter()
             .enumerate()
@@ -1255,9 +1248,16 @@ pub(super) fn expand_group(
                 }
             })
             .collect();
-        let input_ty_name = input_ty();
         let frame_ty_name = frame_ty();
-        quote! { : #input_ty_name<_, #frame_ty_name<#(#frame_args),*>, _> }
+        match frame_args.is_empty() {
+            // With no recursive call the enum has no parameters, and `Frame<>` is not a type.
+            true => quote! { #frame_ty_name },
+            false => quote! { #frame_ty_name<#(#frame_args),*> },
+        }
+    };
+    let input_ann = {
+        let input_ty_name = input_ty();
+        quote! { : #input_ty_name<_, #frame_named, _> }
     };
 
     let defs_imports = defs_imports();
@@ -1324,6 +1324,7 @@ pub(super) fn expand_group(
     // `liftable` for why a group sometimes has to be emitted this way, and the rejection above
     // for why no member of such a group can have come out of a body.
     let ret_ann = &ctx.ret_ann;
+    let loop_expr = driver::machine(&quote! { __ss_entry }, &input_ann, &arms);
     let mut out = Vec::with_capacity(funcs.len());
     for (i, func) in funcs.iter().enumerate() {
         let attrs = &func.attrs;
@@ -1392,11 +1393,8 @@ pub(super) fn expand_group(
                 }
 
                 let mut #ctxp = (#(#ctx_inits,)*);
-                let __ss_out #ret_ann = #drive(
-                    &mut #ctxp,
-                    #entry::#variant((#(#seed,)*)),
-                    |#ctxp, __ss_input #input_ann| match __ss_input { #(#arms)* },
-                );
+                let __ss_entry = #entry::#variant((#(#seed,)*));
+                let __ss_out #ret_ann = #loop_expr;
                 #take_out
             }
         });

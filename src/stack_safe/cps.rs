@@ -1,7 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The CPS transform itself: every recursive call becomes a `Call` step plus a frame — the
+//! The CPS transform itself: every recursive call becomes a `call` transition plus a frame — the
 //! defunctionalized continuation, one variant per call site carrying the locals live across
 //! it — and a loop whose body recurses becomes a new entry point.
 
@@ -15,6 +15,7 @@ use super::analyze::{
     Lend, borrows_a_built_value, contains_rec, pat_bindings, stmt_contains_rec, tokens_mention,
 };
 use super::context::{CtxArg, classify_ctx_arg};
+use super::driver;
 use super::leaf::{leaf_expr, leaf_stmt};
 use super::names::*;
 use super::try_shim;
@@ -445,7 +446,6 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
     // to keep. Only `#[cfg]` matters; see `reject_cfg`.
     reject_cfg(&expr_attrs(e), "an expression that recurses")?;
 
-    let step = step_ty();
     let entry = entry_ty();
     let frame = frame_ty();
 
@@ -594,12 +594,10 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
             // Without a swap the arguments stay inline, so the common path gains
             // no bindings at all.
             let call = if swaps.is_empty() {
-                quote! {
-                    #step::Call(
-                        #entry::#callee_variant((#(#vals,)*)),
-                        #frame::#frame_var(#marker),
-                    )
-                }
+                driver::call(
+                    quote! { #entry::#callee_variant((#(#vals,)*)) },
+                    quote! { #frame::#frame_var(#marker) },
+                )
             } else {
                 // With a swap, every argument is bound *in source order* first and
                 // the derived pointers are taken last. Taking a pointer earlier is
@@ -687,13 +685,14 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
                     }
                 }
 
+                let call = driver::call(
+                    quote! { #entry::#callee_variant((#(#held,)*)) },
+                    quote! { #frame::#frame_var(#marker) },
+                );
                 quote! {
                     #(#pre)*
                     #(#deferred)*
-                    #step::Call(
-                        #entry::#callee_variant((#(#held,)*)),
-                        #frame::#frame_var(#marker),
-                    )
+                    #call
                 }
             };
             Ok(quote! { { #call } })
@@ -798,7 +797,7 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
             };
             cps_expr(ctx, env, &inner, &|v| {
                 let v = env.wrapped(v);
-                Ok(quote! { return #step::Done(#v) })
+                Ok(driver::done(v))
             })
         }
 
@@ -810,12 +809,11 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
             let body = ctx.with_result(ok.clone(), || k(quote! { #ok }))?;
             let branch = try_shim::branch(v.clone());
             let exit = env.wrapped(try_shim::from_residual(quote! { __ss_res }));
+            let exit = driver::done(exit);
             Ok(quote! {
                 match #branch {
                     ::core::result::Result::Ok(#ok) => #body,
-                    ::core::result::Result::Err(__ss_res) => {
-                        return #step::Done(#exit)
-                    }
+                    ::core::result::Result::Err(__ss_res) => { #exit }
                 }
             })
         }),
@@ -837,7 +835,7 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
                 Some(lp) => {
                     let v = entry_variant(lp.variant);
                     let marker = state_marker(lp.idx);
-                    Ok(quote! { #step::Tail(#entry::#v(#marker)) })
+                    Ok(driver::tail(quote! { #entry::#v(#marker) }))
                 }
                 None => Err(syn::Error::new(c.span(), "`continue` outside of a loop")),
             }
@@ -1046,11 +1044,10 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
 
 /// Lower a loop whose body recurses into a fresh entry point.
 ///
-/// One iteration becomes `Tail(En(state))`: re-enter the body at the loop's entry
-/// point without pushing a frame, so iterating costs no stack. The loop's state —
+/// One iteration becomes a `tail` transition to `En(state)`: re-enter the body at the loop's
+/// entry point without pushing a frame, so iterating costs no stack. The loop's state —
 /// iterator plus the locals live across it — travels in the entry payload.
 fn lower_loop(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream> {
-    let step = step_ty();
     let entry = entry_ty();
     let ctxp = ctx_param();
 
@@ -1141,7 +1138,7 @@ fn lower_loop(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStrea
         .in_loop(&lp)
         .bind(iter_ident.clone())
         .bind(store_bindings);
-    let again = quote! { #step::Tail(#entry::#variant(#marker)) };
+    let again = driver::tail(quote! { #entry::#variant(#marker) });
     // The body's value is discarded, but it must still be *evaluated*: a branch
     // with no recursive call arrives here as a whole expression rather than as
     // statements already emitted, so dropping it would drop its side effects.
@@ -1215,11 +1212,11 @@ fn lower_loop(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStrea
                 {
                     let #mark = #ctxp.#slot.mark();
                     let __ss_owned = #push;
-                    // The iterator's type is named because its payload slot is only built
-                    // inside the closure. The shape is enough; regionck settles the lifetime.
+                    // The iterator's type is named because nothing outside the body builds its
+                    // payload slot. The shape is enough; regionck settles the lifetime.
                     let mut #it: <&#elem as ::core::iter::IntoIterator>::IntoIter =
                         ::core::iter::IntoIterator::into_iter(unsafe { &*__ss_owned });
-                    #step::Tail(#entry::#variant(#marker))
+                    #again
                 }
                 })
             }
@@ -1227,12 +1224,12 @@ fn lower_loop(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStrea
                 Ok(quote! {
                     {
                         let mut #it = ::core::iter::IntoIterator::into_iter(#iter_val);
-                        #step::Tail(#entry::#variant(#marker))
+                        #again
                     }
                 })
             }),
         },
-        _ => Ok(quote! { #step::Tail(#entry::#variant(#marker)) }),
+        _ => Ok(again.clone()),
     }
 }
 

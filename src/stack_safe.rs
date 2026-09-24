@@ -86,6 +86,7 @@ use syn::spanned::Spanned;
 mod analyze;
 mod context;
 mod cps;
+mod driver;
 mod emit;
 mod group;
 mod leaf;
