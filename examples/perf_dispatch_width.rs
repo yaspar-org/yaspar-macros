@@ -39,8 +39,8 @@
 //!
 //! This is a guard, not a target, and the absolute figures move with the machine and the
 //! toolchain. What a regression looks like is a row drifting back above 1x, or the ladder
-//! below losing its ordering. See `PERFORMANCE.md` for what each rung is worth and for the
-//! discipline these numbers demand — in particular, that only figures from one run compare.
+//! below losing its ordering. Only figures from one run compare: the same unmodified code has
+//! measured a 2x spread across runs, so a change is only real if it is real inside one table.
 
 use std::hint::black_box;
 use std::sync::Arc;

@@ -150,7 +150,7 @@ or in a frame payload, e.g. `v0`. This is precisely why the recursion can live i
 
 Each arm *answers* with the next state rather than assigning it and jumping back to the top. That is not cosmetic: the
 state is as wide as a frame plus a return value, and one writer is what keeps it in registers instead of being copied
-between stack slots. It is worth about 1.7x — see `PERFORMANCE.md`.
+between stack slots. 
 
 We can read the arms against the original. `None => 0` hands `0` to the frame below, or answers with it if there is none;
 `head + sum(tail)` becomes two arms: the first parks `head` as `v0` and enters the tail, and the `Resume` arm adds `v0`

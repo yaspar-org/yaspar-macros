@@ -36,7 +36,7 @@ pub(super) fn defs_imports(body: &TokenStream) -> TokenStream {
     quote! {
         use ::yaspar_macros_defs::{
             #(#used)*
-            Frames as #frames, In as #input,
+            Frames as #frames, InSplit as #input,
         };
     }
 }

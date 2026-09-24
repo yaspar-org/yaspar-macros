@@ -27,7 +27,6 @@ Those are generated. The other half is the same for every function, so it is wri
 
 A rewritten body imports the ones it turns out to need at its top, under `__ss` names, so an expansion reads the same as
 it did when they were emitted into it — a function with no `?` names no `Try`, and one that lends no value names no
-`Pin`. The loop itself is written into the rewritten function rather than being called here; see `PERFORMANCE.md` for
-what that is worth and why.
+`Pin`.
 
 See the [`yaspar-macros` README](../README.md) for what the transformation does, what it preserves, and what it rejects.

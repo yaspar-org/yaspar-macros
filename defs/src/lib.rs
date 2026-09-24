@@ -37,6 +37,20 @@ pub enum In<A, F, R> {
     Resume(F, R),
 }
 
+/// The loop's state with the frame left *on the stack* rather than carried.
+///
+/// `In` carries the frame the pop produced, so the state is as wide as a frame plus a return
+/// value and some of its bytes come out of the `Vec`'s heap buffer — which is what stops SROA
+/// promoting it. Here the resume transition names only the answer, and the resume arm does the
+/// pop itself; the state is then `max(entry, answer)` wide and every byte of it comes from a
+/// value the loop computed.
+pub enum InSplit<A, R> {
+    /// Run the body from an entry point.
+    Enter(A),
+    /// A child answered with this; the top frame of the stack is whose answer it is.
+    Resume(R),
+}
+
 /// Where a rewritten body parks its frames: the heap, instead of the native stack.
 ///
 /// A plain `Vec`, named because the expansion has to name it and cannot say `Vec` — the crate

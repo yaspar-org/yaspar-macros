@@ -495,8 +495,11 @@ struct Pieces<'a> {
     ret_ann: &'a TokenStream,
     /// Names the entry type parameters the macro knows, before the body is checked.
     anchor: &'a TokenStream,
-    /// `: In<_, Frame<..>, _>`, naming the frame type parameters on the loop's state.
+    /// `: InSplit<_, _>`, the loop's state: an entry or an answer, with the frame left on the
+    /// stack.
     input_ann: &'a TokenStream,
+    /// `: Frames<Frame<..>>`, naming the frame type parameters on the one place that holds one.
+    frames_ann: &'a TokenStream,
     /// The union of the members' return types, when they differ. It is named by the
     /// shared machine's own signature, so it cannot live inside it.
     ret_union_decl: &'a TokenStream,
@@ -526,6 +529,7 @@ fn lifted(
         ctx_inits,
         anchor,
         input_ann,
+        frames_ann,
         ret_ann,
         ret_union_decl,
     } = pieces;
@@ -696,7 +700,7 @@ fn lifted(
             #(#variants,)*
         }
     };
-    let loop_expr = driver::machine(&quote! { __ss_entry }, input_ann, arms);
+    let loop_expr = driver::machine(&quote! { __ss_entry }, input_ann, frames_ann, arms);
     let machine_decl = quote! {
         #allows
         fn #machine #seed_generics (__ss_seed: #seed_ty #seed_args) #ret #where_clause {
@@ -1288,23 +1292,25 @@ pub(super) fn expand_group(
             });
             continue;
         }
+        // Without the shared check the value used to be a pattern in the state, matched straight
+        // out of `Resume`. The state no longer has a slot for it, so it comes from the local the
+        // one `Resume` arm binds — see `driver::resume_direct`.
+        let resumed = value_local();
         let stand_in = stand_in.map(|ungated| {
-            quote! { #ungated #input::Resume(#frame::#variant(()), _) => unreachable!("gated out"), }
+            quote! { #ungated #frame::#variant(()) => unreachable!("gated out"), }
         });
-        arms.push(quote! {
+        frame_arms.push(quote! {
             #gate
-            #input::Resume(#frame::#variant((#(mut #payload,)*)), #value) => { #code },
+            #frame::#variant((#(mut #payload,)*)) => { let #value = #resumed; #code },
             #stand_in
         });
     }
-    if hoist {
-        arms.push(driver::resume(&frame_arms, &frame_drops));
-    }
-    // With no recursive call there is no frame, so the enum is uninhabited and the
-    // arm is proved unreachable rather than written.
-    if resumes.is_empty() {
-        arms.push(quote! { #input::Resume(__ss_never, _) => match __ss_never {}, });
-    }
+    // One `Resume` arm either way, since the pop happens inside it: with no recursive call the
+    // frame enum is uninhabited, so its dispatch has no arms and is proved unreachable there.
+    arms.push(match hoist {
+        true => driver::resume(&frame_arms, &frame_drops),
+        false => driver::resume_direct(&frame_arms),
+    });
     let arms: Vec<TokenStream> = arms.into_iter().map(|ts| substitute(ts, &subst)).collect();
 
     let total_entries = loop_base + loops.len();
@@ -1354,9 +1360,15 @@ pub(super) fn expand_group(
             false => quote! { #frame_ty_name<#(#frame_args),*> },
         }
     };
+    // The state names an entry and an answer; the frame is not in it any more, so the frame's
+    // slot types are named on the stack instead.
     let input_ann = {
         let input_ty_name = input_ty();
-        quote! { : #input_ty_name<_, #frame_named, _> }
+        quote! { : #input_ty_name<_, _> }
+    };
+    let frames_ann = {
+        let frames_ty_name = frames_ty();
+        quote! { : #frames_ty_name<#frame_named> }
     };
 
     // Over everything the expansion writes that could name one of the borrowed items: the arms,
@@ -1418,6 +1430,7 @@ pub(super) fn expand_group(
             ctx_inits: &ctx_inits,
             anchor: &anchor,
             input_ann: &input_ann,
+            frames_ann: &frames_ann,
             ret_ann: &ctx.ret_ann,
             ret_union_decl: &ret_union_decl,
         };
@@ -1428,7 +1441,7 @@ pub(super) fn expand_group(
     // `liftable` for why a group sometimes has to be emitted this way, and the rejection above
     // for why no member of such a group can have come out of a body.
     let ret_ann = &ctx.ret_ann;
-    let loop_expr = driver::machine(&quote! { __ss_entry }, &input_ann, &arms);
+    let loop_expr = driver::machine(&quote! { __ss_entry }, &input_ann, &frames_ann, &arms);
     let mut out = Vec::with_capacity(funcs.len());
     for (i, func) in funcs.iter().enumerate() {
         let attrs = &func.attrs;
