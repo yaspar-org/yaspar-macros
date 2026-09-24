@@ -1401,9 +1401,12 @@ pub(super) fn expand_group(
             unused_parens,
             unused_assignments,
             unreachable_code,
-            // `break` inside a lowered loop becomes `return Done(..)`, which can land in
-            // a sub-expression position.
-            clippy::diverging_sub_expression
+            // `break` inside a lowered loop becomes a transition, which can land in a
+            // sub-expression position.
+            clippy::diverging_sub_expression,
+            // A frame whose payload needs no drop is still named on the path that drops one;
+            // which frames those are is not something the transform can know.
+            clippy::drop_non_drop
         )]
     };
 
@@ -1473,9 +1476,12 @@ pub(super) fn expand_group(
                 unused_parens,
                 unused_assignments,
                 unreachable_code,
-                // `break` inside a lowered loop becomes `return Done(..)`, which can
-                // land in a sub-expression position.
-                clippy::diverging_sub_expression
+                // `break` inside a lowered loop becomes a transition, which can land in
+                // a sub-expression position.
+                clippy::diverging_sub_expression,
+                // A frame whose payload needs no drop is still named on the path that
+                // drops one; which frames those are is not something the transform can know.
+                clippy::drop_non_drop
             )]
             #vis #sig {
                 #defs_imports

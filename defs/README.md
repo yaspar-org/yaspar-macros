@@ -19,12 +19,15 @@ Those are generated. The other half is the same for every function, so it is wri
 
 | item                  | what it is                                                                                                     |
 |-----------------------|----------------------------------------------------------------------------------------------------------------|
-| `Step`, `In`          | the protocol between a rewritten body and its driver                                                           |
-| `drive`               | the loop that keeps the recursion in a `Vec` instead of on the native stack                                    |
+| `In`                  | the loop's state: enter an entry point, or resume a frame with the value a callee produced                      |
+| `Frames`              | the stack it parks frames on instead of using the native one                                                   |
 | `Pin`                 | the store for values a call site lends its callee, under `#[stack_safe(data_in_frame)]`                        |
 | `Try`, `FromResidual` | a stand-in for the unstable traits of the same names, so that `?` works on a `Result` and on an `Option` alike |
+| `Step`, `drive`       | the same machine as a loop the body is handed to, which is what an expansion used to be; kept as the reference its benchmarks measure against |
 
-A rewritten body imports all of them at its top, under `__ss` names, so an expansion reads the same as it did when they
-were emitted into it.
+A rewritten body imports the ones it turns out to need at its top, under `__ss` names, so an expansion reads the same as
+it did when they were emitted into it — a function with no `?` names no `Try`, and one that lends no value names no
+`Pin`. The loop itself is written into the rewritten function rather than being called here; see `PERFORMANCE.md` for
+what that is worth and why.
 
 See the [`yaspar-macros` README](../README.md) for what the transformation does, what it preserves, and what it rejects.
