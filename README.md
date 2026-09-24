@@ -32,12 +32,10 @@ Caveats:
 1. Trait impls cannot get involved in recursion.
 2. Certain recursive styles require special unsafe options, which are documented below.
 
-### Recursion: Good and Bad
+### The problem
 
-Recursion is the most natural way to write many things — tree walks, backtracking search — and it states a program's
-**denotation**, which makes it easier to prove correct than the equivalent loop.
-
-For example, the following function sums a slice of `u64`:
+Recursion is the most natural way to write a tree walk or a backtracking search, and it states a program's *denotation*,
+which makes it easier to prove correct than the equivalent loop. What it cannot do is survive its input:
 
 ```rust
 fn sum(xs: &[u64]) -> u64 {
@@ -48,175 +46,99 @@ fn sum(xs: &[u64]) -> u64 {
 }
 ```
 
-It is standard, and it is correct — until we run it on a long slice. Recursion depth is bounded by the process stack:
-each call takes a frame, and exceeding the limit gets us a `SIGSEGV`.
+Every call takes a stack frame, so a long enough slice exhausts the process stack:
 
-```
-thread 'main' (900263) has overflowed its stack
+```text
+thread 'main' has overflowed its stack
 fatal runtime error: stack overflow, aborting
 ```
 
-Raising the OS limit is no fix: some input is always big enough to exhaust it. And a stack overflow is fatal — there is
-no recovering from it, so the process aborts. The program is correct; the runtime is what stops us from applying it to
-any input.
+Raising the limit is no fix — some input is always bigger — and an overflow cannot be caught, so the process dies. The
+program is correct; the runtime is what refuses to run it. Rewriting each such function as a loop by hand works, and is
+tedious enough that nobody does it consistently.
 
-### Manual Transformation of Recursion to Iteration
+### What the macro does
 
-One answer is to rewrite `sum` as a loop by hand:
+A recursive call cuts a body in two: the work before it, and the work after — the *continuation*. `#[stack_safe]` makes
+those halves arms of one `match`, and the locals a parked half still needs become a value in a `Vec`. Running a sequence
+of arms grows no stack, so depth is bounded by memory instead of by the stack. Turning continuations into enum variants
+this way is called *defunctionalization*; it dates to the 70s.
 
-```rust
-fn sum_iter(xs: &[u64]) -> u64 {
-    let mut acc = 0;
-    let mut rest = xs;
-    while let Some((head, tail)) = rest.split_first() {
-        acc += head;
-        rest = tail;
-    }
-    acc
-}
-```
-
-But rewriting every recursive function by hand is unnatural at best and tedious always. Better to automate the
-transformation, and write recursion without thinking about the stack at all.
-
-### Generalization: Continuation Passing Style (CPS) Transformation
-
-A recursive call cuts a body in two: work to do before the call, and work to do after it. Those alternate until the
-recursion finishes, and the "work after" — abstracted — is a **continuation**. Manipulating continuations as values is
-continuation passing style (CPS).
-
-Executing a sequence of continuations in order grows no stack, which is what makes CPS a route to stack-safe recursion at
-competitive speed. So we cut the body into chunks, make each chunk a variant of an enum, carry in that variant the state
-the stack used to hold, and let a transition table say which chunk follows which. That source transformation is what
-`#[stack_safe]` does.
-
-The technique of defining continuations as an enum is called **defunctionalization**, which dates back to the 70s. Each
-call site becomes a variant of a frame enum carrying the locals that are live across that call, and the code after the
-call becomes a `match` arm. The frame stack is then a `Vec` of plain values.
-
-By adding `#[stack_safe]` to the `sum` function, the program is transformed as follows. Names are shortened here, and
-the context argument that carries `&mut` parameters is omitted, since `sum` has none:
+`sum` above becomes roughly the following. There is one entry arm per function and one resume arm per call site, and the
+`Vec` holds what the stack used to:
 
 ```rust
-// The loop's state: enter the body at an entry point, or resume a parked frame with the value a
-// callee produced. Each turn of the loop answers with the next state.
-enum In<A, F, R> { Enter(A), Resume(F, R) }
-
 fn sum(xs: &[u64]) -> u64 {
-    // One variant per entry point; here, only `sum` itself.
-    enum Entry<A0> { E0(A0) }
-    // One variant per recursive call site, carrying the locals live across it.
-    enum Frame<F0> { R0(F0) }
+    enum Entry<A0> { E0(A0) }          // one variant per entry point
+    enum Frame<F0> { R0(F0) }          // one per call site, carrying the locals live across it
+    enum In<A, R> { Enter(A), Resume(R) }
 
-    let out: u64 = {
-        let mut frames: Vec<Frame<_>> = Vec::new();    // the recursion, on the heap
-        let mut input = In::Enter(Entry::E0((xs,)));
-        'drive: loop {
-            input = match input {
-                // The body, entered with the arguments of a call.
-                In::Enter(Entry::E0((xs,))) => match xs.split_first() {
-                    None => match frames.pop() {
-                        None => break 'drive 0,        // the outermost call has finished
-                        Some(frame) => In::Resume(frame, 0),
-                    },
-                    Some((head, tail)) => {
-                        let v0 = head;                 // the left operand of `+`
-                        frames.push(Frame::R0((v0,))); // park what is live across the call
-                        In::Enter(Entry::E0((tail,)))  // and enter it
-                    }
-                },
-                // The rest of the body, resumed with the result of that call.
-                In::Resume(Frame::R0((v0,)), v1) => {
-                    let out = v0 + v1;
-                    match frames.pop() {
-                        None => break 'drive out,
-                        Some(frame) => In::Resume(frame, out),
-                    }
+    let mut frames = Vec::new();
+    let mut state = In::Enter(Entry::E0((xs,)));
+    let out: u64 = 'drive: loop {
+        state = match state {
+            // the work *before* the call
+            In::Enter(Entry::E0((xs,))) => match xs.split_first() {
+                None => In::Resume(0),                    // nothing to recurse into: hand 0 down
+                Some((head, tail)) => {
+                    frames.push(Frame::R0((head,)));      // `head` is live across the call
+                    In::Enter(Entry::E0((tail,)))         // and descend
                 }
-            };
-        }
+            },
+            // the work *after* it, with the value the call produced
+            In::Resume(v) => match frames.pop() {
+                None => break 'drive v,                   // the outermost call has finished
+                Some(Frame::R0((head,))) => In::Resume(head + v),
+            },
+        };
     };
     out
 }
 ```
 
-Everything lives inside the original `fn sum`, so neither its signature nor its call sites change. `In` is shown inline
-here to keep the example readable; a real expansion imports it from `yaspar-macros-defs`, since it is the same for every
-function. Only the entry and frame enums are nested items, i.e. the halves that vary per function. `out` is the value the
-loop breaks with, i.e. the value that `sum` returns.
+Each arm *answers* with the next state, and that is the whole machine: no call, no closure, nothing on the stack. It all
+lives inside the original `fn sum`, so neither its signature nor its call sites change. The enums are generic because a
+proc macro cannot write a frame's payload types down — only inference knows what is live across a call.
 
-Note that no arm reads a local of the function. Every value an arm needs arrives either in an entry payload, e.g. `xs`,
-or in a frame payload, e.g. `v0`. This is precisely why the recursion can live in a `Vec` on the heap.
+### Performance
 
-Each arm *answers* with the next state rather than assigning it and jumping back to the top. That is not cosmetic: the
-state is as wide as a frame plus a return value, and one writer is what keeps it in registers instead of being copied
-between stack slots. 
+Two examples measure it, and they disagree — which is the useful part.
 
-We can read the arms against the original. `None => 0` hands `0` to the frame below, or answers with it if there is none;
-`head + sum(tail)` becomes two arms: the first parks `head` as `v0` and enters the tail, and the `Resume` arm adds `v0`
-to the result once it arrives. `head` travels in the frame because it is the only local live across the call, i.e.
-exactly what a stack frame would have held. A loop in the body would add a third kind of transition — re-entering at the
-loop's own entry point without parking anything — which `sum` has no need of.
+`cargo run --release --example perf_contrast` sums a balanced 524 287-node tree, so every call returns within about 19
+levels and ordinary recursion is never near the stack limit. `manual` is a hand-written worklist over the same tree:
 
-Note also that `head` is hoisted into `v0` before the frame is parked rather than read after it. Rust evaluates operands
-left to right, and the cut falls at the recursive call: whatever is left of the cut runs before the call, with its value
-travelling in the frame, and whatever is right of it lands in the `Resume` arm and runs once the result arrives.
-
-For example, `f(a(), sum(n - 1), b())` is transformed into two arms:
-
-```rust
-In::Enter(Entry::E0((n,))) => {
-    let v0 = a();                                 // left of the cut, so it runs before the call
-    frames.push(Frame::R0((v0,)));
-    In::Enter(Entry::E0((n - 1,)))
-}
-// right of the cut, so it runs once the result arrives
-In::Resume(Frame::R0((v0,)), v1) => done(f(v0, v1, b())),
-```
-
-`done(v)` is shorthand, here and below, for the transition spelled out in full above: pop a frame and resume it with `v`,
-or break the loop with `v` if there is none.
-
-`a()` cannot be left in the `Resume` arm, where it would run after the recursion, and it cannot be evaluated twice
-either, since it may have side effects — so its value is what travels. If `a` and `b` print their names, `sum(2)` prints
-`a a b b` under both programs.
-
-`sum` is minimal, in that it has one entry point, one call site, and one local live across that call. Larger bodies
-scale in three directions:
-
-* **Call sites**: each one gets its own frame variant. A body with two recursive calls gets `R0` and `R1`, where the arm
-  of `R0` holds the code between the two calls and issues the second one, and the arm of `R1` holds the code after both.
-  Every frame carries only what its own arm still needs, e.g. `R0` carries `n` when the second call's argument mentions
-  it, while `R1` no longer does.
-* **Loops**: each loop gets its own entry variant, and one iteration is a `Tail` step, i.e. a re-entry that pushes no
-  frame. Thus an iteration costs no stack at all. The iterator of a `for` loop travels in the payload of that entry,
-  together with every local that the next iteration still needs.
-* **Payloads**: their types are never written down. The macro sees tokens rather than types, so the enums are generic
-  and inference fills them in from the construction sites. What the macro must compute for itself is which locals are
-  live at each point; had we kept continuations as closures, capture inference would have done that for us.
-
-### Performance Comparison (with Release Flag)
-
-`cargo run --release --example perf_contrast` sums a 524 287-node tree in three ways, where `manual` is a hand-written
-worklist over the same tree:
-
-```
+```text
 524287 nodes, so that many calls
 
-naive            1.47 ms      2.8 ns/call           0 allocs (0.00/call)            0 bytes   sum 262144
-manual           2.08 ms      4.0 ns/call           5 allocs (0.00/call)          488 bytes   sum 262144
-stack_safe       1.43 ms      2.7 ns/call           4 allocs (0.00/call)         1440 bytes   sum 262144
+naive            0.67 ms      1.3 ns/call           0 allocs            0 bytes
+manual           1.26 ms      2.4 ns/call           5 allocs          488 bytes
+stack_safe       1.23 ms      2.4 ns/call           1 alloc          1536 bytes
+
+leaving the stack at all costs 1.9x (manual / naive)
+the macro's encoding costs a further 1.0x (stack_safe / manual)
+overhead per call: 1 ns
 ```
 
-The transformation is highly optimized and performs virtually identical to the native recursive implementation, and
-better than manually transformed version. It allocates on the heap with a minimal amount and has an amortized linear
-growth to the call depth. In practice, it is always recommended to tag recursive functions with this macro if no option
-is needed.
+Where the stack is not a constraint, the stack *is* the fastest place to be: a native frame costs nothing to push and the
+recursion stays in cache. Leaving it costs about 1 ns per call — and that cost is the leaving, not the macro. The
+transform lands level with the hand-written worklist, which is the comparison that isolates its encoding. One allocation
+covers the whole descent, since frames are allocated 64 at a time.
 
-### Usage and Examples
+Deep recursion reverses it. `cargo run --release --example perf_dispatch_width` walks a 1024-deep chain, where a native
+frame per level starts to hurt:
 
-The simplest application is to annotate a function with `#[stack_safe]`. Its signature does not change, so callers are
-unaffected:
+```text
+depth 1024, native 8048 ns
+   3 call sites:     3820 ns   0.47x native
+   9 call sites:     3706 ns   0.46x native
+```
+
+So the transform is roughly twice as fast as the recursion it replaces once the depth is real, and about 1 ns/call slower
+when it is not. Tag recursive functions by default: the case where it costs you is the case where you did not need it.
+
+### Using it
+
+Annotate the function. Its signature does not change:
 
 ```rust
 use yaspar_macros::stack_safe;
@@ -230,15 +152,11 @@ fn sum(xs: &[u64]) -> u64 {
 }
 
 let xs: Vec<u64> = (1..=1_000_000).collect();
-assert_eq!(sum(&xs), 500_000_500_000);      // 1 000 000 deep, on any stack size
+assert_eq!(sum(&xs), 500_000_500_000);      // a million deep, on any stack size
 ```
 
-#### Mutually recursive functions
-
-Functions can also recurse through each other, e.g. `is_even` calls `is_odd` and `is_odd` calls `is_even`. The
-transformation has to see every body of such a cycle at once, since turning `is_odd(..)` inside `is_even` into a step of
-the same state machine requires the body of `is_odd`. So we put the macro on the scope that holds them both, a module or
-an impl block, and it works out the cycles by itself:
+**Mutual recursion.** Rewriting `is_even` needs the body of `is_odd`, so put the attribute on the scope that holds both —
+a module or an impl block — and it finds the cycles itself:
 
 ```rust
 #[stack_safe]
@@ -249,125 +167,17 @@ mod parity {
 }
 
 assert!(parity::is_even(1_000_000));
-assert!(is_even(1_000_000));                // also available unqualified
+assert!(is_even(1_000_000));                 // also available unqualified
 ```
 
-Every member of a cycle receives its own entry variant, and all of them are compiled to one and the same body:
+The members of a cycle share one machine and differ only in which entry it is seeded at. Anything the scan finds no cycle
+for — `describe` here — is emitted exactly as written. Nested modules, impl blocks and functions declared *inside a body*
+are all scanned, to any depth, so one attribute covers a module tree. Members may return different types; the macro joins
+them into an enum and each wrapper unwraps its own again. Methods join a cycle through `self.g(..)` or `Self::g(self, ..)`.
 
-```rust
-enum Entry<A0, A1> { E0(A0), E1(A1) }         // `E0` is `is_even`, and `E1` is `is_odd`
-
-In::Enter(Entry::E0((n,))) => if n == 0 { done(true) }
-else { frames.push(Frame::R0(())); In::Enter(Entry::E1((n - 1,))) },
-In::Enter(Entry::E1((n,))) => if n == 0 { done(false) }
-else { frames.push(Frame::R1(())); In::Enter(Entry::E0((n - 1,))) },
-```
-
-A call from one member into another is therefore just another turn of the loop, and the two functions differ only in
-which entry the loop is seeded with, `E0` for `is_even` and `E1` for `is_odd`. Note that such a call still parks a
-frame, i.e. it is not turned into a tail call, but that frame lives in the `Vec` instead of on the native stack, which
-is exactly the point.
-
-To find the cycles, the macro adds one edge per syntactic call among the functions in scope, i.e. the container's own
-and everything their bodies declare, and takes the transitive closure. Two functions belong to the same group if each of
-them reaches the other, and a function is recursive at all if it reaches itself. Thus `describe` above is emitted
-exactly as written, since it calls `is_even` without ever being called back.
-
-Nested modules and impl blocks are scanned to any depth and are grouped separately, so one macro covers a whole module
-tree. Methods join a cycle through `self.g(..)` or `Self::g(self, ..)`. Since the members of a group share one body,
-they must also agree on their `&mut` parameters, and a mismatch is a compile error that names the pair.
-
-Mutually recursive functions can have different return types:
-
-```rust
-#[stack_safe]
-mod m {
-    pub fn is_even(n: u64) -> bool {
-        if n == 0 { true } else { count(n - 1) % 2 == 1 }
-    }
-    pub fn count(n: u64) -> u64 {
-        if n == 0 { 0 } else if is_even(n - 1) { 1 } else { 2 }
-    }
-}
-```
-
-The driver has one result, so the macro joins the members' return types into an enum of its own, one variant per member.
-Each member wraps its answer on the way out and its wrapper unwraps it again, so every signature survives.
-
-When a return type is an opaque type, i.e. `impl Trait`, the transformation only works if a function is self-recursive.
-In a mutually recursive case, we are not able to fit opaque types in enums, so a group of such mutual recursions is
-rejected. The fix is to write down explicit return types or use `Box`.
-
-A parameter type is under less pressure than a return type. The seed enum carries the members' own generic parameters,
-i.e. the union of them, keyed by name. Thus a generic cycle, one naming a lifetime, and one passing `&dyn Trait` all
-share a single machine. We compare bounds as sets, and a where-clause counts as bounds, so `T: Copy + Into<u64>`, `T:
-Into<u64> + Copy` and `T` with `where T: Into<u64> + Copy` are one requirement. Where the parameters cannot be shared,
-the group is simply not lifted: each member gets its own copy of the machine instead, and nothing is rejected. This
-happens when two members ask genuinely different things of the same name, or when a parameter is used in no parameter
-type at all. An `impl Trait` parameter is the exception. Nothing then pins the payload's type, and the result is an
-`E0282` on the body rather than an error from the macro. Writing the parameter as a named generic with a where-clause
-both names the type and keeps the group sharing one machine.
-
-Finally, a grouped module re-exports each of its top-level functions beside itself:
-
-```rust
-mod parity {
-    pub fn is_even(n: u64) -> bool { /* the state machine */ }
-}
-use parity::is_even;
-```
-
-Thus `is_even(..)` can be called unqualified at the scope of the macro, and not only as `parity::is_even(..)`. A `use`is
-chosen over a forwarding definition because it never has to reproduce a signature, so a generic, a where-clause, or a
-type that only the module can name all come along for free. Visibility is re-expressed rather than copied, e.g. a
-`pub(super) fn` becomes private one level up, so that no name out-reaches its module, and a function the module keeps
-private is not re-exported at all.
-
-#### Functions declared in a body
-
-A body is a scope of item definitions like any other, so the scan does not stop at the annotated function. A `fn`
-declared inside it is scanned as well, to any depth of nesting. Everything under one `#[stack_safe]` becomes a single
-graph: the annotated function, or the container's functions, plus whatever their bodies declare. We then read the cycles
-off that one graph, so a cycle is found wherever it runs. It may sit within one body, run from a body into the function
-hosting it, or leave a body for a different function of the same container. Below, `step` recurses through `depth` and
-`depth` through `step`, so we flatten the two together:
-
-```rust
-#[stack_safe]
-fn depth(n: u64) -> u64 {
-    fn step(n: u64) -> u64 { if n == 0 { 0 } else { 1 + depth(n - 1) } }
-    if n == 0 { 0 } else { 1 + step(n - 1) }
-}
-
-assert_eq!(depth(1_000_000), 1_000_000);
-```
-
-Nested functions in a cycle among themselves get a driver of their own, and one that recurses alone gets one as well. A
-nested function in no cycle at all is emitted as written, so a body can hold a mix, just as a module can.
-
-A cycle's driver is written where the outermost of its members was declared. A nested `fn` prevents the cycle driver
-from being generic. A driver does carry its members' generic parameters, which is how a generic cycle shares one. But a
-member declared in a body can never name them, since a nested `fn` sees none of the generics of the one hosting it. It
-could only call the cycle at some concrete type, which is not what the driver is. We therefore reject such a cycle, and
-likewise one naming a lifetime of its own, one whose members take an `impl Trait` parameter, and one naming a `Self` the
-driver's signature cannot spell. A trait object is fine, since `&dyn Trait` is a type the driver can name. Moving the
-function out to the enclosing scope removes the restriction, as it is then a member like any other.
-
-Options of the macro are scoped like bindings. Those the attribute itself was given hold throughout, and a
-`#[stack_safe(..)]` written on a function, a nested module or a nested impl block inside it *shadows* them for that item
-and whatever it contains. A nested marker is recognised by its *name*, i.e. any path whose last segment is `stack_safe`,
-so `#[stack_safe]`, `#[yaspar_macros::stack_safe]`, `#[ym::stack_safe]` and a re-export all work. A *renaming* import
-does not: given `use yaspar_macros::stack_safe as ss`, nothing about `#[ss]` ties it back to this crate, so the compiler
-expands it itself — on a body already rewritten, which we refuse with a message saying as much.
-
-#### `&mut` parameters
-
-A `&mut` parameter cannot travel in a frame. Every nested activation parks a frame carrying its own live locals, so at
-depth `n` we would hold `n` frames, each with a `&mut` to the same object, which the borrow checker rightly rejects.
-
-Such a parameter becomes part of a **context** instead, which the driver owns in a tuple and hands to the body as a
-`&mut` on each step. This is the context argument that was omitted from the expansion above. Since no reborrow outlives
-a single step, nothing is captured, and the parameter stays usable after a recursive call returns:
+**`&mut` parameters.** One cannot ride in a frame: at depth *n* there would be *n* frames each holding a `&mut` to the
+same object. Such a parameter becomes a *context* the loop owns and lends out for one step at a time, so it stays usable
+after a call returns:
 
 ```rust
 #[stack_safe]
@@ -376,19 +186,16 @@ fn collect(n: u64, out: &mut Vec<u64>) {
     out.push(n);
     collect(n / 2, out);
     collect(n / 3, out);
-    out.push(n);           // `out` is still usable after both calls
+    out.push(n);           // `out` is still usable here
 }
 ```
 
-A method is handled by desugaring `self` away: the receiver becomes an ordinary first parameter of a generated
-associated function, and the method itself keeps its signature and forwards to it. Thus `&mut self` is a `&mut`
-parameter, governed by everything above, and `&self` is a shared one that simply rides in the payload.
+**The two opt-in options.** Both trade a reference for a raw pointer, and both emit `unsafe` into *your* crate, where your
+own `#![forbid(unsafe_code)]` will not see it. Neither is on by default. The invariants are argued in `SAFETY:` comments
+and tested under both of Miri's aliasing models — but not proved, so opting in is a decision.
 
-Every recursive call must pass that same reference. If we recurse into a place *derived* from it, e.g. `walk(&mut
-t.kids[i])` where the parent and the child are different nodes, then the driver has to keep the parent's place while
-lending out the child's, which is once again two live `&mut` into the same tree. This problem can be overcome by casting
-mutable reference to pointers. This operation is explicitly acknowledged by passing the `use_nonlinear_mut` flag to the
-macro.
+`use_nonlinear_mut` allows recursing into a place *derived* from a `&mut` parameter, where the parent's place must be held
+while the child's is lent out. The frame keeps a pointer, swapped in before the call and restored on resume:
 
 ```rust
 #[stack_safe(use_nonlinear_mut)]
@@ -400,328 +207,92 @@ fn bump(t: &mut Tree) -> u64 {
 }
 ```
 
-The frame then holds a raw pointer instead: the child's pointer is swapped in before the call, and the parent's is
-restored by the resume arm. The macro checks what it can see syntactically, i.e. that the argument is `&mut <place>`
-rooted at a context parameter, so that `&mut some_local` is rejected. It cannot see types, however, so it becomes our
-obligation that the place stays valid while the subtree of the child runs, e.g. that it is a node reached from the
-context rather than something that could be moved or freed in the meantime.
-
-#### Lending the callee a value built at the call site
-
-Sometimes a recursion grows its own argument, e.g. it pushes a node onto a borrowed chain on the way down:
+`data_in_frame` allows lending the callee something built at the call site. Natively that value is a temporary of the
+caller, whose frame outlives the call; here the arm that built it has already returned, so the value moves into a store
+the loop owns, which never moves what it holds and drops it exactly when the callee's subtree ends:
 
 ```rust
 #[stack_safe(data_in_frame)]
 fn rec(n: usize, stack: &Stack<'_, Vec<usize>>) -> usize {
-    if stack.len() >= n {
-        n
-    } else {
-        let v = vec![];
-        1 + rec(n, &Stack::Cons(v, stack))
-    }
+    if stack.len() >= n { n } else { 1 + rec(n, &Stack::Cons(vec![], stack)) }
 }
 ```
 
-Natively the new node is a temporary of the caller, and the caller's frame outlives the call, so the callee can borrow
-it. The CPS transformation takes that frame away: a recursive call becomes a frame parked on the heap and a jump back to
-the top of the loop, so the arm that built the node has already returned before the callee's arm runs. Hence the flag, without which we get an
-error saying so rather than an `E0515` blamed on the attribute.
+Without the option each case is a compile error that names the option, rather than a borrow-check error blamed on the
+attribute. The untransformed body is also emitted beside the machine, so your program's *source-level* borrows are still
+checked and a program the compiler would have refused is still refused.
 
-Under the flag the node lives in a store the loop owns. The callee is given an *address*, which has to be valid at two
-moments the frame cannot cover: while the arm still runs, since the entry carrying it must be complete before the arm
-returns; and for the whole subtree of the callee, which pushes frames of its own and so moves the `Vec` that holds them.
-The store answers both. It exists before the arm runs, so pushing hands back an address at once, and its chunks are
-pre-sized and never regrown, so no value ever moves. That costs one allocation per 64 values rather than one per value.
+### What it handles
 
-Each call site records the store's length (a mark) before pushing and truncates back to it on resume, carrying that mark
-in its frame, so what a call lends its callee dies exactly with the callee's subtree. There is one store per driver
-however many shapes it holds: they travel as variants of a generated enum, so a call may grow several arguments at once
-even when their types differ, and a descent allocates one chunked buffer rather than one per shape.
+Inside a body: `if`, `match`, blocks; `for`, `while`, `while let`, `loop`, with `break` and `continue`; `return` from any
+depth; `?` on a `Result`, an `Option`, a `ControlFlow`, or a carrier of your own that implements the two stand-in traits
+in `yaspar-macros-defs`; parameters that destructure; `&mut` parameters and `&self` / `&mut self` methods; generics and
+where-clauses; `#[cfg]` on a statement, a match arm or a struct field, which travels to every piece the construct is cut
+into; and any number of recursive call sites.
 
-A lend need not be a value built there. `rec(n - 1, &row[0])` on a local of the frame — a `let` that says its type —
-lends a *place inside* it: the local moves into the store, the callee is given the address of the place, and the resume
-arm hands the local back, so the code after the call still owns it. It is taken back by index rather than "the value
-pushed last", since a later lend to the same call sits on top of it.
+Semantics are preserved as well as syntax — argument evaluation order, `&&` / `||` laziness, an iterator expression
+evaluated exactly once, every value dropped exactly once even when a panic unwinds through parked frames. Each of those
+is checked against a hand-written twin in `tests/observable.rs`.
 
-The two options compose, including at one call site. A recursion may hand its child a place derived from a `&mut`
-parameter *and*, in the same argument list, a reference to a value built there. We park the slot for the child's subtree
-and move the value into the driver's store, and the continuation then undoes both. `tests/context.rs` walks a tree that
-way, i.e. it mutates each node through the derived reference while carrying the path from the root as a chain built one
-link per level, and it is checked under both of Miri's aliasing models.
+### What it refuses
 
-Both options hand the driver a raw pointer where the original had a reference. That does not put the borrow checker
-aside for the program you wrote: the untransformed body is emitted alongside the state machine, so the *source-level*
-borrow structure is still checked, and a program it would have refused is still refused, e.g. a callee that returns a
-borrow of a value lent to it. One consequence is worth knowing, since it is visible: a mistake either option would
-otherwise have hidden may be reported twice, once against each of the two readings of the body.
+Rejections are compile errors on the offending span, and each one's message is pinned in `tests/ui/`. The categories:
 
-The expansion is not checked that way: keeping those pointers valid is an invariant this crate takes on, argued in
-`SAFETY:` blocks and tested under both of Miri's aliasing models, but not proved. Both options also emit `unsafe` into
-*your* crate, where your own `#![forbid(unsafe_code)]` will not see it. Neither is on by default, so keeping that
-guarantee means not opting in.
+* **signatures** it cannot rewrite: `async fn`, `const fn`, variadics, a by-value `self`, `-> !`;
+* **call positions** it cannot cut: inside a closure or a macro, in a match guard, an `if let` scrutinee, a `let ... else`
+  initialiser, the left side of an assignment, or any position needing a `let` first — and a recursive function *named*
+  without being called;
+* **names it cannot resolve**, since a macro resolves no paths: a call through `T::f(..)` or `crate::m::f(..)`, two
+  members of one name, two same-named `fn`s in sibling blocks, a binding that shadows the function, a turbofish naming a
+  *different* instantiation;
+* **scopes it cannot carry**: an item declared in a block that then recurses, and a binding that shadows an outer one
+  which is read again after the recursion;
+* **an attribute that does nothing**: `#[stack_safe]` on a scope where nothing recurses, or on an item that is not a
+  function, module or impl block.
 
-#### Supports
+Two cases are *not* caught, and both leave a working program that still overflows deeply: a reference hidden behind a type
+alias, which the macro cannot see through, and a cycle only partly covered by one attribute, since everything outside its
+reach is opaque. Put the attribute on a scope containing the whole cycle.
 
-Within a function body, the transformation handles `if`, `match` and blocks; `for`, `while`, `while let` and `loop`, with
-`break` and `continue`; `return` from any depth, and `?` on a `Result`, an `Option`, a `ControlFlow` or a carrier of your
-own; parameters that destructure; `&mut` parameters, `&self` and `&mut self` methods; generics and where-clauses; and any
-number of recursive call sites.
+### Where it differs from ordinary recursion
 
-A `#[cfg]` travels with the construct it was written on, even though the construct is cut across the driver's arms: a
-statement, a match arm and a struct-expression field each carry their predicate to every piece, and the code that a
-failing predicate disables is not compiled. `tests/cfg_gates.rs` pins both answers with `cfg(all())` and `cfg(any())`,
-disabling code that would not compile if a gate failed to travel. What is refused instead, with the error on the span:
-a `#[cfg]` deeper inside an expression, a `#[cfg_attr]` anywhere a call is cut out of, and a `#[cfg]` on a parameter,
-which would change the payload's shape for the whole cycle.
+The suite compares the transform against ordinary recursion on everything it can reach. What follows is what still
+differs; each is a test in `tests/adversarial.rs` that pins *both* answers, so a fix fails loudly there.
 
-It preserves semantics as well as syntax: argument evaluation order, `&&` and `||` laziness, compound assignment, and
-the iterator expression of a loop being evaluated exactly once. Every value is dropped exactly once, with no leak and no
-double drop, even when a panic unwinds through parked frames. Each of these is checked in `tests/observable.rs` against
-a hand-written twin of the same function.
-
-#### Limitations
-
-Drop *timing* shifts, because locals live in frames instead of on the native stack. The shift that can change what a
-program means is the following one: a local that nothing after the call mentions is not carried in a frame at all, so it
-is dropped *before* the call instead of after it.
+**Drop timing.** Locals live in frames, not on the stack, and a local nothing after the call mentions is not carried at
+all — so it drops *before* the call rather than after:
 
 ```rust
-struct Guard(u64);
-impl Drop for Guard { fn drop(&mut self) { print!("leave{} ", self.0); } }
-
 #[stack_safe]
 fn walk(n: u64) {
-    let _g = Guard(n);
+    let _g = Guard(n);              // prints on drop
     if n > 0 { walk(n - 1); }
 }
 ```
 
-For `walk(2)`, plain recursion prints `leave0 leave1 leave2`, i.e. innermost first, whereas the transformed version
-prints `leave2 leave1 leave0`. In other words, an RAII guard held across a recursive call does not protect that call.
-Deciding otherwise would require knowing that the local implements `Drop`, i.e. would require types, so the remedy is to
-mention the guard after the call, or to scope it in an inner block.
+`walk(2)` prints `leave0 leave1 leave2` natively and `leave2 leave1 leave0` here. An RAII guard held across a recursive
+call does not protect that call. Mention it after the call, or scope it in an inner block.
 
-Four smaller shifts are recorded in `tests/observable.rs`, none of which changes *which* values are dropped, only when:a
-carried local drops at the end of its resume arm, a temporary drops at the hoisted `let`, the iterator of a lowered loop
-drops after the epilogue of the loop, and parked frames drop outermost-first when a panic unwinds.
+**Things read after the recursion that Rust reads before it.** A method call whose receiver is a place, with a recursive
+call among its arguments, reads that place late: a by-value `self` sees what the recursion wrote, and a user `Deref` or an
+overloaded `Index` resolves at the wrong time. The same holds for an argument beside a later recursive one, whose coercion
+waits. **Hoist the call** — `let v = recurse(..); receiver.method(v)`. These cannot be rejected: the shapes that
+misbehave are written exactly like the ones that work, and only a type tells them apart.
 
-Next come the cases where the macro silently leaves a recursive call as an ordinary call, so that the function compiles,
-returns the right answer, and still overflows on a deep input:
+**A same-named method on an unrelated receiver.** Inside an annotated impl, every `.g(..)` whose name is a member's is
+read as a call into the cycle — which is what makes recursing down a structure work. Call the unrelated one through its
+type: `Other::g(&other, ..)`.
 
-* Since the proc-macros only see syntactic stream, a type alias is not expanded. If an alias hides a reference, e.g.
-  `type Words<'a> = &'a [&'a str]`, an object of this type alias is not recognized as a reference, and the
-  transformation therefore could fail with an obscure error message.
-* mutual recursive functions that are not fully captured by a single `#[stack_safe]` will still overflow when input size
-  is too large. This is because `#[stack_safe]` can only analyze code within its reach. Other functions are treated
-  opaquely.
+**Source locations** name the attribute's line rather than their own, since the body is inside a macro expansion. That
+covers `line!()`, `panic!` and `assert!` locations, and `Location::caller()` in anything the body calls. A
+`#[track_caller]` function that is itself rewritten is fine: it reports its external call site.
 
-Everything else is rejected at compile time, with the error on the offending span. A call through a path the macro
-cannot rewrite — `T::f(..)`, `<Self>::f(..)`, `crate::m::f(..)` — is one of them: it plainly names a member, so it is an
-error naming the spelling to use rather than a recursion left on the native stack. So is a `#[stack_safe]` on a module
-or an impl block that flattens nothing, which was already an error on a function.
+**Addresses**, under the two options. `data_in_frame` moves a lent value into the loop's store and `use_nonlinear_mut`
+re-derives a `&mut` parameter on resume, so a program comparing addresses across a call sees them change. Both are what
+those options do.
 
-On the signature:
-
-* `async fn`, since the rewritten body is a loop over a frame stack, which an async state machine cannot hold without
-  pinning; `const fn`, since the expansion allocates; and variadics;
-* a by-value `self`, since the receiver becomes a parameter the driver either lends out or carries, and it can do
-  neither with an owned value;
-* *assigning* to a `mut` binding of a `&mut` parameter, e.g. `out = other;` after `mut out: &mut Vec<u64>`, since that
-  parameter is a context slot every step re-derives, so the next step would not see the new value. Writing *through* the
-  reference is the ordinary use, so an inert `mut` is accepted;
-* `-> !`, which the driver would have to name where it is not yet stable.
-
-A parameter that destructures needs no rejection: `f((a, b): (u64, u64))`, `f(Point { x, y }: P)` and `f(_: u64)` are
-given a name of their own with the pattern re-bound at the top of the body, since it is the payload that needs the name
-and not the caller. `impl Trait` nested in a type, as in `Box<impl Iterator>`, is accepted for the same reason.
-
-On the placement of a recursive call:
-
-* inside a closure, or inside a macro invocation, i.e. anywhere the macro cannot see how the call is reached. This is
-  particularly the case for collection functions. Please use explicit loops instead;
-* inside an `async { .. }` or `const { .. }` block, and any `.await` in the body;
-* in a `let ... else` initializer, a match guard, an `if let` or `while let` scrutinee, a struct-update base, or the
-  left-hand side of an assignment or of a compound assignment;
-* in any other position it cannot be hoisted out of, e.g. an array-repeat expression, which asks for it to be bound to a
-  `let` first;
-* on a reference to a value the frame owns, i.e. one built at the call site, e.g. `rec(n, &Node::Cons(v, rest))`, or a
-  place inside a local, e.g. `rec(n, &row[0])`, unless we opt in with `data_in_frame` — see below;
-* inside the place passed for a context parameter, e.g. `f(&mut t.kids[f(..) as usize])`, since that place is taken as a
-  pointer before the call is made, so the inner call would recurse natively;
-* with the wrong number of arguments, which is reported as such rather than left to the type checker;
-* naming a transformed function without calling it, e.g. `let g = f;` or `xs.iter().map(f)`, since the name no longer
-  denotes something the driver can be entered at; wrap it in a closure that calls it;
-* a labelled `break` or `continue` in a loop that contains a recursive call.
-
-Inside a group:
-
-* two members declaring a type of the same name in their bodies. Since recursive definitions are hoisted in a common
-  state machine, internal type definitions with clashing names are also hoisted into the state machine, causing a name
-  clashing. This can be addressed by using different names or centralize type definitions in a module;
-* a member declared inside another member's body, where the cycle is generic or names a lifetime of its own. The driver
-  carries those parameters, and such a function cannot name them. The same holds where a member takes an `impl Trait`
-  parameter, or a `Self` the driver's signature cannot spell. Move the function out to the enclosing scope;
-* a `default fn` in an impl block;
-* a `#[stack_safe]` marker on a function the group finds no cycle for, which would otherwise silently do nothing.
-
-On `?`:
-
-* a carrier that implements only the *unstable* `core::ops::Try`, since the early exit is desugared through a stand-in
-  for the unstable `Try` and `FromResidual`, which has one impl per carrier; the error is a missing-impl one naming
-  `yaspar_macros_defs::Try`, with a second naming `FromResidual` for the early-exit half.
-
-`Result`, `Option` and `ControlFlow` are carried out of the box, as in `core`. Any other carrier joins by implementing
-the two stand-in traits for itself:
-
-```rust
-impl<T> yaspar_macros_defs::Try for Maybe<T> {
-    type Output = T;
-    type Residual = NothingLeft;
-    fn branch(self) -> Result<T, NothingLeft> { .. }
-}
-impl<T> yaspar_macros_defs::FromResidual<NothingLeft> for Maybe<T> {
-    fn from_residual(_: NothingLeft) -> Self { Maybe::Nothing }
-}
-```
-
-`tests/carrier.rs` drives such a carrier through both halves of the desugaring. What cannot be done is picking up an
-existing `core::ops::Try` impl, since a blanket impl over it would need that unstable trait.
-
-Misusing the attribute is also an error: `#[stack_safe]` on an item that is neither a function, a module nor an impl
-block; on a bodiless `mod m;`, which shows it no body to scan; and an unknown or malformed option list — where an
-unknown option suggests the nearest real one, a flag given a value says it takes none, and a repeated one says so.
-
-Two notes on the generated code. Where a group's members return different types, the arms that take a member's result
-out of the driver's union end in `::core::unreachable!`; they cannot be taken, but the panic path is present, which
-matters under `panic = "abort"`. And the rewriting itself is recursive descent with no depth guard, so a body whose
-*expressions* nest deeply enough overflows `rustc`'s own stack — on `aarch64`, 700 levels of parentheses around a
-recursive call compile and 800 abort with `SIGBUS`. That is compile-time only and out of reach of hand-written code, and
-we accept it as it stands: the claim is that a *recursion* is bounded by memory, not that any body shape is accepted.
-
-#### More Tests and Examples
-
-| file                  | what it covers                                                                        |
-|-----------------------|---------------------------------------------------------------------------------------|
-| `tests/transform.rs`  | the core transform: branching, `?`, operators, strict positions, nested scopes, depth |
-| `tests/loops.rs`      | `for` / `while` / `while let` / `loop`, nesting, `break` / `continue`                 |
-| `tests/context.rs`    | `&mut` parameters, methods, `use_nonlinear_mut` (also the Miri target)                |
-| `tests/group.rs`      | mutual recursion, nesting, member bodies, threading out, visibility                   |
-| `tests/observable.rs` | side-effect and drop equivalence with plain recursion                                 |
-| `tests/ui/`           | every rejection, with its message pinned against a stored `.stderr`                   |
-
-We check the rejections with `trybuild`, which compares the compiler's output against a stored `.stderr` per case. A
-`compile_fail` doctest cannot do that, since it passes however the message reads. After changing a message, regenerate
-the snapshots with `TRYBUILD=overwrite cargo test --test ui` and read every diff.
-
-Every stack-safety test runs on a thread with a 64 KiB stack, so that a regression to native recursion aborts the test
-process instead of failing quietly. Two paths are `unsafe`, namely `use_nonlinear_mut` and `data_in_frame`, and both are
-checked under both aliasing models. The depth-only tests are skipped there, since they are about frames rather than
-aliasing and Miri would take forever over them:
-
-```
-cargo test
-MIRIFLAGS="-Zmiri-strict-provenance" cargo +nightly miri test --test context \
-    -- --skip deep_ --skip _is_flat --skip _is_stack_safe
-MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-strict-provenance" cargo +nightly miri test --test context \
-    -- --skip deep_ --skip _is_flat --skip _is_stack_safe
-MIRIFLAGS="-Zmiri-strict-provenance" cargo +nightly miri test --test transform \
-    -- lends_the_callee two_values_of three_lent_values_with
-MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-strict-provenance" cargo +nightly miri test --test transform \
-    -- lends_the_callee two_values_of three_lent_values_with
-MIRIFLAGS="-Zmiri-strict-provenance" cargo +nightly miri test --test group \
-    -- lend unsafe_options --skip _is_flat
-MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-strict-provenance" cargo +nightly miri test --test group \
-    -- lend unsafe_options --skip _is_flat
-MIRIFLAGS="-Zmiri-strict-provenance" cargo +nightly miri test --test pinned_places \
-    -- three_shapes park_inside two_members_park_their a_panic_drops
-MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-strict-provenance" cargo +nightly miri test --test pinned_places \
-    -- three_shapes park_inside two_members_park_their a_panic_drops
-MIRIFLAGS="-Zmiri-strict-provenance" cargo +nightly miri test --test loops \
-    -- borrowed_loop_is_correct borrowed_loop_releases_on_break_and_question_mark
-MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-strict-provenance" cargo +nightly miri test --test loops \
-    -- borrowed_loop_is_correct borrowed_loop_releases_on_break_and_question_mark
-```
-
-The two examples are runnable programs rather than tests, since one of them deliberately aborts:
-
-```
-cargo run --release --example perf_contrast          # the benchmark quoted above
-cargo run --example overflow_contrast -- safe        # 500001
-cargo run --example overflow_contrast -- naive       # fatal runtime error: stack overflow
-```
-
-### Where the transform differs from ordinary recursion
-
-The rewritten function is meant to compute what the recursive one computed, and the suite compares
-the two on everything it can reach. Differential testing found nine shapes where they can still
-disagree. Each is a test in `tests/adversarial.rs` that runs with the rest of the suite and pins
-*both* answers, so a fix fails there and says so, and no further drift goes unnoticed:
-
-```text
-cargo test --test adversarial
-```
-
-They are here rather than rejected because rejecting them would refuse ordinary code. The transform
-sees no types — a proc macro cannot — and in each case the shape that misbehaves is written exactly
-like the shape that works, the difference lying in a type. Where a shape *can* be told apart, the
-macro rejects it instead; `tests/ui/` holds those.
-
-**A method call whose receiver is a place, with a recursive call among its arguments.** Rust reads
-the receiver place before the arguments run. The transform keeps it as a place and reads it after,
-so three things can differ: a by-value `self` copies out of the place at the wrong time
-(`value[0].plus(recurse(..))` sees what the recursion wrote); a user `Deref` on a path receiver
-resolves late (`s.plus(recurse(..))` where `s: &Switch` derefs to a different `V` than it would
-have); and an overloaded `Index` runs late. A borrowed `self` over a plain binding — which is nearly
-every method call — is unaffected. **Hoist the call:** `let v = recurse(..); value[0].plus(v)`.
-
-Nothing distinguishes these from `cs[0].bump(recurse(..))`, which is correct and is tested as such:
-only the method's `self` kind does, and that is a type.
-
-**A coercion on a *later* argument's neighbour.** `consume(s, recurse(..))` hoists `s` into a
-temporary to keep the evaluation order, and the temporary is untyped — the callee's parameter types
-are not the macro's to know — so an expected `&V` deref of a `&Switch` happens in the reconstructed
-call rather than before the recursion. **Hoist the call**, as above.
-
-**A same-named method on an unrelated receiver.** Inside `#[stack_safe] impl T`, every `.g(..)` whose
-name is a member's is read as a call into the cycle, whatever the receiver. That is what makes
-recursion down a structure work — `tail.len()` recursing on another `&Self` is supported and
-tested — and it is why `other.g(..)` for an unrelated `other` that happens to have a `g`, reachable
-by `Deref`, is also rewritten. **Call the unrelated one through its type:** `Other::g(&other, ..)`,
-which the transform leaves alone.
-
-**Source locations, inside the rewritten body.** Anything that asks where it is reports the
-`#[stack_safe]` attribute's line rather than its own, because the body is now inside a macro
-expansion. This is not something the transform chooses, and it holds even for code the transform
-does not touch:
-
-```rust
-#[stack_safe]                       // line 1
-fn f(n: u64) -> u32 {
-    if n == 0 { return line!(); }   // line 3 — reports 1, not 3
-    f(n - 1)
-}
-```
-
-So `line!()`, `column!()`, `file!()`, a `panic!` or `assert!` location, and `Location::caller()` in
-anything the body calls all name the attribute. Two visible consequences: a lowered `for` reports the
-attribute's line to a `#[track_caller]` `IntoIterator::into_iter` or `Iterator::next`, and `?` reaches
-a `#[track_caller] From::from` through the stable `Try` shim, which reports a line inside
-`yaspar-macros-defs`.
-
-A `#[track_caller]` function that is *itself* rewritten is fine: the attribute is carried onto every
-generated frame, so the location reported is the external call site, which is outside the expansion.
-
-**Addresses, under the two opt-in options.** `#[stack_safe(data_in_frame)]` lends a callee a value
-by moving it into a store the loop owns, so the value does not sit where a native caller's frame
-would have put it: a program comparing `ptr::from_ref` across the call sees it move. Likewise
-`#[stack_safe(use_nonlinear_mut)]` re-derives a `&mut` parameter in the arm that resumes, so the
-*binding's* address differs. Both are what those options do rather than accidents, and neither
-dereferences anything the transform has not kept alive — see the invariants above.
-
-**An annotated module's re-export.** `#[stack_safe] mod m` re-exports `m`'s public functions beside
-it, so callers need not name the module. An explicit `use` outranks a glob one, so an unqualified
-`f(..)` that used to resolve through `use other::*` resolves to `m::f` after the attribute is added.
-**Name the one you mean:** `other::f(..)`.
+**A grouped module's re-export.** The generated `use m::f` outranks a glob import, so an unqualified `f(..)` that used to
+resolve through `use other::*` resolves to `m::f` once the attribute is added. Name the one you mean.
 
 ## Trait Delegation and Object Orientation
 
