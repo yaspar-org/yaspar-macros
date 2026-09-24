@@ -91,6 +91,19 @@ pub(super) fn input_local() -> Ident {
 pub(super) fn frame_local() -> Ident {
     format_ident!("__ss_frame")
 }
+/// The resumed value, where one resume arm serves every frame: the carrier the callee answered
+/// with, before the shared `?` check.
+pub(super) fn value_local() -> Ident {
+    format_ident!("__ss_value")
+}
+/// That value once the check has passed, which every frame's arm reads.
+pub(super) fn ok_local() -> Ident {
+    format_ident!("__ss_ok")
+}
+/// The residual the check produced, on its way out of the loop.
+pub(super) fn res_local() -> Ident {
+    format_ident!("__ss_res")
+}
 /// The value a `Done` hands down, bound so that the pop can be branched on without writing it
 /// twice.
 pub(super) fn done_local() -> Ident {
@@ -100,6 +113,11 @@ pub(super) fn done_local() -> Ident {
 /// breaks this.
 pub(super) fn drive_label() -> syn::Lifetime {
     syn::Lifetime::new("'__ss_drive", proc_macro2::Span::call_site())
+}
+/// One turn of the loop, whose value is the next state. A transition reached from anywhere but the
+/// end of an arm leaves this with it — see `driver::escape`.
+pub(super) fn body_label() -> syn::Lifetime {
+    syn::Lifetime::new("'__ss_body", proc_macro2::Span::call_site())
 }
 pub(super) fn frame_variant(r: usize) -> Ident {
     format_ident!("R{}", r)

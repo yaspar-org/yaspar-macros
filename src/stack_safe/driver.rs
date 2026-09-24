@@ -11,30 +11,35 @@
 //! about 2x (see `PERFORMANCE.md`, and `ladder1_one_loop` in
 //! `examples/perf_dispatch_width.rs`, which is this shape by hand).
 //!
-//! What the body is is unchanged: one `match` over [`names::input_ty`], with an arm per entry
-//! point and per resume point. What it *answers* with is gone — a transition now stores the next
-//! input and jumps to the top of the loop itself, so every arm diverges and the loop is
+//! What the body is is unchanged: one `match` over [`names::input_ty`], with an arm per entry point
+//! and per resume point. What it *answers* with is the next input, so the loop is
 //!
 //! ```text
 //! let mut __ss_frames = __SsFrames::new();
 //! let mut __ss_input: __SsIn<_, __SsFrame<..>, _> = __SsIn::Enter(__ss_entry);
 //! '__ss_drive: loop {
-//!     match __ss_input { .. }
+//!     __ss_input = '__ss_body: { match __ss_input { .. } };
 //! }
 //! ```
 //!
-//! Storing rather than answering is also what keeps the body type-checking as it did. A payload
-//! is a tuple of inferred types, so `Entry::E0((tail,))` needs the *expected* type at hand to
-//! coerce `tail` — a `&&Stack` a `match` handed out, where the payload holds a `&Stack` — and a
-//! coercion does not reach inside a generic afterwards. An assignment to a local whose type is
-//! already known provides that expectation, exactly as the closure's return type used to.
+//! *Answering* rather than storing is worth about 1.7x, and it is the largest single thing in the
+//! shape. The state is as big as a frame plus a return value — 168 bytes in the benchmark — and a
+//! transition that assigns it and jumps back to the top gives it one writer per call site; answered
+//! instead, it has exactly one, and LLVM keeps it in registers rather than copying it between stack
+//! slots. The assembly says so plainly: the answering form has no block copies in its loop.
+//!
+//! A transition reached from anywhere but the end of an arm — a `?`, a `return`, a `break` out of a
+//! lowered loop — cannot be the arm's value, so it leaves the turn with [`escape`] instead. That is
+//! what the `'__ss_body` label is for, and what those places used to `return`.
 
 use proc_macro2::TokenStream;
 use quote::quote;
 
 use super::names::{
-    done_local, drive_label, frame_local, frames_local, frames_ty, input_local, input_ty,
+    body_label, done_local, drive_label, frame_local, frames_local, frames_ty, input_local,
+    input_ty, ok_local, res_local, value_local,
 };
+use super::try_shim;
 
 /// This body is finished: hand the value to the frame below, or answer with it.
 ///
@@ -43,16 +48,13 @@ use super::names::{
 /// the whole recursion's answer, and the only way out of the loop.
 pub(super) fn done(v: TokenStream) -> TokenStream {
     let (frames, frame, val) = (frames_local(), frame_local(), done_local());
-    let (input, input_local, drive) = (input_ty(), input_local(), drive_label());
+    let (input, drive) = (input_ty(), drive_label());
     quote! {
         {
             let #val = #v;
             match #frames.pop() {
                 ::core::option::Option::None => break #drive #val,
-                ::core::option::Option::Some(#frame) => {
-                    #input_local = #input::Resume(#frame, #val);
-                    continue #drive;
-                }
+                ::core::option::Option::Some(#frame) => #input::Resume(#frame, #val),
             }
         }
     }
@@ -60,32 +62,80 @@ pub(super) fn done(v: TokenStream) -> TokenStream {
 
 /// Park `frame` and enter `entry`: a recursive call.
 ///
-/// The entry is stored *before* the frame is parked, because the two are cut out of one source
-/// expression and that is the order it had: the frame takes ownership of the locals live across
-/// the call, and an argument may still have to read one of them (`walk(n - 1, ids.clone(), ..)`
-/// for an `ids` the continuation also uses).
-pub(super) fn call(entry: TokenStream, frame: TokenStream) -> TokenStream {
-    let (frames, input, input_local, drive) =
-        (frames_local(), input_ty(), input_local(), drive_label());
+/// `args` binds the arguments first, and it has to, for two reasons that both come of the entry
+/// being the arm's *value* — which is where it has to be, since answering with the state rather
+/// than storing it is what keeps the state in registers.
+///
+/// The first is order. The frame takes ownership of the locals live across the call, and an
+/// argument may still have to read one of them — `walk(n - 1, ids.clone(), ..)` for an `ids` the
+/// continuation also uses — so the arguments have to run before the push, which as the value they
+/// would not.
+///
+/// The second is coercion. A payload is a tuple of inferred types, so `E0((tail,))` needs the
+/// expected type at hand to coerce `tail`, a `&&Stack` that a `match` handed out, to the `&Stack`
+/// the payload holds; a coercion does not reach inside a generic afterwards, and the value position
+/// offers no expectation. Each argument's own `let`, annotated with the callee's declared parameter
+/// type, is that expectation — the same device the swap path already uses.
+pub(super) fn call(args: TokenStream, entry: TokenStream, frame: TokenStream) -> TokenStream {
+    let (frames, input) = (frames_local(), input_ty());
     quote! {
         {
-            #input_local = #input::Enter(#entry);
+            #args
             #frames.push(#frame);
-            continue #drive;
+            #input::Enter(#entry)
         }
+    }
+}
+
+/// One resume arm for every frame, with the `?` every one of them began with done once, above the
+/// dispatch on the frame tag.
+///
+/// This is `ladder1_one_loop`'s shape, and it is the largest single difference between the two in
+/// the benchmark: a check per frame arm costs about a third of native, since it puts the carrier's
+/// round trip and a copy of the error tail into the hot path once per call site. The caller decides
+/// whether it applies: every point has to begin with that check, the members have to share one
+/// return type, and no point may have anything to tear down first. See `emit::checks_are_shareable`.
+///
+/// `inner` is one arm per frame variant, each expecting the checked value in [`names::ok_local`].
+/// `drops` is the same dispatch again, for the path where the check fails: the frame is still whole
+/// there, and a tuple dropped whole drops its slots front to back, where the recursion this came
+/// from dropped its locals in reverse. So that path names them and drops them itself — cold code,
+/// and the only thing the lifted check costs.
+pub(super) fn resume(inner: &[TokenStream], drops: &[TokenStream]) -> TokenStream {
+    let (frame, ok, res) = (frame_local(), ok_local(), res_local());
+    let (value, input_ty) = (value_local(), input_ty());
+    let branch = try_shim::branch(quote! { #value });
+    let handed_down = done(try_shim::from_residual(quote! { #res }));
+    // Both ways out are the arm's *value*: binding the checked value to a `let` first and leaving
+    // the turn on the error path would put a second writer back on the state, which is the one
+    // thing this shape is careful not to do — and it cost the single-call-site case 2.8x.
+    quote! {
+        #input_ty::Resume(#frame, #value) => match #branch {
+            ::core::result::Result::Ok(#ok) => match #frame { #(#inner)* },
+            ::core::result::Result::Err(#res) => {
+                match #frame { #(#drops)* }
+                #handed_down
+            }
+        },
     }
 }
 
 /// Enter `entry` without parking anything: one iteration of a lowered loop, whose result belongs
 /// to whichever frame is already on top.
 pub(super) fn tail(entry: TokenStream) -> TokenStream {
-    let (input, input_local, drive) = (input_ty(), input_local(), drive_label());
-    quote! {
-        {
-            #input_local = #input::Enter(#entry);
-            continue #drive;
-        }
-    }
+    let input = input_ty();
+    quote! { #input::Enter(#entry) }
+}
+
+/// A transition reached from somewhere other than the end of an arm: a `?`, a `return`, or a
+/// `break` out of a lowered loop.
+///
+/// It leaves the turn with the next state, which is what those places used to `return` the `Step`
+/// for. Parenthesised because the state is usually a block, and `break 'a { .. }` reads worse than
+/// it parses.
+pub(super) fn escape(next: TokenStream) -> TokenStream {
+    let body = body_label();
+    quote! { break #body (#next) }
 }
 
 /// The loop around one group's body: `arms` entered at `entry`, run to completion.
@@ -99,7 +149,8 @@ pub(super) fn machine(
     arms: &[TokenStream],
 ) -> TokenStream {
     let (frames, frames_ty, frame) = (frames_local(), frames_ty(), frame_local());
-    let (input, input_ty, drive) = (input_local(), input_ty(), drive_label());
+    let (input, input_ty) = (input_local(), input_ty());
+    let (drive, body) = (drive_label(), body_label());
     quote! {
         {
             let mut #frames = #frames_ty::new();
@@ -115,7 +166,7 @@ pub(super) fn machine(
                 #input = #input_ty::Resume(#frame, ::core::unreachable!("nothing is parked yet"));
             }
             #drive: loop {
-                match #input { #(#arms)* }
+                #input = #body: { match #input { #(#arms)* } };
             }
         }
     }
