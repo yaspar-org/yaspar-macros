@@ -543,7 +543,10 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
             // A parked local is not carried: the resume arm takes it back out of the store.
             let mut scope = ctx.scope_with_results(&env.scope);
             scope.retain(|name| !parked.iter().any(|(_, root, _)| root == name));
-            let r = ctx.reserve_resume(scope, saved.clone(), v.clone());
+            // Nothing to take back, release or restore means nothing has to run before this
+            // point's code, so a `?` at the front of it may be shared with the other points.
+            let bare = parked.is_empty() && marks.is_empty() && swaps.is_empty();
+            let r = ctx.reserve_resume(scope, saved.clone(), v.clone(), bare);
             let frame_var = frame_variant(r);
             let marker = frame_marker(r);
 
@@ -553,8 +556,15 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
             let prologue = ctx.ctx_prologue();
 
             // A resumed value arrives in the union when the members' return types differ,
-            // and the callee is known here, so the variant is too.
-            let unwrap = ctx.unwrap_result(callee, &v);
+            // and the callee is known here, so the variant is too. A point whose check was
+            // lifted out has no union to take apart -- that is one of the conditions for
+            // lifting -- and its value is no longer the carrier, so it is left alone.
+            let unwrap = if ctx.is_checked(r) {
+                ctx.note_unwrapped(callee, &v);
+                TokenStream::new()
+            } else {
+                ctx.unwrap_result(callee, &v)
+            };
 
             // Restoring a parked pointer has to happen *before* the prologue derives
             // the context bindings from it, or they would be the child's.
@@ -594,8 +604,21 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
             // Without a swap the arguments stay inline, so the common path gains
             // no bindings at all.
             let call = if swaps.is_empty() {
+                // One `let` per argument, in source order: see `driver::call` for why the value
+                // position needs them. A pinned position holds a pointer into the store rather
+                // than the parameter's own reference type, so it goes unannotated.
+                let tmps: Vec<Ident> = vals.iter().map(|_| ctx.fresh()).collect();
+                let args = tmps.iter().zip(vals).enumerate().map(|(j, (tmp, val))| {
+                    let ann = if ctx.member(callee).pinned[j].get() {
+                        TokenStream::new()
+                    } else {
+                        ctx.member(callee).param_types.get(j).cloned().unwrap_or_default()
+                    };
+                    quote! { let #tmp #ann = #val; }
+                });
                 driver::call(
-                    quote! { #entry::#callee_variant((#(#vals,)*)) },
+                    quote! { #(#args)* },
+                    quote! { #entry::#callee_variant((#(#tmps,)*)) },
                     quote! { #frame::#frame_var(#marker) },
                 )
             } else {
@@ -685,15 +708,11 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
                     }
                 }
 
-                let call = driver::call(
+                driver::call(
+                    quote! { #(#pre)* #(#deferred)* },
                     quote! { #entry::#callee_variant((#(#held,)*)) },
                     quote! { #frame::#frame_var(#marker) },
-                );
-                quote! {
-                    #(#pre)*
-                    #(#deferred)*
-                    #call
-                }
+                )
             };
             Ok(quote! { { #call } })
         });
@@ -797,11 +816,24 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
             };
             cps_expr(ctx, env, &inner, &|v| {
                 let v = env.wrapped(v);
-                Ok(driver::done(v))
+                Ok(driver::escape(driver::done(v)))
             })
         }
 
         Expr::Try(t) => cps_expr(ctx, env, &t.expr, &|v| {
+            // `f(a)?` on a recursive call: the check is the first thing that resume point does, so
+            // it can be lifted out of every point that begins the same way and done once, above
+            // the frame dispatch -- which is what `ladder1_one_loop` does by hand, and worth a
+            // third of native on a three-call-site recursion. Not when something is pending here:
+            // a swap to undo or a store to release has to happen on the error path too, and the
+            // lifted check leaves the loop without reaching it.
+            if ctx.hoist.get()
+                && env.restores.is_empty()
+                && env.teardown.is_empty()
+                && ctx.mark_checked(&v)
+            {
+                return k(v);
+            }
             let ok = ctx.fresh();
             // `ok` is a binding the transform introduces, so nothing in the user's
             // scope names it. A later call in the same expression still has to carry
@@ -809,7 +841,7 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
             let body = ctx.with_result(ok.clone(), || k(quote! { #ok }))?;
             let branch = try_shim::branch(v.clone());
             let exit = env.wrapped(try_shim::from_residual(quote! { __ss_res }));
-            let exit = driver::done(exit);
+            let exit = driver::escape(driver::done(exit));
             Ok(quote! {
                 match #branch {
                     ::core::result::Result::Ok(#ok) => #body,
@@ -835,7 +867,7 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
                 Some(lp) => {
                     let v = entry_variant(lp.variant);
                     let marker = state_marker(lp.idx);
-                    Ok(driver::tail(quote! { #entry::#v(#marker) }))
+                    Ok(driver::escape(driver::tail(quote! { #entry::#v(#marker) })))
                 }
                 None => Err(syn::Error::new(c.span(), "`continue` outside of a loop")),
             }

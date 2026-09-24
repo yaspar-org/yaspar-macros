@@ -17,7 +17,7 @@ use super::analyze::{
     MethodSplit, assigns_binding, desugar_apit, desugar_param_patterns, desugar_receiver,
     reject_generic_payload, scan_context_args, scan_pinned_args, validate,
 };
-use super::context::{CtxEntry, is_context_slot, peel_type, slot_key, slot_type};
+use super::context::{CtxEntry, is_context_slot, peel_type, slot_key, slot_type, strip_parens};
 use super::cps::cps_stmts;
 use super::driver;
 use super::loop_state::{solve_payloads, substitute};
@@ -935,9 +935,11 @@ fn analyse(
         local_types: RefCell::new(HashMap::new()),
         locals: RefCell::new(HashSet::new()),
         asked_stores: RefCell::new(Vec::new()),
+        hoist: Cell::new(false),
     };
 
     reject_generic_payload(&ctx, funcs)?;
+    ctx.hoist.set(checks_are_shareable(&ctx, funcs));
 
     for (i, func) in funcs.iter().enumerate() {
         // Before the scans: whether a borrowed local is owned here is judged from its annotation.
@@ -952,6 +954,62 @@ fn analyse(
         scan_pinned_args(&ctx, &func.block)?;
     }
     Ok(ctx)
+}
+
+/// May this group's resume arms share one carrier check, as `driver::resume` writes it?
+///
+/// Three things have to hold, and all of them are known before anything is lowered — which is when
+/// the question has to be settled, since a point whose check is lifted out keeps none of its own.
+///
+/// 1. Every recursive call is the operand of a `?`. Only then is the check the first thing every
+///    resume point does, and only then is there one check rather than several to share.
+/// 2. The members share a return type. A union would have to be taken apart per callee first, and
+///    the check is on what is inside it.
+/// 3. Neither unsafe option is in play. Under them a point may have a value to take back, a store
+///    to release or a context pointer to restore, all of which have to happen on the error path
+///    too — and a lifted check leaves the loop without reaching them.
+fn checks_are_shareable(ctx: &Ctx, funcs: &[ItemFn]) -> bool {
+    struct V<'a> {
+        ctx: &'a Ctx,
+        shareable: bool,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for V<'_> {
+        fn visit_expr(&mut self, e: &'ast syn::Expr) {
+            // `rec(..)?` is the shape being looked for, so the call itself is not reported —
+            // only whatever its arguments turn out to hold.
+            if let syn::Expr::Try(t) = e
+                && let Some((_, call)) = self.ctx.rec_call(strip_parens(&t.expr))
+            {
+                for arg in &call.args {
+                    self.visit_expr(arg);
+                }
+                return;
+            }
+            if self.ctx.rec_call(e).is_some() {
+                self.shareable = false;
+                return;
+            }
+            syn::visit::visit_expr(self, e);
+        }
+
+        /// An item a body declares is a scope of its own; a member declared there is in `funcs`.
+        fn visit_item(&mut self, _: &'ast Item) {}
+    }
+
+    if ctx.ret_union.is_some() || ctx.opts != Opts::default() {
+        return false;
+    }
+    let mut v = V {
+        ctx,
+        shareable: true,
+    };
+    for (i, func) in funcs.iter().enumerate() {
+        // `rec_call` reads the member being lowered, for the same reason the lowering does.
+        ctx.current.set(i);
+        syn::visit::Visit::visit_block(&mut v, &func.block);
+    }
+    v.shareable
 }
 
 /// Each member's body, turned into the arms it is entered at, and the items those bodies declared.
@@ -1185,13 +1243,51 @@ pub(super) fn expand_group(
             #stand_in
         });
     }
+    // Every call site's continuation began by checking the carrier, so that check is done once,
+    // above the dispatch on the frame tag, and a residual leaves the loop instead of being handed
+    // down through the frames — `driver::resume`, which is where the two are measured. Only with
+    // one return type across the group: a union would have to be taken apart per callee first, and
+    // the check is on what is inside it.
+    let hoist = ctx.hoist.get() && !resumes.is_empty();
+    // A lifted check is not written per point, so if the decision held for some points and not for
+    // others their `?` would be gone with nothing standing in for it. `checks_are_shareable` is
+    // what rules that out, and this is where it would show.
+    assert!(
+        !hoist || resumes.iter().all(|r| r.checked.get()),
+        "stack_safe: the shared carrier check was decided on but some resume point did not take it"
+    );
     // One arm per recursive call site: where the driver resumes with the result.
+    let mut frame_arms: Vec<TokenStream> = Vec::new();
+    // The same dispatch for the path where the shared check fails; see `driver::resume`.
+    let mut frame_drops: Vec<TokenStream> = Vec::new();
     for (r, res) in resumes.iter().enumerate() {
         let variant = frame_variant(r);
         let payload = &frames[r];
         let value = &res.value;
         let code = &res.point.code;
         let (gate, stand_in) = gating(&res.point.gates);
+        if hoist {
+            let ok = ok_local();
+            let stand_in_drop = stand_in.clone();
+            let stand_in = stand_in.map(|ungated| {
+                quote! { #ungated #frame::#variant(()) => unreachable!("gated out"), }
+            });
+            frame_arms.push(quote! {
+                #gate
+                #frame::#variant((#(mut #payload,)*)) => { let #value = #ok; #code },
+                #stand_in
+            });
+            let dropped = payload.iter().rev();
+            let stand_in_drop = stand_in_drop.map(|ungated| {
+                quote! { #ungated #frame::#variant(()) => {}, }
+            });
+            frame_drops.push(quote! {
+                #gate
+                #frame::#variant((#(#payload,)*)) => { #(::core::mem::drop(#dropped);)* },
+                #stand_in_drop
+            });
+            continue;
+        }
         let stand_in = stand_in.map(|ungated| {
             quote! { #ungated #input::Resume(#frame::#variant(()), _) => unreachable!("gated out"), }
         });
@@ -1200,6 +1296,9 @@ pub(super) fn expand_group(
             #input::Resume(#frame::#variant((#(mut #payload,)*)), #value) => { #code },
             #stand_in
         });
+    }
+    if hoist {
+        arms.push(driver::resume(&frame_arms, &frame_drops));
     }
     // With no recursive call there is no frame, so the enum is uninhabited and the
     // arm is proved unreachable rather than written.

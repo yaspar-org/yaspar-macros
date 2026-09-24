@@ -73,7 +73,7 @@ impl VisitMut for LeafRewrite<'_> {
                 let inner = &t.expr;
                 let branch = try_shim::branch(quote! { #inner });
                 let exit = self.wrapped(try_shim::from_residual(quote! { __ss_res }));
-                let exit = driver::done(exit);
+                let exit = driver::escape(driver::done(exit));
                 *e = parse_quote! {
                     match #branch {
                         ::core::result::Result::Ok(__ss_ok) => __ss_ok,
@@ -93,7 +93,7 @@ impl VisitMut for LeafRewrite<'_> {
                 // Bound before the teardown: the value may read out of a store it releases, as
                 // `return Err(*x)` does for an `x` borrowed from one.
                 let v = self.wrapped(quote! { __ss_ret });
-                let v = driver::done(v);
+                let v = driver::escape(driver::done(v));
                 *e = parse_quote! {
                     { let __ss_ret = #raw; #undo #release #v }
                 };
@@ -110,7 +110,7 @@ impl VisitMut for LeafRewrite<'_> {
                 if let Some(lp) = self.lp {
                     let v = entry_variant(lp.variant);
                     let marker = state_marker(lp.idx);
-                    let again = driver::tail(quote! { #entry::#v(#marker) });
+                    let again = driver::escape(driver::tail(quote! { #entry::#v(#marker) }));
                     *e = parse_quote! { { #undo #again } };
                 }
             }
@@ -130,7 +130,10 @@ impl VisitMut for LeafRewrite<'_> {
                         None => quote! { () },
                     };
                     match (lp.brk)(v) {
-                        Ok(after) => *e = parse_quote! { { #undo #after } },
+                        Ok(after) => {
+                            let after = driver::escape(after);
+                            *e = parse_quote! { { #undo #after } };
+                        }
                         Err(err) => {
                             if self.err.is_none() {
                                 self.err = Some(err);

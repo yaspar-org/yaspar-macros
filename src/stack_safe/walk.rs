@@ -9,7 +9,7 @@ use quote::{format_ident, quote};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
-use super::names::entry_variant;
+use super::names::{entry_variant, try_trait};
 use syn::Expr;
 
 use super::Opts;
@@ -39,6 +39,13 @@ pub(super) struct ResumePoint {
     pub(super) point: PayloadPoint,
     /// The binding the callee's result arrives in.
     pub(super) value: Ident,
+    /// Could this point's carrier check be shared with the others? Set while the call that
+    /// creates the point is being lowered: nothing it has to tear down first (`Ctx::hoistable`),
+    /// and then a `?` as the first thing the continuation does (`Ctx::mark_checked`).
+    pub(super) hoistable: Cell<bool>,
+    /// The `?` was lifted out, so [`ResumePoint::value`] holds the value *already* checked, and
+    /// the check belongs to whoever writes the resume arm. See `driver::resume`.
+    pub(super) checked: Cell<bool>,
 }
 
 /// One function the driver can enter. A self-recursive function is a group of
@@ -141,6 +148,10 @@ pub(super) struct Ctx {
     /// than a local the frame owns, and one per local a call site parks to lend a place inside it.
     /// Kept in one list so that a variant index settles when it is handed out.
     pub(super) asked_stores: RefCell<Vec<(StoreKey, TokenStream)>>,
+    /// May the `?` at the front of every resume point be lifted into one check above the frame
+    /// dispatch? Decided before a line is lowered, by `emit::checks_are_shareable`, because it has
+    /// to be all or nothing: a point whose check is lifted out no longer carries one of its own.
+    pub(super) hoist: Cell<bool>,
 }
 
 impl Ctx {
@@ -509,11 +520,17 @@ impl Ctx {
 
     /// Reserve a resume point for a recursive call; the code is filled in once the
     /// continuation has been generated.
+    ///
+    /// `hoistable` says the point has nothing to run before its code — no parked value to take
+    /// back, no store to release, no context pointer to restore — so a `?` at the front of it may
+    /// be lifted out. Anything that has to be torn down first must be reached on the error path
+    /// too, and a lifted check leaves before reaching it.
     pub(super) fn reserve_resume(
         &self,
         scope: Vec<Ident>,
         forced: Vec<Ident>,
         value: Ident,
+        hoistable: bool,
     ) -> usize {
         let mut resumes = self.resumes.borrow_mut();
         resumes.push(ResumePoint {
@@ -525,8 +542,43 @@ impl Ctx {
                 gates: self.gates.borrow().clone(),
             },
             value,
+            hoistable: Cell::new(hoistable),
+            checked: Cell::new(false),
         });
         resumes.len() - 1
+    }
+
+    /// `v` is a resume point's value and that point may share its check: take the `?` off it, and
+    /// answer `true`. The point is the one still being generated, which its value names uniquely.
+    pub(super) fn mark_checked(&self, v: &TokenStream) -> bool {
+        let name = v.to_string();
+        let resumes = self.resumes.borrow();
+        let Some(point) = resumes
+            .iter()
+            .find(|p| p.point.code.is_empty() && p.value == name)
+        else {
+            return false;
+        };
+        point.hoistable.get() && {
+            point.checked.set(true);
+            true
+        }
+    }
+
+    /// The resumed value of a point whose check was lifted out holds the carrier's `Output`, not
+    /// the carrier. Recorded under the only name there is for it, since a payload slot carrying
+    /// that value onward may have to be named.
+    pub(super) fn note_unwrapped(&self, callee: usize, v: &Ident) {
+        let bare = &self.ret_types[callee];
+        if bare.is_empty() {
+            return;
+        }
+        let tr = try_trait();
+        self.note_local_type(v, quote! { <#bare as #tr>::Output });
+    }
+
+    pub(super) fn is_checked(&self, idx: usize) -> bool {
+        self.resumes.borrow()[idx].checked.get()
     }
 
     pub(super) fn set_resume_code(&self, idx: usize, code: TokenStream) {
