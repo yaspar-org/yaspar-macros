@@ -44,21 +44,6 @@ pub enum In<A, F, R> {
 /// a poor bargain. One alias also gives any future change of stack one place to happen.
 pub type Frames<F> = Vec<F>;
 
-impl<A, F, R> In<A, F, R> {
-    /// The stack a loop over this input parks its frames on: empty, and of the right type.
-    ///
-    /// It takes an input it does not read because that is the whole point of it. An expansion
-    /// annotates its state with the payload types it knows, which for the ones inference fills is
-    /// `_`; a second annotation on the stack would be a second, unrelated `_`, and then a slot the
-    /// macro cannot name has nothing to be inferred from — the push that would say what it is
-    /// belongs to the other hole. Deriving the stack from the state says once, in a signature,
-    /// that the two hold the same frame.
-    #[inline(always)]
-    pub fn frames(&self) -> Frames<F> {
-        Frames::new()
-    }
-}
-
 /// What the body hands back, in the [`drive`] protocol.
 pub enum Step<A, F, R> {
     /// This computation is finished; hand the value to the frame below.

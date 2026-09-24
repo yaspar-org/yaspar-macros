@@ -15,18 +15,27 @@ use quote::{format_ident, quote};
 
 /// Bring the fixed half of an expansion into the rewritten body.
 ///
-/// One `use` rather than a fully qualified path at every mention: the expansion is what
-/// a reader debugging their own function has to read. The aliases are the `__ss` names,
-/// so nothing here can shadow an item the body already uses, and an expansion that
-/// happens not to need `Try` or `Pin` is no reason to work out which ones to leave out.
-pub(super) fn defs_imports() -> TokenStream {
-    let (input, frames, pin) = (input_ty(), frames_ty(), pin_ty());
-    let (tr, from_residual) = (try_trait(), from_residual_trait());
+/// One `use` rather than a fully qualified path at every mention: the expansion is what a reader
+/// debugging their own function has to read. The aliases are the `__ss` names, so nothing here can
+/// shadow an item the body already uses.
+///
+/// Only what `body` turns out to mention is imported: a function with no `?` has no business
+/// naming `Try`, and one that lends no value has none naming `Pin`. The loop's own two — the state
+/// and the stack — are always there.
+pub(super) fn defs_imports(body: &TokenStream) -> TokenStream {
+    let (input, frames) = (input_ty(), frames_ty());
+    let optional = [
+        (pin_ty(), quote! { Pin }),
+        (try_trait(), quote! { Try }),
+        (from_residual_trait(), quote! { FromResidual }),
+    ];
+    let used = optional.iter().filter_map(|(alias, name)| {
+        super::analyze::tokens_mention(body, alias).then(|| quote! { #name as #alias, })
+    });
     quote! {
-        #[allow(unused_imports)]
         use ::yaspar_macros_defs::{
-            Frames as #frames, FromResidual as #from_residual, In as #input, Pin as #pin,
-            Try as #tr,
+            #(#used)*
+            Frames as #frames, In as #input,
         };
     }
 }

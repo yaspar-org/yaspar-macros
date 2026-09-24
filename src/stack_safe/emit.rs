@@ -1260,7 +1260,9 @@ pub(super) fn expand_group(
         quote! { : #input_ty_name<_, #frame_named, _> }
     };
 
-    let defs_imports = defs_imports();
+    // Over everything the expansion writes that could name one of the borrowed items: the arms,
+    // and the context tuple, which is where a `Pin` store is built.
+    let defs_imports = defs_imports(&quote! { #(#arms)* #(#ctx_inits)* });
     let ret_union_decl = match &ctx.ret_union {
         None => TokenStream::new(),
         Some(union) => {
