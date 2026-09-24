@@ -8,8 +8,8 @@
 //! machine; the difference is that a transition is now the push, the pop or the `break` itself,
 //! emitted where the body arrives at it, instead of a `Step` value built to be taken apart again
 //! by a second `match` one call frame up. On a three-recursive-call-site function that is worth
-//! about 2x (see `PERFORMANCE.md`, and `ladder1_one_loop` in
-//! `examples/perf_dispatch_width.rs`, which is this shape by hand).
+//! about 2x; `ladder1_one_loop` in `examples/perf_dispatch_width.rs` is this shape by hand, and
+//! `ladder4_expansion` beside it is what this replaced.
 //!
 //! What the body is is unchanged: one `match` over [`names::input_ty`], with an arm per entry point
 //! and per resume point. What it *answers* with is the next input, so the loop is
@@ -47,17 +47,43 @@ use super::try_shim;
 /// tag it is about to switch on straight out of the `Vec` and goes round again. The empty case is
 /// the whole recursion's answer, and the only way out of the loop.
 pub(super) fn done(v: TokenStream) -> TokenStream {
-    let (frames, frame, val) = (frames_local(), frame_local(), done_local());
-    let (input, drive) = (input_ty(), drive_label());
+    let val = done_local();
+    let input = input_ty();
+    // The pop moved into the resume arm, so this is a plain construction: the state names the
+    // answer and nothing else, and whose answer it is is whatever frame is on top. The `let`
+    // stays so that the temporaries of `v` die here, where they died when this was a statement.
     quote! {
         {
             let #val = #v;
-            match #frames.pop() {
-                ::core::option::Option::None => break #drive #val,
-                ::core::option::Option::Some(#frame) => #input::Resume(#frame, #val),
-            }
+            #input::Resume(#val)
         }
     }
+}
+
+/// The one `Resume` arm: pop the frame here, and dispatch `inner` on it.
+///
+/// With the frame out of the state the pop has to happen somewhere, and this is the only place
+/// that reads it. An empty stack means the value in hand is the whole recursion's answer, so this
+/// is also the only way out of the loop — [`done`] no longer has a `break` of its own, and the
+/// emptiness is tested once per level here instead of once in every `done`.
+fn resume_shell(inner: TokenStream) -> TokenStream {
+    let (frames, frame, value) = (frames_local(), frame_local(), value_local());
+    let (input_ty, drive) = (input_ty(), drive_label());
+    quote! {
+        #input_ty::Resume(#value) => match #frames.pop() {
+            ::core::option::Option::None => break #drive #value,
+            ::core::option::Option::Some(#frame) => #inner,
+        },
+    }
+}
+
+/// One arm per frame, each doing its own carrier check, for a group the shared one does not fit.
+///
+/// `arms` read the resumed value out of [`names::value_local`], which the shell binds: it used to
+/// be a pattern in the state, and the state no longer has a slot for it.
+pub(super) fn resume_direct(arms: &[TokenStream]) -> TokenStream {
+    let frame = frame_local();
+    resume_shell(quote! { match #frame { #(#arms)* } })
 }
 
 /// Park `frame` and enter `entry`: a recursive call.
@@ -103,21 +129,21 @@ pub(super) fn call(args: TokenStream, entry: TokenStream, frame: TokenStream) ->
 /// and the only thing the lifted check costs.
 pub(super) fn resume(inner: &[TokenStream], drops: &[TokenStream]) -> TokenStream {
     let (frame, ok, res) = (frame_local(), ok_local(), res_local());
-    let (value, input_ty) = (value_local(), input_ty());
+    let value = value_local();
     let branch = try_shim::branch(quote! { #value });
     let handed_down = done(try_shim::from_residual(quote! { #res }));
     // Both ways out are the arm's *value*: binding the checked value to a `let` first and leaving
     // the turn on the error path would put a second writer back on the state, which is the one
     // thing this shape is careful not to do — and it cost the single-call-site case 2.8x.
-    quote! {
-        #input_ty::Resume(#frame, #value) => match #branch {
+    resume_shell(quote! {
+        match #branch {
             ::core::result::Result::Ok(#ok) => match #frame { #(#inner)* },
             ::core::result::Result::Err(#res) => {
                 match #frame { #(#drops)* }
                 #handed_down
             }
-        },
-    }
+        }
+    })
 }
 
 /// Enter `entry` without parking anything: one iteration of a lowered loop, whose result belongs
@@ -146,25 +172,26 @@ pub(super) fn escape(next: TokenStream) -> TokenStream {
 pub(super) fn machine(
     entry: &TokenStream,
     input_ann: &TokenStream,
+    frames_ann: &TokenStream,
     arms: &[TokenStream],
 ) -> TokenStream {
-    let (frames, frames_ty, frame) = (frames_local(), frames_ty(), frame_local());
+    let (frames, frames_ty) = (frames_local(), frames_ty());
     let (input, input_ty) = (input_local(), input_ty());
     let (drive, body) = (drive_label(), body_label());
     quote! {
         {
-            let mut #frames = #frames_ty::new();
+            // The frame's payload types are named *here* now, on the one place that holds a
+            // frame. They used to be named on the state, and a dead `push`-shaped construction
+            // had to tie the two together, because two annotations each had their own `_` holes
+            // for the slots only inference can fill and nothing said they were the same holes.
+            // With the frame carried nowhere else there is only one annotation, and the resume
+            // arm's bindings are inferred straight from it.
+            // Room for 64 levels up front. A `Vec` that grows from nothing reallocates and copies
+            // at 4, 8, 16, 32 and 64 frames, which a recursion of any depth pays on the way down;
+            // one allocation covers all of it. The price is that a call which parks nothing still
+            // allocates, where `new()` would not have.
+            let mut #frames #frames_ann = #frames_ty::with_capacity(64);
             let mut #input #input_ann = #input_ty::Enter(#entry);
-            // Never runs: nothing is parked yet. It is here to say that the stack holds the
-            // frames the state carries, which only a *construction* can say. The annotation
-            // above names the payload types the macro knows and writes `_` for the ones only
-            // inference can fill, so annotating the stack in turn would repeat those as
-            // unrelated holes — and then the frame a `push` describes and the frame a resume arm
-            // takes apart are two different types, leaving that arm's binding with nothing to be
-            // inferred from.
-            if let ::core::option::Option::Some(#frame) = #frames.pop() {
-                #input = #input_ty::Resume(#frame, ::core::unreachable!("nothing is parked yet"));
-            }
             #drive: loop {
                 #input = #body: { match #input { #(#arms)* } };
             }
