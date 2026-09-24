@@ -92,35 +92,15 @@ the stack used to hold, and let a transition table say which chunk follows which
 
 The technique of defining continuations as an enum is called **defunctionalization**, which dates back to the 70s. Each
 call site becomes a variant of a frame enum carrying the locals that are live across that call, and the code after the
-call becomes a `match` arm. The driver's stack is then a `Vec` of plain values.
+call becomes a `match` arm. The frame stack is then a `Vec` of plain values.
 
 By adding `#[stack_safe]` to the `sum` function, the program is transformed as follows. Names are shortened here, and
 the context argument that carries `&mut` parameters is omitted, since `sum` has none:
 
 ```rust
-// What the driver hands to the body.
+// The loop's state: enter the body at an entry point, or resume a parked frame with the value a
+// callee produced. Each turn of the loop answers with the next state.
 enum In<A, F, R> { Enter(A), Resume(F, R) }
-// What the body hands back to the driver.
-enum Step<A, F, R> { Done(R), Call(A, F), Tail(A) }
-
-// The driver converts recursions into loops. It is generic, i.e. it knows nothing about `sum`.
-fn drive<A, F, R>(init: A, mut body: impl FnMut(In<A, F, R>) -> Step<A, F, R>) -> R {
-    let mut stack: Vec<F> = Vec::new();            // the recursion, on the heap
-    let mut step = body(In::Enter(init));
-    loop {
-        match step {
-            Step::Tail(args) => step = body(In::Enter(args)),
-            Step::Call(args, frame) => {
-                stack.push(frame);
-                step = body(In::Enter(args));
-            }
-            Step::Done(r) => match stack.pop() {
-                None => return r,                  // the outermost call has finished
-                Some(frame) => step = body(In::Resume(frame, r)),
-            },
-        }
-    }
-}
 
 fn sum(xs: &[u64]) -> u64 {
     // One variant per entry point; here, only `sum` itself.
@@ -128,48 +108,74 @@ fn sum(xs: &[u64]) -> u64 {
     // One variant per recursive call site, carrying the locals live across it.
     enum Frame<F0> { R0(F0) }
 
-    let out: u64 = drive(Entry::E0((xs,)), |input| match input {
-        // The body, entered with the arguments of a call.
-        In::Enter(Entry::E0((xs, ))) => match xs.split_first() {
-            None => Step::Done(0),
-            Some((head, tail)) => {
-                let v0 = head;                         // the left operand of `+`
-                Step::Call(Entry::E0((tail,)), Frame::R0((v0,)))
-            }
-        },
-        // The rest of the body, resumed with the result of that call.
-        In::Resume(Frame::R0((v0, )), v1) => Step::Done(v0 + v1),
-    });
+    let out: u64 = {
+        let mut frames: Vec<Frame<_>> = Vec::new();    // the recursion, on the heap
+        let mut input = In::Enter(Entry::E0((xs,)));
+        'drive: loop {
+            input = match input {
+                // The body, entered with the arguments of a call.
+                In::Enter(Entry::E0((xs,))) => match xs.split_first() {
+                    None => match frames.pop() {
+                        None => break 'drive 0,        // the outermost call has finished
+                        Some(frame) => In::Resume(frame, 0),
+                    },
+                    Some((head, tail)) => {
+                        let v0 = head;                 // the left operand of `+`
+                        frames.push(Frame::R0((v0,))); // park what is live across the call
+                        In::Enter(Entry::E0((tail,)))  // and enter it
+                    }
+                },
+                // The rest of the body, resumed with the result of that call.
+                In::Resume(Frame::R0((v0,)), v1) => {
+                    let out = v0 + v1;
+                    match frames.pop() {
+                        None => break 'drive out,
+                        Some(frame) => In::Resume(frame, out),
+                    }
+                }
+            };
+        }
+    };
     out
 }
 ```
 
-Everything lives inside the original `fn sum`, so neither its signature nor its call sites change. `In`, `Step` and
-`drive` are shown inline here to keep the example readable. A real expansion imports them from `yaspar-macros-defs`,
-since they are the same for every function. Only the entry and frame enums are nested items, i.e. the halves that vary
-per function. `out` is simply the value that the driver returns, i.e. the value that `sum` returns.
+Everything lives inside the original `fn sum`, so neither its signature nor its call sites change. `In` is shown inline
+here to keep the example readable; a real expansion imports it from `yaspar-macros-defs`, since it is the same for every
+function. Only the entry and frame enums are nested items, i.e. the halves that vary per function. `out` is the value the
+loop breaks with, i.e. the value that `sum` returns.
 
-Note that the closure captures nothing. Every value it needs arrives either in an entry payload, e.g. `xs`, or in a
-frame payload, e.g. `v0`. This is precisely why the recursion can live in a `Vec` on the heap.
+Note that no arm reads a local of the function. Every value an arm needs arrives either in an entry payload, e.g. `xs`,
+or in a frame payload, e.g. `v0`. This is precisely why the recursion can live in a `Vec` on the heap.
 
-We can read the arms against the original. `None => 0` becomes `Done(0)`, and `head + sum(tail)` becomes two arms: the
-`Call` says to evaluate the tail and to remember `head` as `v0`, and the `Resume` arm adds `v0` to the result once it
-arrives. `head` travels in the frame because it is the only local live across the call, i.e. exactly what a stack frame
-would have held. The `Tail` variant is unused here, since `sum` contains no loop.
+Each arm *answers* with the next state rather than assigning it and jumping back to the top. That is not cosmetic: the
+state is as wide as a frame plus a return value, and one writer is what keeps it in registers instead of being copied
+between stack slots. It is worth about 1.7x — see `PERFORMANCE.md`.
 
-Note also that `head` is hoisted into `v0` before the `Call` rather than read after it. Rust evaluates operands left to
-right, and the cut falls at the recursive call: whatever is left of the cut runs before the `Call` step with its value
+We can read the arms against the original. `None => 0` hands `0` to the frame below, or answers with it if there is none;
+`head + sum(tail)` becomes two arms: the first parks `head` as `v0` and enters the tail, and the `Resume` arm adds `v0`
+to the result once it arrives. `head` travels in the frame because it is the only local live across the call, i.e.
+exactly what a stack frame would have held. A loop in the body would add a third kind of transition — re-entering at the
+loop's own entry point without parking anything — which `sum` has no need of.
+
+Note also that `head` is hoisted into `v0` before the frame is parked rather than read after it. Rust evaluates operands
+left to right, and the cut falls at the recursive call: whatever is left of the cut runs before the call, with its value
 travelling in the frame, and whatever is right of it lands in the `Resume` arm and runs once the result arrives.
 
 For example, `f(a(), sum(n - 1), b())` is transformed into two arms:
 
 ```rust
 In::Enter(Entry::E0((n,))) => {
-let v0 = a();                                     // left of the cut, so it runs before the call
-Step::Call(Entry::E0((n - 1,)), Frame::R0((v0,)))
+    let v0 = a();                                 // left of the cut, so it runs before the call
+    frames.push(Frame::R0((v0,)));
+    In::Enter(Entry::E0((n - 1,)))
 }
-In::Resume(Frame::R0((v0,)), v1) => Step::Done(f(v0, v1, b())),   // right of the cut, so it runs after
+// right of the cut, so it runs once the result arrives
+In::Resume(Frame::R0((v0,)), v1) => done(f(v0, v1, b())),
 ```
+
+`done(v)` is shorthand, here and below, for the transition spelled out in full above: pop a frame and resume it with `v`,
+or break the loop with `v` if there is none.
 
 `a()` cannot be left in the `Resume` arm, where it would run after the recursion, and it cannot be evaluated twice
 either, since it may have side effects — so its value is what travels. If `a` and `b` print their names, `sum(2)` prints
@@ -251,14 +257,14 @@ Every member of a cycle receives its own entry variant, and all of them are comp
 ```rust
 enum Entry<A0, A1> { E0(A0), E1(A1) }         // `E0` is `is_even`, and `E1` is `is_odd`
 
-In::Enter(Entry::E0((n,))) => if n == 0 { Step::Done(true) }
-else { Step::Call(Entry::E1((n - 1, )), Frame::R0(())) },
-In::Enter(Entry::E1((n,))) => if n == 0 { Step::Done(false) }
-else { Step::Call(Entry::E0((n - 1, )), Frame::R1(())) },
+In::Enter(Entry::E0((n,))) => if n == 0 { done(true) }
+else { frames.push(Frame::R0(())); In::Enter(Entry::E1((n - 1,))) },
+In::Enter(Entry::E1((n,))) => if n == 0 { done(false) }
+else { frames.push(Frame::R1(())); In::Enter(Entry::E0((n - 1,))) },
 ```
 
-A call from one member into another is therefore just another step of the driver, and the two functions differ only in
-which entry the driver is seeded with, `E0` for `is_even` and `E1` for `is_odd`. Note that such a call still parks a
+A call from one member into another is therefore just another turn of the loop, and the two functions differ only in
+which entry the loop is seeded with, `E0` for `is_even` and `E1` for `is_odd`. Note that such a call still parks a
 frame, i.e. it is not turned into a tail call, but that frame lives in the `Vec` instead of on the native stack, which
 is exactly the point.
 
@@ -417,11 +423,11 @@ fn rec(n: usize, stack: &Stack<'_, Vec<usize>>) -> usize {
 ```
 
 Natively the new node is a temporary of the caller, and the caller's frame outlives the call, so the callee can borrow
-it. The CPS transformation takes that frame away: a recursive call becomes a `Step::Call` handed back to the driver, so
-the arm that built the node has already returned before the callee's arm runs. Hence the flag, without which we get an
+it. The CPS transformation takes that frame away: a recursive call becomes a frame parked on the heap and a jump back to
+the top of the loop, so the arm that built the node has already returned before the callee's arm runs. Hence the flag, without which we get an
 error saying so rather than an `E0515` blamed on the attribute.
 
-Under the flag the node lives in a store the driver owns. The callee is given an *address*, which has to be valid at two
+Under the flag the node lives in a store the loop owns. The callee is given an *address*, which has to be valid at two
 moments the frame cannot cover: while the arm still runs, since the entry carrying it must be complete before the arm
 returns; and for the whole subtree of the callee, which pushes frames of its own and so moves the `Vec` that holds them.
 The store answers both. It exists before the arm runs, so pushing hands back an address at once, and its chunks are

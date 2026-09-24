@@ -612,7 +612,11 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
                     let ann = if ctx.member(callee).pinned[j].get() {
                         TokenStream::new()
                     } else {
-                        ctx.member(callee).param_types.get(j).cloned().unwrap_or_default()
+                        ctx.member(callee)
+                            .param_types
+                            .get(j)
+                            .cloned()
+                            .unwrap_or_default()
                     };
                     quote! { let #tmp #ann = #val; }
                 });

@@ -19,27 +19,28 @@
 //! sites. So any difference between the rows is the width of the dispatch and nothing
 //! else.
 //!
-//! What it showed when it was written, on an M-series Mac:
+//! What it shows, on an M-series Mac, beside what it showed when the expansion handed a
+//! closure to `drive` and answered with `Step` — the shape `ladder4_expansion` still is:
 //!
 //! ```text
-//! call sites   depth 4   depth 1024
-//!          1     0.37x        0.16x
-//!          3     3.65x        2.11x
-//!          5     2.93x        2.14x
-//!          9     2.45x        1.87x
+//! call sites   depth 1024   was
+//!          1        0.65x   0.18x
+//!          3        0.77x   1.86x
+//!          5        0.80x   1.74x
+//!          9        0.66x   1.46x
 //! ```
 //!
-//! At one call site the frame enum has one variant, the machine collapses into a loop,
-//! and it beats native recursion several times over — native pays a large stack frame
-//! per level where the machine pays a `Vec` push. From three call sites up, a resume is
-//! a switch on a tag read out of that `Vec`, where native recursion had a static
-//! fall-through edge, and the transform costs 2–4x rather than saving.
+//! The machine now beats native recursion at every width: native pays a large stack frame
+//! per level where the machine pays a `Vec` push. The old shape's cliff between one call
+//! site and three — where a resume became a switch on a tag read out of the `Vec`, against
+//! native's static fall-through edge — is gone, and the rows are within noise of each other.
+//! One call site *regressed*: it used to collapse into something extraordinary and now merely
+//! does well, which was traded deliberately for the rows that a real recursion sits in.
 //!
-//! The step from one call site to three is the whole finding; the ordering *among* the
-//! wider rows is inside the noise and means nothing. This is a guard, not a target, and
-//! the absolute figures move with the machine and the toolchain. What a regression looks
-//! like is the shape changing: the one-call-site row losing its large win, or the wider
-//! rows drifting well past the figures above.
+//! This is a guard, not a target, and the absolute figures move with the machine and the
+//! toolchain. What a regression looks like is a row drifting back above 1x, or the ladder
+//! below losing its ordering. See `PERFORMANCE.md` for what each rung is worth and for the
+//! discipline these numbers demand — in particular, that only figures from one run compare.
 
 use std::hint::black_box;
 use std::sync::Arc;
@@ -565,7 +566,8 @@ fn ladder4b_try(root: &E) -> R {
 }
 
 /// L4: L3 with the body handed to `drive` as a closure, and the residual routed through
-/// `Try`/`FromResidual`. This is the expansion, written out.
+/// `Try`/`FromResidual`. This is what the expansion *was*, written out: the rung the current
+/// one is measured against. `ladder1_one_loop` above is what it is now, near enough.
 fn ladder4_expansion(root: &E) -> R {
     use yaspar_macros_defs::{drive, FromResidual, In, Step, Try};
     drive(
@@ -645,7 +647,7 @@ fn main() {
             ("L3b transition above arms   ", time(|| { black_box(ladder3b_transition_first(black_box(&e))).ok(); }, iters)),
             ("L4a + closure/drive only    ", time(|| { black_box(ladder4a_closure(black_box(&e))).ok(); }, iters)),
             ("L4b + Try only              ", time(|| { black_box(ladder4b_try(black_box(&e))).ok(); }, iters)),
-            ("L4 + both (= the expansion) ", time(|| { black_box(ladder4_expansion(black_box(&e))).ok(); }, iters)),
+            ("L4 + both (= old expansion)  ", time(|| { black_box(ladder4_expansion(black_box(&e))).ok(); }, iters)),
         ] {
             println!("   {name} {ns:8.0} ns  {:5.2}x native", ns / base);
         }

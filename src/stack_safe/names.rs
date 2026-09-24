@@ -29,9 +29,10 @@ pub(super) fn defs_imports(body: &TokenStream) -> TokenStream {
         (try_trait(), quote! { Try }),
         (from_residual_trait(), quote! { FromResidual }),
     ];
-    let used = optional.iter().filter_map(|(alias, name)| {
-        super::analyze::tokens_mention(body, alias).then(|| quote! { #name as #alias, })
-    });
+    let used = optional
+        .iter()
+        .filter(|(alias, _)| super::analyze::tokens_mention(body, alias))
+        .map(|(alias, name)| quote! { #name as #alias, });
     quote! {
         use ::yaspar_macros_defs::{
             #(#used)*
