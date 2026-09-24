@@ -161,6 +161,14 @@ fn hoist_place(ctx: &Ctx, place: &Expr) -> (Vec<TokenStream>, Expr) {
                 // Children first, so nested projections hoist in evaluation order.
                 Expr::Index(i) => {
                     self.visit_expr_mut(&mut i.expr);
+                    // A base that *runs* something — `node.select(..)[i]` — has to run before the
+                    // index, which is the order the source has. Leaving it in the place would run
+                    // it after, since the place is what evaluation is deferred to. A base that
+                    // only projects (`self.kids[i]`) is left alone: it is part of the place, and
+                    // hoisting it would take a reference where the source took none.
+                    if matches!(&*i.expr, Expr::MethodCall(_) | Expr::Call(_)) {
+                        self.take(&mut i.expr);
+                    }
                     self.take(&mut i.index);
                 }
                 Expr::MethodCall(m) => {
@@ -965,10 +973,27 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
             cps_seq(ctx, env, &elems, Vec::new(), &|v| k(quote! { [#(#v),*] }))
         }
         Expr::Call(call) => {
-            let func = &call.func;
             let args: Vec<&Expr> = call.args.iter().collect();
-            cps_seq(ctx, env, &args, Vec::new(), &|v| {
-                k(quote! { #func(#(#v),*) })
+            // Rust evaluates the callable *before* the arguments, so a computed one has to be
+            // sequenced first: left in place it would run after the recursion, and
+            // `choose(calls)(rec(..))` would pick its callee with the counter the recursion left
+            // behind. `cps_seq` binds it for us, since a later operand recurses.
+            //
+            // A path callee stays where it is. It has no side effects to order, and binding it
+            // would turn a function *item* into a value — which changes what inference has to work
+            // from, and can fail outright for a generic one.
+            if matches!(&*call.func, Expr::Path(_)) {
+                let func = &call.func;
+                return cps_seq(ctx, env, &args, Vec::new(), &|v| {
+                    k(quote! { #func(#(#v),*) })
+                });
+            }
+            let mut parts: Vec<&Expr> = Vec::with_capacity(args.len() + 1);
+            parts.push(&call.func);
+            parts.extend(args);
+            cps_seq(ctx, env, &parts, Vec::new(), &|v| {
+                let (func, args) = v.split_first().expect("the callee was pushed first");
+                k(quote! { (#func)(#(#args),*) })
             })
         }
         Expr::MethodCall(mc) => {
@@ -1340,6 +1365,28 @@ fn project_from(place: &Expr, root: &Ident, owned: &Ident) -> Expr {
         owned: &'a Ident,
     }
 
+    impl V<'_> {
+        /// Does this rebind the root, so that the paths under it name something else?
+        ///
+        /// The place is rewritten by name, and a name is only the root's until something else
+        /// claims it. A block that declares its own `bag` — as an index expression may —  makes
+        /// every mention inside it a mention of *that* one, and rewriting those to the stored root
+        /// silently read the wrong value.
+        fn rebinds_root(&self, e: &Expr) -> bool {
+            match e {
+                Expr::Block(b) => b.block.stmts.iter().any(|s| match s {
+                    Stmt::Local(l) => pat_bindings(&l.pat).iter().any(|b| b == self.root),
+                    _ => false,
+                }),
+                Expr::Closure(c) => c
+                    .inputs
+                    .iter()
+                    .any(|p| pat_bindings(p).iter().any(|b| b == self.root)),
+                _ => false,
+            }
+        }
+    }
+
     impl VisitMut for V<'_> {
         fn visit_expr_mut(&mut self, e: &mut Expr) {
             if let Expr::Path(p) = &*e
@@ -1348,6 +1395,9 @@ fn project_from(place: &Expr, root: &Ident, owned: &Ident) -> Expr {
             {
                 let owned = self.owned;
                 *e = parse_quote! { #owned };
+                return;
+            }
+            if self.rebinds_root(e) {
                 return;
             }
             syn::visit_mut::visit_expr_mut(self, e);

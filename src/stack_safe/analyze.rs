@@ -141,6 +141,17 @@ pub(super) fn desugar_receiver(
         block: parse_quote! { { Self::#inner(self #(, #forwarded)*) } },
     };
     outer.attrs.push(parse_quote! { #[inline] });
+    // `#[track_caller]` has to hold all the way down, not just on the item the caller sees:
+    // `Location::caller()` runs in the transformed body, and an untracked frame anywhere between
+    // reports *that* frame instead of the caller's. So the wrapper keeps it and the body gets its
+    // own copy; `emit` puts one on a shared machine for the same reason.
+    if outer
+        .attrs
+        .iter()
+        .any(|a| a.path().is_ident("track_caller"))
+    {
+        func.attrs.push(parse_quote! { #[track_caller] });
+    }
     func.vis = syn::Visibility::Inherited;
 
     // The receiver is now the first ordinary parameter.
@@ -534,13 +545,197 @@ pub(super) fn scan_context_args(ctx: &Ctx, block: &Block) -> syn::Result<()> {
     }
 }
 
+/// A binding that shadows an outer one which is read again *after* the shadow.
+///
+/// A frame's payload is chosen and rebuilt by *name*: the transform records the names in scope at a
+/// call and carries the ones the continuation mentions. Two bindings of one name are therefore one
+/// slot, and the slot holds the inner one — so where the source left the inner scope and went back
+/// to the outer binding, the resumed code would still read the inner value.
+///
+/// Three things have to hold, and the third is what keeps this from refusing ordinary code.
+/// Shadowing has to be *inside* a nested block: a `let x` at the top of the body shadows for the
+/// rest of it, which is what the payload does too. The block has to *recurse*, or the code after is
+/// not cut into another arm at all. And the outer binding has to be read *after* that block, since
+/// only then do the two ever have to be told apart — which is the whole of `let item = item + 1`
+/// inside a loop, the idiom that must keep working.
+///
+/// "After the block" is found by walking the body in order and counting only what follows the
+/// shadowing block, wherever it sits. That covers both the later statements and the rest of the
+/// *same* statement — `{ let x = ..; rec(); x } + x` diverges as plainly as the statement-level
+/// shape does — while a mention *before* the block, or the pattern that binds the outer name in the
+/// first place, is not a read the inner slot could answer and does not count.
+/// Is `name` mentioned anywhere in `body` *after* the block `at`, without descending into it?
+///
+/// The walk is in source order, so "after" is what follows once `at` has been passed — later
+/// statements of any enclosing block, and the rest of the statement `at` sits in. Mentions inside
+/// `at` are the inner binding's own and are skipped with it; mentions before it read the outer
+/// binding at a point no payload has reached yet.
+fn read_after_block(body: &Block, at: &Block, name: &Ident) -> bool {
+    struct V<'a> {
+        at: *const Block,
+        name: &'a Ident,
+        passed: bool,
+        found: bool,
+    }
+
+    impl<'ast> Visit<'ast> for V<'_> {
+        fn visit_block(&mut self, b: &'ast Block) {
+            if std::ptr::eq(b, self.at) {
+                self.passed = true;
+                return;
+            }
+            syn::visit::visit_block(self, b);
+        }
+
+        fn visit_ident(&mut self, i: &'ast Ident) {
+            if self.passed && i == self.name {
+                self.found = true;
+            }
+        }
+    }
+
+    let mut v = V {
+        at: std::ptr::from_ref(at),
+        name,
+        passed: false,
+        found: false,
+    };
+    v.visit_block(body);
+    v.found
+}
+
+pub(super) fn reject_shadowed_across_a_call(ctx: &Ctx, func: &ItemFn) -> syn::Result<()> {
+    struct W<'a> {
+        ctx: &'a Ctx,
+        /// One set of names per scope: the parameters, then the body, then each block inside it.
+        scopes: Vec<Vec<Ident>>,
+        /// The body being walked, so that a candidate can be checked against everything that
+        /// follows the block it was found in.
+        body: &'a Block,
+        err: Option<syn::Error>,
+    }
+
+    impl W<'_> {
+        fn check(&mut self, pat: &Pat, recurses: bool, block: &Block) {
+            if !recurses || self.scopes.len() <= 2 || self.err.is_some() {
+                return;
+            }
+            for name in pat_bindings(pat) {
+                let outer = self.scopes[..self.scopes.len() - 1]
+                    .iter()
+                    .any(|s| s.iter().any(|n| n == &name));
+                if outer && read_after_block(self.body, block, &name) {
+                    self.err = Some(syn::Error::new(
+                        name.span(),
+                        format!(
+                            "`{name}` shadows a binding of the same name outside this block, the \
+                             block recurses, and the outer one is read again afterwards. \
+                             `#[stack_safe]` parks the locals that are live across a recursive call \
+                             by *name*, so the two are one slot: the code that resumes would read \
+                             this binding where the source had gone back to the outer one. Rename \
+                             one of them",
+                        ),
+                    ));
+                    return;
+                }
+            }
+        }
+
+        fn bind(&mut self, pat: &Pat) {
+            if let Some(scope) = self.scopes.last_mut() {
+                scope.extend(pat_bindings(pat));
+            }
+        }
+
+        fn block(&mut self, b: &Block) {
+            let recurses = b.stmts.iter().any(|s| stmt_contains_rec(self.ctx, s));
+            self.scopes.push(Vec::new());
+            for stmt in &b.stmts {
+                if let Stmt::Local(l) = stmt {
+                    self.check(&l.pat, recurses, b);
+                    self.bind(&l.pat);
+                }
+                self.walk_stmt(stmt);
+            }
+            self.scopes.pop();
+        }
+
+        /// Down into whatever blocks a statement holds, keeping the scope stack honest for the
+        /// bindings a `for`, a `match` arm or a closure introduces around one.
+        fn walk_stmt(&mut self, stmt: &Stmt) {
+            struct V<'a, 'b>(&'a mut W<'b>);
+
+            impl<'ast> Visit<'ast> for V<'_, '_> {
+                fn visit_block(&mut self, b: &'ast Block) {
+                    self.0.block(b);
+                }
+
+                fn visit_arm(&mut self, a: &'ast syn::Arm) {
+                    self.0.scopes.push(Vec::new());
+                    self.0.bind(&a.pat);
+                    syn::visit::visit_arm(self, a);
+                    self.0.scopes.pop();
+                }
+
+                fn visit_expr_for_loop(&mut self, f: &'ast syn::ExprForLoop) {
+                    self.visit_expr(&f.expr);
+                    self.0.scopes.push(Vec::new());
+                    self.0.bind(&f.pat);
+                    self.0.block(&f.body);
+                    self.0.scopes.pop();
+                }
+
+                fn visit_expr_closure(&mut self, c: &'ast syn::ExprClosure) {
+                    self.0.scopes.push(Vec::new());
+                    for input in &c.inputs {
+                        self.0.bind(input);
+                    }
+                    self.visit_expr(&c.body);
+                    self.0.scopes.pop();
+                }
+
+                fn visit_item(&mut self, _: &'ast syn::Item) {}
+            }
+
+            V(self).visit_stmt(stmt);
+        }
+    }
+
+    let params = func
+        .sig
+        .inputs
+        .iter()
+        .filter_map(|a| match a {
+            syn::FnArg::Typed(pt) => match &*pt.pat {
+                Pat::Ident(p) => Some(p.ident.clone()),
+                _ => None,
+            },
+            syn::FnArg::Receiver(_) => None,
+        })
+        .collect();
+    let mut w = W {
+        ctx,
+        body: &func.block,
+        scopes: vec![params],
+        err: None,
+    };
+    w.block(&func.block);
+    match w.err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
 
-pub(super) fn validate(ctx: &Ctx, block: &Block) -> syn::Result<()> {
+pub(super) fn validate(ctx: &Ctx, func: &ItemFn) -> syn::Result<()> {
     struct V<'a> {
         ctx: &'a Ctx,
+        /// The enclosing function's own generic parameters, by name. A turbofish on a recursive
+        /// call may restate these and nothing else; see `check_generic_args`.
+        own_generics: Vec<String>,
         err: Option<syn::Error>,
     }
 
@@ -548,6 +743,116 @@ pub(super) fn validate(ctx: &Ctx, block: &Block) -> syn::Result<()> {
         fn fail(&mut self, span: Span, msg: &str) {
             if self.err.is_none() {
                 self.err = Some(syn::Error::new(span, msg));
+            }
+        }
+
+        /// Explicit generic arguments on a recursive call.
+        ///
+        /// The rewritten body is one loop, compiled for the instantiation it was entered at, and a
+        /// transition re-enters *that* body. So `f::<A>` calling `f::<B>` is a call to a different
+        /// function, which the transform cannot make: it would silently run the caller's
+        /// instantiation instead. A turbofish that merely restates the enclosing function's own
+        /// parameters names the same instantiation and is fine.
+        fn check_generic_args(&mut self, call: &syn::ExprCall) {
+            let Expr::Path(p) = &*call.func else { return };
+            let Some(seg) = p.path.segments.last() else {
+                return;
+            };
+            let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+                return;
+            };
+            let restates_own = args.args.iter().all(|a| match a {
+                // A lifetime argument cannot change which instantiation runs.
+                syn::GenericArgument::Lifetime(_) => true,
+                syn::GenericArgument::Type(syn::Type::Path(t)) => t
+                    .path
+                    .get_ident()
+                    .is_some_and(|id| self.own_generics.iter().any(|g| g == &id.to_string())),
+                syn::GenericArgument::Const(Expr::Path(c)) => c
+                    .path
+                    .get_ident()
+                    .is_some_and(|id| self.own_generics.iter().any(|g| g == &id.to_string())),
+                _ => false,
+            });
+            if !restates_own {
+                self.fail(
+                    args.span(),
+                    &format!(
+                        "`#[stack_safe]` does not support explicit generic arguments on a \
+                         recursive call: the rewritten body is one loop, compiled for the \
+                         instantiation it was entered at, and a recursive call re-enters that same \
+                         loop. `{}::<..>` with arguments of its own is a call to a *different* \
+                         function, which no transition can reach — it would silently run the \
+                         caller's instantiation. Give the enclosing function's own parameters, or \
+                         move the differently instantiated call into a function of its own and \
+                         call that",
+                        seg.ident,
+                    ),
+                );
+            }
+        }
+
+        /// A binding whose name is a member's.
+        ///
+        /// A call is recognised by name — a macro resolves no paths — so a value binding that
+        /// shadows the function cannot be told apart from a call to it. Left alone, the shadowed
+        /// call is rewritten into a recursion, which is a wrong answer with no diagnostic.
+        fn check_shadowing(&mut self, pat: &Pat) {
+            for bound in pat_bindings(pat) {
+                if self.ctx.index_of(&bound).is_some() {
+                    self.fail(
+                        bound.span(),
+                        &format!(
+                            "`{bound}` is the name of a function `#[stack_safe]` is rewriting, and \
+                             this binding shadows it. Calls are recognised by name, since a macro \
+                             resolves no paths, so a call to this binding would be rewritten into a \
+                             recursion instead. Rename the binding",
+                        ),
+                    );
+                    return;
+                }
+            }
+        }
+
+        /// An item declared in a block that goes on to recurse.
+        ///
+        /// The code after a recursive call becomes a separate arm of the driver's `match`, and an
+        /// item declared in a *block* cannot travel there: continuation state carries values, not
+        /// declarations. The name would resolve to whatever the enclosing scope has instead — an
+        /// outer `const` of the same name, say. A body's own top-level items are fine: those are
+        /// moved out to one place that encloses every arm.
+        fn check_block_items(&mut self, block: &Block) {
+            let mut seen: Option<Span> = None;
+            for stmt in &block.stmts {
+                if let Stmt::Item(item) = stmt {
+                    // A member declared in a block is not at risk: it is moved into the driver,
+                    // where every arm can reach it. Nor is anything the transform itself put
+                    // there — a member already lifted out leaves tokens behind, which is what
+                    // `Verbatim` is here. Anything else stays where it was emitted, and the code
+                    // after a call is emitted somewhere else.
+                    let ours = match item {
+                        syn::Item::Fn(f) => self.ctx.index_of(&f.sig.ident).is_some(),
+                        syn::Item::Verbatim(_) | syn::Item::Macro(_) => true,
+                        _ => false,
+                    };
+                    if !ours {
+                        seen = Some(item.span());
+                    }
+                    continue;
+                }
+                if let Some(at) = seen
+                    && stmt_contains_rec(self.ctx, stmt)
+                {
+                    self.fail(
+                        at,
+                        "`#[stack_safe]` cannot keep this item in scope: the block declares it and \
+                         then recurses, and the code after a recursive call becomes a separate arm \
+                         of one `match`, which carries values but not declarations — the name would \
+                         resolve to whatever encloses the function instead. Move the item out to \
+                         the function's own body, whose items are moved out with it",
+                    );
+                    return;
+                }
             }
         }
 
@@ -572,6 +877,7 @@ pub(super) fn validate(ctx: &Ctx, block: &Block) -> syn::Result<()> {
         fn visit_expr(&mut self, e: &'ast Expr) {
             if let Some((callee, call)) = self.ctx.rec_call(e) {
                 let p = self.ctx.member(callee);
+                self.check_generic_args(call);
                 if call.args.len() != p.arity {
                     self.fail(
                         e.span(),
@@ -587,6 +893,11 @@ pub(super) fn validate(ctx: &Ctx, block: &Block) -> syn::Result<()> {
                     self.visit_expr(a);
                 }
                 return;
+            }
+            if let Expr::Closure(c) = e {
+                for input in &c.inputs {
+                    self.check_shadowing(input);
+                }
             }
             if let Expr::Path(path) = e
                 && path.qself.is_none()
@@ -619,11 +930,45 @@ pub(super) fn validate(ctx: &Ctx, block: &Block) -> syn::Result<()> {
             self.check_macro(&m.mac, m.span());
         }
 
+        fn visit_local(&mut self, l: &'ast syn::Local) {
+            self.check_shadowing(&l.pat);
+            syn::visit::visit_local(self, l);
+        }
+
+        fn visit_arm(&mut self, a: &'ast syn::Arm) {
+            self.check_shadowing(&a.pat);
+            syn::visit::visit_arm(self, a);
+        }
+
+        fn visit_block(&mut self, b: &'ast Block) {
+            self.check_block_items(b);
+            syn::visit::visit_block(self, b);
+        }
+
         fn visit_item(&mut self, _: &'ast syn::Item) {}
     }
 
-    let mut v = V { ctx, err: None };
-    v.visit_block(block);
+    let own_generics = func
+        .sig
+        .generics
+        .params
+        .iter()
+        .filter_map(|p| match p {
+            syn::GenericParam::Type(t) => Some(t.ident.to_string()),
+            syn::GenericParam::Const(c) => Some(c.ident.to_string()),
+            syn::GenericParam::Lifetime(_) => None,
+        })
+        .collect();
+    let mut v = V {
+        ctx,
+        own_generics,
+        err: None,
+    };
+    // The body's own top-level items are moved out to enclose every arm, so only the blocks
+    // *inside* it are checked for a declaration a continuation would lose.
+    for stmt in &func.block.stmts {
+        v.visit_stmt(stmt);
+    }
     match v.err {
         Some(e) => Err(e),
         None => Ok(()),

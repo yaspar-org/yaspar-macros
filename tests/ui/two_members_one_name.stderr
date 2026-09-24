@@ -1,0 +1,5 @@
+error: `f` is declared twice among the functions `#[stack_safe]` rewrites together. A recursive call is recognised by name, since a macro resolves no paths, so the two cannot be told apart and calls to either would enter the same body. Rename one of them
+ --> tests/ui/two_members_one_name.rs:9:12
+  |
+9 |         fn f(_: u8) -> u8 {
+  |            ^

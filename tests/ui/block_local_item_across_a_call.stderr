@@ -1,0 +1,5 @@
+error: `#[stack_safe]` cannot keep this item in scope: the block declares it and then recurses, and the code after a recursive call becomes a separate arm of one `match`, which carries values but not declarations — the name would resolve to whatever encloses the function instead. Move the item out to the function's own body, whose items are moved out with it
+  --> tests/ui/block_local_item_across_a_call.rs:13:9
+   |
+13 |         const X: u8 = 1;
+   |         ^^^^^

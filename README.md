@@ -650,6 +650,79 @@ cargo run --example overflow_contrast -- safe        # 500001
 cargo run --example overflow_contrast -- naive       # fatal runtime error: stack overflow
 ```
 
+### Where the transform differs from ordinary recursion
+
+The rewritten function is meant to compute what the recursive one computed, and the suite compares
+the two on everything it can reach. Differential testing found nine shapes where they can still
+disagree. Each is a test in `tests/adversarial.rs` that runs with the rest of the suite and pins
+*both* answers, so a fix fails there and says so, and no further drift goes unnoticed:
+
+```text
+cargo test --test adversarial
+```
+
+They are here rather than rejected because rejecting them would refuse ordinary code. The transform
+sees no types — a proc macro cannot — and in each case the shape that misbehaves is written exactly
+like the shape that works, the difference lying in a type. Where a shape *can* be told apart, the
+macro rejects it instead; `tests/ui/` holds those.
+
+**A method call whose receiver is a place, with a recursive call among its arguments.** Rust reads
+the receiver place before the arguments run. The transform keeps it as a place and reads it after,
+so three things can differ: a by-value `self` copies out of the place at the wrong time
+(`value[0].plus(recurse(..))` sees what the recursion wrote); a user `Deref` on a path receiver
+resolves late (`s.plus(recurse(..))` where `s: &Switch` derefs to a different `V` than it would
+have); and an overloaded `Index` runs late. A borrowed `self` over a plain binding — which is nearly
+every method call — is unaffected. **Hoist the call:** `let v = recurse(..); value[0].plus(v)`.
+
+Nothing distinguishes these from `cs[0].bump(recurse(..))`, which is correct and is tested as such:
+only the method's `self` kind does, and that is a type.
+
+**A coercion on a *later* argument's neighbour.** `consume(s, recurse(..))` hoists `s` into a
+temporary to keep the evaluation order, and the temporary is untyped — the callee's parameter types
+are not the macro's to know — so an expected `&V` deref of a `&Switch` happens in the reconstructed
+call rather than before the recursion. **Hoist the call**, as above.
+
+**A same-named method on an unrelated receiver.** Inside `#[stack_safe] impl T`, every `.g(..)` whose
+name is a member's is read as a call into the cycle, whatever the receiver. That is what makes
+recursion down a structure work — `tail.len()` recursing on another `&Self` is supported and
+tested — and it is why `other.g(..)` for an unrelated `other` that happens to have a `g`, reachable
+by `Deref`, is also rewritten. **Call the unrelated one through its type:** `Other::g(&other, ..)`,
+which the transform leaves alone.
+
+**Source locations, inside the rewritten body.** Anything that asks where it is reports the
+`#[stack_safe]` attribute's line rather than its own, because the body is now inside a macro
+expansion. This is not something the transform chooses, and it holds even for code the transform
+does not touch:
+
+```rust
+#[stack_safe]                       // line 1
+fn f(n: u64) -> u32 {
+    if n == 0 { return line!(); }   // line 3 — reports 1, not 3
+    f(n - 1)
+}
+```
+
+So `line!()`, `column!()`, `file!()`, a `panic!` or `assert!` location, and `Location::caller()` in
+anything the body calls all name the attribute. Two visible consequences: a lowered `for` reports the
+attribute's line to a `#[track_caller]` `IntoIterator::into_iter` or `Iterator::next`, and `?` reaches
+a `#[track_caller] From::from` through the stable `Try` shim, which reports a line inside
+`yaspar-macros-defs`.
+
+A `#[track_caller]` function that is *itself* rewritten is fine: the attribute is carried onto every
+generated frame, so the location reported is the external call site, which is outside the expansion.
+
+**Addresses, under the two opt-in options.** `#[stack_safe(data_in_frame)]` lends a callee a value
+by moving it into a store the loop owns, so the value does not sit where a native caller's frame
+would have put it: a program comparing `ptr::from_ref` across the call sees it move. Likewise
+`#[stack_safe(use_nonlinear_mut)]` re-derives a `&mut` parameter in the arm that resumes, so the
+*binding's* address differs. Both are what those options do rather than accidents, and neither
+dereferences anything the transform has not kept alive — see the invariants above.
+
+**An annotated module's re-export.** `#[stack_safe] mod m` re-exports `m`'s public functions beside
+it, so callers need not name the module. An explicit `use` outranks a glob one, so an unqualified
+`f(..)` that used to resolve through `use other::*` resolves to `m::f` after the attribute is added.
+**Name the one you mean:** `other::f(..)`.
+
 ## Trait Delegation and Object Orientation
 
 ### Reuse without Inheritance

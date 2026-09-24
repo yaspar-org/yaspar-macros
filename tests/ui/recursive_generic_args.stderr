@@ -1,0 +1,5 @@
+error: `#[stack_safe]` does not support explicit generic arguments on a recursive call: the rewritten body is one loop, compiled for the instantiation it was entered at, and a recursive call re-enters that same loop. `f::<..>` with arguments of its own is a call to a *different* function, which no transition can reach — it would silently run the caller's instantiation. Give the enclosing function's own parameters, or move the differently instantiated call into a function of its own and call that
+  --> tests/ui/recursive_generic_args.rs:10:29
+   |
+10 |     if n == 0 { N } else { f::<7>(n - 1) }
+   |                             ^
