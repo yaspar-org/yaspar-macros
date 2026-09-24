@@ -20,25 +20,19 @@ use quote::{format_ident, quote};
 /// so nothing here can shadow an item the body already uses, and an expansion that
 /// happens not to need `Try` or `Pin` is no reason to work out which ones to leave out.
 pub(super) fn defs_imports() -> TokenStream {
-    let (step, input, drive, pin) = (step_ty(), input_ty(), drive_fn(), pin_ty());
+    let (input, frames, pin) = (input_ty(), frames_ty(), pin_ty());
     let (tr, from_residual) = (try_trait(), from_residual_trait());
     quote! {
         #[allow(unused_imports)]
         use ::yaspar_macros_defs::{
-            FromResidual as #from_residual, In as #input, Pin as #pin, Step as #step,
-            Try as #tr, drive as #drive,
+            Frames as #frames, FromResidual as #from_residual, In as #input, Pin as #pin,
+            Try as #tr,
         };
     }
 }
 
-pub(super) fn step_ty() -> Ident {
-    format_ident!("__SsStep")
-}
 pub(super) fn entry_ty() -> Ident {
     format_ident!("__SsEntry")
-}
-pub(super) fn drive_fn() -> Ident {
-    format_ident!("__ss_drive")
 }
 pub(super) fn entry_variant(n: usize) -> Ident {
     format_ident!("E{}", n)
@@ -65,10 +59,38 @@ pub(super) fn pinned_param(n: usize) -> Ident {
 pub(super) fn frame_ty() -> Ident {
     format_ident!("__SsFrame")
 }
-/// What the driver hands the body: either an entry, or a frame plus the result the
-/// child produced.
+/// What one turn of the loop hands the body: either an entry, or a frame plus the result the
+/// child produced. The body's own value is the next turn's input, so this is the loop's state.
 pub(super) fn input_ty() -> Ident {
     format_ident!("__SsIn")
+}
+/// The frame stack's type, so that the expansion need not name `Vec` in a crate that may be
+/// `no_std`.
+pub(super) fn frames_ty() -> Ident {
+    format_ident!("__SsFrames")
+}
+/// The frame stack itself, which the body pushes to and pops from where it used to answer with
+/// a `Call` or a `Done`.
+pub(super) fn frames_local() -> Ident {
+    format_ident!("__ss_frames")
+}
+/// The loop's state: what the body is entered with this turn.
+pub(super) fn input_local() -> Ident {
+    format_ident!("__ss_input")
+}
+/// The frame a `Done` popped, to be resumed with the value.
+pub(super) fn frame_local() -> Ident {
+    format_ident!("__ss_frame")
+}
+/// The value a `Done` hands down, bound so that the pop can be branched on without writing it
+/// twice.
+pub(super) fn done_local() -> Ident {
+    format_ident!("__ss_done")
+}
+/// The loop. A `Done` with no frame left to resume is the whole recursion's answer, so it
+/// breaks this.
+pub(super) fn drive_label() -> syn::Lifetime {
+    syn::Lifetime::new("'__ss_drive", proc_macro2::Span::call_site())
 }
 pub(super) fn frame_variant(r: usize) -> Ident {
     format_ident!("R{}", r)

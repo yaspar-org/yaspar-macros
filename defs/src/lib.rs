@@ -9,8 +9,10 @@
 //! is the same for every function, and lives here rather than being emitted again into
 //! each one:
 //!
-//! - [`Step`] and [`In`], the protocol between the rewritten body and its driver;
-//! - [`drive`], the loop that keeps the recursion in a `Vec` instead of on the stack;
+//! - [`In`], what the loop hands the body on each step, and [`Frames`], the stack it parks
+//!   frames on instead of using the native one;
+//! - [`Step`] and [`drive`], the same protocol and loop as a function the body is handed to,
+//!   which is what an expansion used to be written as and what its benchmarks compare against;
 //! - [`Pin`], the store for values a call site lends its callee, under
 //!   `#[stack_safe(data_in_frame)]`;
 //! - [`Try`] and [`FromResidual`], a stable stand-in for the unstable traits of the
@@ -26,7 +28,8 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-/// What the driver hands the body on each step.
+/// What one turn of the loop hands the body, and what the body hands back to be the next
+/// turn's input.
 pub enum In<A, F, R> {
     /// Run the body from an entry point.
     Enter(A),
@@ -34,7 +37,29 @@ pub enum In<A, F, R> {
     Resume(F, R),
 }
 
-/// What the body hands back.
+/// Where a rewritten body parks its frames: the heap, instead of the native stack.
+///
+/// A plain `Vec`, named because the expansion has to name it and cannot say `Vec` — the crate
+/// it lands in may be `no_std`, and an expansion that worked or not depending on that would be
+/// a poor bargain. One alias also gives any future change of stack one place to happen.
+pub type Frames<F> = Vec<F>;
+
+impl<A, F, R> In<A, F, R> {
+    /// The stack a loop over this input parks its frames on: empty, and of the right type.
+    ///
+    /// It takes an input it does not read because that is the whole point of it. An expansion
+    /// annotates its state with the payload types it knows, which for the ones inference fills is
+    /// `_`; a second annotation on the stack would be a second, unrelated `_`, and then a slot the
+    /// macro cannot name has nothing to be inferred from — the push that would say what it is
+    /// belongs to the other hole. Deriving the stack from the state says once, in a signature,
+    /// that the two hold the same frame.
+    #[inline(always)]
+    pub fn frames(&self) -> Frames<F> {
+        Frames::new()
+    }
+}
+
+/// What the body hands back, in the [`drive`] protocol.
 pub enum Step<A, F, R> {
     /// This computation is finished; hand the value to the frame below.
     Done(R),
@@ -46,12 +71,20 @@ pub enum Step<A, F, R> {
     Tail(A),
 }
 
-/// Run a rewritten body to completion, keeping its frames on the heap.
+/// Run a body to completion, keeping its frames on the heap: the loop, as a function.
 ///
-/// `c` is the context the driver owns and lends out for the duration of each step: the
+/// `c` is the context the loop owns and lends out for the duration of each step: the
 /// `&mut` parameters and any receiver, which cannot travel in a payload because two live
 /// frames would then hold the same `&mut`. Lending it per step is what lets the body use
 /// it at every level of the recursion without anything capturing it.
+///
+/// `#[stack_safe]` no longer emits a call to this: the body is now inlined into the loop, so
+/// that the three transitions below are a push, a pop and a `break` written where the body
+/// reaches them, rather than a value handed back through [`Step`] for a second `match` to take
+/// apart. Measured on a three-call-site recursion, that is worth about 2x — `Step` is a real
+/// enum that has to be built and read back, and the closure's captures kept the loop's state
+/// out of registers. It is kept, unchanged, because the encoding it stands for is what
+/// `examples/perf_dispatch_width.rs` measures the emitted one against.
 pub fn drive<C, A, F, R>(
     c: &mut C,
     init: A,

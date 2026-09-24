@@ -1,6 +1,8 @@
 error[E0382]: use of moved value: `v`
   --> tests/ui/original_moved.rs:14:35
    |
+13 | #[stack_safe(data_in_frame)]
+   | ---------------------------- inside of this loop
 14 | fn moved(n: usize, c: &Chain<'_>, v: Vec<u64>) -> usize {
    |                                   ^
    |                                   |

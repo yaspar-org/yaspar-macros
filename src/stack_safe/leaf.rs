@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Rewriting code that contains no recursive call. It is spliced verbatim, but
-//! it now lives inside a closure returning `__SsStep`, so `?`, `return`, and —
-//! inside a lowered loop — `break` and `continue` still have to be adjusted.
+//! it now lives inside one turn of the driver's loop, so `?`, `return`, and —
+//! inside a lowered loop — `break` and `continue` still have to be adjusted: each
+//! of them leaves that turn with the next input instead of leaving the function.
 
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::{ToTokens, quote};
@@ -11,7 +12,8 @@ use syn::spanned::Spanned;
 use syn::visit_mut::VisitMut;
 use syn::{Expr, Stmt, parse_quote};
 
-use super::names::{entry_ty, entry_variant, state_marker, step_ty};
+use super::driver;
+use super::names::{entry_ty, entry_variant, state_marker};
 use super::try_shim;
 use super::walk::{Env, LoopCtx};
 
@@ -61,7 +63,6 @@ impl VisitMut for LeafRewrite<'_> {
         }
         syn::visit_mut::visit_expr_mut(self, e);
 
-        let step = step_ty();
         let entry = entry_ty();
         // Undo a pending swap before leaving; empty in every other position.
         let undo = &self.restores;
@@ -72,13 +73,14 @@ impl VisitMut for LeafRewrite<'_> {
                 let inner = &t.expr;
                 let branch = try_shim::branch(quote! { #inner });
                 let exit = self.wrapped(try_shim::from_residual(quote! { __ss_res }));
+                let exit = driver::done(exit);
                 *e = parse_quote! {
                     match #branch {
                         ::core::result::Result::Ok(__ss_ok) => __ss_ok,
                         ::core::result::Result::Err(__ss_res) => {
                             #undo
                             #release
-                            return #step::Done(#exit)
+                            #exit
                         }
                     }
                 };
@@ -91,8 +93,9 @@ impl VisitMut for LeafRewrite<'_> {
                 // Bound before the teardown: the value may read out of a store it releases, as
                 // `return Err(*x)` does for an `x` borrowed from one.
                 let v = self.wrapped(quote! { __ss_ret });
+                let v = driver::done(v);
                 *e = parse_quote! {
-                    { let __ss_ret = #raw; #undo #release return #step::Done(#v) }
+                    { let __ss_ret = #raw; #undo #release #v }
                 };
             }
             Expr::Continue(c) if self.depth == 0 => {
@@ -107,7 +110,8 @@ impl VisitMut for LeafRewrite<'_> {
                 if let Some(lp) = self.lp {
                     let v = entry_variant(lp.variant);
                     let marker = state_marker(lp.idx);
-                    *e = parse_quote! { { #undo return #step::Tail(#entry::#v(#marker)) } };
+                    let again = driver::tail(quote! { #entry::#v(#marker) });
+                    *e = parse_quote! { { #undo #again } };
                 }
             }
             Expr::Break(b) if self.depth == 0 => {
@@ -126,7 +130,7 @@ impl VisitMut for LeafRewrite<'_> {
                         None => quote! { () },
                     };
                     match (lp.brk)(v) {
-                        Ok(after) => *e = parse_quote! { { #undo return #after } },
+                        Ok(after) => *e = parse_quote! { { #undo #after } },
                         Err(err) => {
                             if self.err.is_none() {
                                 self.err = Some(err);
