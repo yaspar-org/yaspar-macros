@@ -1,0 +1,5 @@
+error: `step` names more than one function declared in this body, and `#[stack_safe]` cannot tell which: it addresses a definition by the body that declares it, not by the block, so two declared in sibling blocks are equally in scope here. Rust resolves this by block. Rename one of them, or move the one you mean out to the body itself
+  --> tests/ui/ambiguous_sibling_definitions.rs:14:9
+   |
+14 |         step(n)
+   |         ^^^^

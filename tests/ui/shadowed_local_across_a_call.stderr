@@ -1,0 +1,5 @@
+error: `x` shadows a binding of the same name outside this block, the block recurses, and the outer one is read again afterwards. `#[stack_safe]` parks the locals that are live across a recursive call by *name*, so the two are one slot: the code that resumes would read this binding where the source had gone back to the outer one. Rename one of them
+  --> tests/ui/shadowed_local_across_a_call.rs:16:17
+   |
+16 |             let x = 100 + n;
+   |                 ^

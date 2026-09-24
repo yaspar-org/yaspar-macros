@@ -15,7 +15,8 @@ use syn::{FnArg, Item, ItemFn, Pat, PatIdent, ReturnType, Stmt};
 use super::Opts;
 use super::analyze::{
     MethodSplit, assigns_binding, desugar_apit, desugar_param_patterns, desugar_receiver,
-    reject_generic_payload, scan_context_args, scan_pinned_args, validate,
+    reject_generic_payload, reject_shadowed_across_a_call, scan_context_args, scan_pinned_args,
+    validate,
 };
 use super::context::{CtxEntry, is_context_slot, peel_type, slot_key, slot_type, strip_parens};
 use super::cps::cps_stmts;
@@ -701,8 +702,16 @@ fn lifted(
         }
     };
     let loop_expr = driver::machine(&quote! { __ss_entry }, input_ann, frames_ann, arms);
+    // One `#[track_caller]` member makes the shared machine tracked too: the body runs *in* the
+    // machine, so an untracked frame here would be the one `Location::caller()` reports. See
+    // `analyze::desugar_receiver`, which keeps the same attribute on the body of a method.
+    let tracked = funcs
+        .iter()
+        .any(|f| f.attrs.iter().any(|a| a.path().is_ident("track_caller")))
+        .then(|| quote! { #[track_caller] });
     let machine_decl = quote! {
         #allows
+        #tracked
         fn #machine #seed_generics (__ss_seed: #seed_ty #seed_args) #ret #where_clause {
             #machinery
             #(#within)*
@@ -859,6 +868,26 @@ fn analyse(
     assoc: bool,
     self_ty: Option<&syn::Type>,
 ) -> syn::Result<Ctx> {
+    // Two members of one cycle with the same name. A call is matched by its *final identifier* —
+    // a macro resolves no paths — so the transform cannot tell which of the two a given call
+    // means: both would enter whichever entry point comes first, silently. Sibling blocks each
+    // declaring `fn step`, and a nested `fn f` inside an outer `fn f`, are the shapes that get
+    // here.
+    for (i, func) in funcs.iter().enumerate() {
+        if funcs[..i].iter().any(|g| g.sig.ident == func.sig.ident) {
+            return Err(syn::Error::new(
+                func.sig.ident.span(),
+                format!(
+                    "`{}` is declared twice among the functions `#[stack_safe]` rewrites together. \
+                     A recursive call is recognised by name, since a macro resolves no paths, so \
+                     the two cannot be told apart and calls to either would enter the same body. \
+                     Rename one of them",
+                    func.sig.ident,
+                ),
+            ));
+        }
+    }
+
     let mut splits = Vec::new();
     for func in funcs {
         reject_unsupported_signature(&func.sig)?;
@@ -949,7 +978,8 @@ fn analyse(
         // Before the scans: whether a borrowed local is owned here is judged from its annotation.
         ctx.current.set(i);
         note_annotated_lets(&ctx, &func.block);
-        validate(&ctx, &func.block)?;
+        validate(&ctx, func)?;
+        reject_shadowed_across_a_call(&ctx, func)?;
         // Must run before any code is generated: it decides which slots are raw,
         // which every context rebinding depends on.
         scan_context_args(&ctx, &func.block)?;

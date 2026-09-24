@@ -1,0 +1,5 @@
+error: `f` is the name of a function `#[stack_safe]` is rewriting, and this binding shadows it. Calls are recognised by name, since a macro resolves no paths, so a call to this binding would be rewritten into a recursion instead. Rename the binding
+  --> tests/ui/shadowed_member_name.rs:14:9
+   |
+14 |     let f: fn(u64) -> u64 = |_| 100;
+   |         ^

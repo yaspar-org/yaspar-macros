@@ -514,7 +514,22 @@ fn expand_roots(roots: Roots<'_>) -> syn::Result<Scanned> {
     // force at it handed down from its host.
     let defs = scope::collect(&mut roots, scope_opts)?;
 
-    let (edges, blocked) = scope::edges(&roots, &defs, assoc, host_name.as_ref());
+    let (edges, blocked, ambiguous) = scope::edges(&roots, &defs, assoc, host_name.as_ref());
+    // Two definitions of one name, declared in sibling blocks of one body, are equally in scope as
+    // far as a path of ordinals can say — Rust tells them apart by block, which is the one thing
+    // that path does not record. Choosing either would be a guess, and the guess used to be silent.
+    if let Some(name) = ambiguous.first() {
+        return Err(syn::Error::new(
+            name.span(),
+            format!(
+                "`{name}` names more than one function declared in this body, and `#[stack_safe]` \
+                 cannot tell which: it addresses a definition by the body that declares it, not by \
+                 the block, so two declared in sibling blocks are equally in scope here. Rust \
+                 resolves this by block. Rename one of them, or move the one you mean out to the \
+                 body itself"
+            ),
+        ));
+    }
     let reaches = scope::closure(&edges);
     unresolvable_recursion(&defs, &edges, &reaches, &blocked, assoc)?;
     for (i, d) in defs.iter().enumerate() {

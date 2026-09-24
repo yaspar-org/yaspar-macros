@@ -55,13 +55,13 @@ pub(super) fn solve_payloads(
             for (m, marker) in markers.iter().enumerate() {
                 if mentioned[n].contains(marker) {
                     for id in &solved[m] {
-                        needed.insert(id.to_string());
+                        needed.insert(canonical(id));
                     }
                 }
             }
             let mut next: Vec<Ident> = points[n].forced.clone();
             for id in &points[n].scope {
-                if needed.contains(&id.to_string()) && !next.iter().any(|i| i == id) {
+                if needed.contains(&canonical(id)) && !next.iter().any(|i| i == id) {
                     next.push(id.clone());
                 }
             }
@@ -76,7 +76,7 @@ pub(super) fn solve_payloads(
             for (m, marker) in markers.iter().enumerate() {
                 if set.contains(marker) {
                     for id in &solved[m] {
-                        if set.insert(id.to_string()) {
+                        if set.insert(canonical(id)) {
                             changed = true;
                         }
                     }
@@ -92,12 +92,21 @@ pub(super) fn solve_payloads(
     (solved, resume_solved)
 }
 
+/// A binding's name as a *use* of it spells it. A raw identifier is written `r#type` where it is
+/// bound and `type` where a format string captures it, and the two have to meet: a use the solver
+/// fails to see is not a lost optimisation but a wrong answer, since the payload then omits the
+/// binding and the resume arm resolves the name to the outermost call's own parameter.
+fn canonical(id: &Ident) -> String {
+    let name = id.to_string();
+    name.strip_prefix("r#").unwrap_or(&name).to_owned()
+}
+
 fn idents(ts: &TokenStream) -> HashSet<String> {
     fn go(ts: &TokenStream, out: &mut HashSet<String>) {
         for t in ts.clone() {
             match t {
                 TokenTree::Ident(i) => {
-                    out.insert(i.to_string());
+                    out.insert(canonical(&i));
                 }
                 TokenTree::Group(g) => go(&g.stream(), out),
                 // A name can be used from *inside a string literal* too: an implicit

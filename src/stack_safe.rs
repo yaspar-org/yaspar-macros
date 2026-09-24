@@ -115,13 +115,21 @@ pub fn expand_attr(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStr
 /// recognised as ours, so it is left in place and the compiler runs us again on the rewritten body.
 /// Everything we generate is `__ss`-prefixed, which the user's own names may not be, so such a name
 /// in the input means exactly that.
+///
+/// The prefix is looked for in the name Rust *resolves*, not in the spelling: `r#__ss_v0` is the
+/// same identifier as `__ss_v0`, so a raw spelling that slipped past this check used to collide
+/// silently with the first temporary the transform mints, and the body read the wrong binding.
 fn already_expanded(item: &TokenStream) -> syn::Result<()> {
     fn generated(tokens: TokenStream) -> Option<Ident> {
+        fn reserved(id: &Ident) -> bool {
+            let name = id.to_string();
+            let name = name.strip_prefix("r#").unwrap_or(&name);
+            name.starts_with("__ss") || name.starts_with("__Ss")
+        }
+
         for tt in tokens {
             match tt {
-                TokenTree::Ident(id)
-                    if id.to_string().starts_with("__ss") || id.to_string().starts_with("__Ss") =>
-                {
+                TokenTree::Ident(id) if reserved(&id) => {
                     return Some(id);
                 }
                 TokenTree::Group(g) => {
@@ -140,12 +148,14 @@ fn already_expanded(item: &TokenStream) -> syn::Result<()> {
         Some(id) => Err(syn::Error::new(
             id.span(),
             format!(
-                "`#[stack_safe]` has already rewritten this item: `{id}` is one of the names it \
-                 generates. A marker inside a scope this attribute covers is recognised by name \
-                 only, since a macro resolves no paths, so an alias — `use \
-                 yaspar_macros::stack_safe as ss;` and then `#[ss]` — is not recognised, is left \
-                 in place, and runs again on the rewritten body. Write the inner marker as \
-                 `#[stack_safe(..)]` or `#[yaspar_macros::stack_safe(..)]`"
+                "`{id}` is a name `#[stack_safe]` reserves: everything it generates is \
+                 `__ss`-prefixed, and a raw spelling is the same identifier. Two things bring you \
+                 here. Either this item has already been rewritten, which is what a marker behind \
+                 an alias does — `use yaspar_macros::stack_safe as ss;` and then `#[ss]` is not \
+                 recognised, since a macro resolves no paths, so it is left in place and runs \
+                 again on the rewritten body; write the inner marker as `#[stack_safe(..)]` or \
+                 `#[yaspar_macros::stack_safe(..)]`. Or the name is one you wrote yourself, in \
+                 which case rename it"
             ),
         )),
     }

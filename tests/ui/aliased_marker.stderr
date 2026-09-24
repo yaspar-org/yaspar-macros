@@ -1,4 +1,4 @@
-error: `#[stack_safe]` has already rewritten this item: `__SsFrames` is one of the names it generates. A marker inside a scope this attribute covers is recognised by name only, since a macro resolves no paths, so an alias — `use yaspar_macros::stack_safe as ss;` and then `#[ss]` — is not recognised, is left in place, and runs again on the rewritten body. Write the inner marker as `#[stack_safe(..)]` or `#[yaspar_macros::stack_safe(..)]`
+error: `__SsFrames` is a name `#[stack_safe]` reserves: everything it generates is `__ss`-prefixed, and a raw spelling is the same identifier. Two things bring you here. Either this item has already been rewritten, which is what a marker behind an alias does — `use yaspar_macros::stack_safe as ss;` and then `#[ss]` is not recognised, since a macro resolves no paths, so it is left in place and runs again on the rewritten body; write the inner marker as `#[stack_safe(..)]` or `#[yaspar_macros::stack_safe(..)]`. Or the name is one you wrote yourself, in which case rename it
  --> tests/ui/aliased_marker.rs:5:1
   |
 5 | #[stack_safe]

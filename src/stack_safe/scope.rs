@@ -304,14 +304,20 @@ pub(super) fn edges(
     defs: &[Def],
     assoc: bool,
     host: Option<&Ident>,
-) -> (Vec<Vec<bool>>, Vec<Blocked>) {
+) -> (Vec<Vec<bool>>, Vec<Blocked>, Vec<Ident>) {
     let mut rows = Vec::with_capacity(defs.len());
     let mut blocked = Vec::new();
+    let mut ambiguous = Vec::new();
     for (i, d) in defs.iter().enumerate() {
         let mut row = vec![false; defs.len()];
         for m in mentioned(at(&roots[d.owner], &d.path), assoc, host) {
-            let Some(j) = resolve(defs, i, &m, assoc) else {
-                continue;
+            let j = match resolve(defs, i, &m, assoc) {
+                Ok(Some(j)) => j,
+                Ok(None) => continue,
+                Err(name) => {
+                    ambiguous.push(name);
+                    continue;
+                }
             };
             match m.unrewritable {
                 None => row[j] = true,
@@ -325,7 +331,7 @@ pub(super) fn edges(
         }
         rows.push(row);
     }
-    (rows, blocked)
+    (rows, blocked, ambiguous)
 }
 
 /// A call that names a definition in scope through a path the transform cannot rewrite.
@@ -349,8 +355,12 @@ pub(super) struct Blocked {
 /// `Self::g(..)` and `other.g(..)` are the other way round: an associated item only. `self::g(..)`
 /// names a module's own item, so it reaches a free root and nothing declared in a body.
 ///
-/// Where several candidates remain, the innermost wins, exactly as Rust resolves it.
-fn resolve(defs: &[Def], from: usize, m: &Mention, assoc: bool) -> Option<usize> {
+/// Where several candidates remain, the innermost wins, exactly as Rust resolves it — unless two
+/// are equally innermost, which a path of ordinals cannot break, and then the mention is reported
+/// as ambiguous rather than guessed at. That is conservative: two same-named definitions in sibling
+/// blocks are refused even where the tie would not have changed which cycles there are, because
+/// deciding *that* would mean resolving the tie first.
+fn resolve(defs: &[Def], from: usize, m: &Mention, assoc: bool) -> Result<Option<usize>, Ident> {
     let here = &defs[from];
     let nameable = |d: &Def| {
         let root = d.path.is_empty();
@@ -361,15 +371,28 @@ fn resolve(defs: &[Def], from: usize, m: &Mention, assoc: bool) -> Option<usize>
             Written::InAMacro => true,
         }
     };
-    defs.iter()
+    let candidates: Vec<(usize, &Def)> = defs
+        .iter()
         .enumerate()
         .filter(|(_, d)| d.name == m.name && nameable(d))
         .filter(|(_, d)| match d.path.split_last() {
             Some((_, declared_in)) => d.owner == here.owner && here.path.starts_with(declared_in),
             None => true,
         })
-        .max_by_key(|(_, d)| d.path.len())
-        .map(|(i, _)| i)
+        .collect();
+    let Some(depth) = candidates.iter().map(|(_, d)| d.path.len()).max() else {
+        return Ok(None);
+    };
+    let mut innermost = candidates.iter().filter(|(_, d)| d.path.len() == depth);
+    let (winner, _) = *innermost.next().expect("the maximum is one of them");
+    // A path records which *body* a definition sits in, not which block of it, so two definitions
+    // declared in sibling blocks of one body are equally deep and equally in scope here. Rust
+    // resolves that by block, which is exactly the distinction the path does not carry: picking
+    // either would be a guess, and picking the last one is what silently called the wrong `step`.
+    match innermost.next() {
+        None => Ok(Some(winner)),
+        Some(_) => Err(m.name.clone()),
+    }
 }
 
 /// One entry per cycle, its members in `defs` order — so the shallowest member comes first —
