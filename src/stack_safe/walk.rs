@@ -585,6 +585,21 @@ impl Ctx {
         self.resumes.borrow_mut()[idx].point.code = code;
     }
 
+    /// Give back the point reserved last, so a call in tail position leaves no trace of it.
+    ///
+    /// Answers whether it went, which the caller reads as "the tail form applies". It only does
+    /// when `idx` is still the last point — true exactly when the continuation reserved none of
+    /// its own, which is the case the caller has already established — and when nothing has been
+    /// written into it yet, so that no emitted code can be naming its marker.
+    pub(super) fn drop_last_resume(&self, idx: usize) -> bool {
+        let mut resumes = self.resumes.borrow_mut();
+        if resumes.len() != idx + 1 || !resumes[idx].point.code.is_empty() {
+            return false;
+        }
+        resumes.pop();
+        true
+    }
+
     /// Which member this expression calls, if it is a call to one of them.
     /// After `desugar_receiver`, a method's `self.walk(a)` has already become
     /// `walk(a)`, so one shape covers both.
