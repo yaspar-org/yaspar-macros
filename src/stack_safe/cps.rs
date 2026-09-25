@@ -597,17 +597,45 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
                 .iter()
                 .map(|(slot, mark)| quote! { #ctxp.#slot.truncate(#mark); });
             let unpin = quote! { #(#unpin)* };
-            ctx.set_resume_code(
-                r,
-                quote! {
-                    #take_backs
-                    #unpin
-                    #(#restores)*
-                    #prologue
-                    #unwrap
-                    #body
-                },
-            );
+            // A call whose continuation is *hand the answer straight down* is in tail position.
+            // The frame it would park holds nothing — nothing after the call mentions anything —
+            // and its resume arm is the identity, so the push, the pop and the dispatch on the
+            // frame tag are three transitions with nothing between them. Entering the callee
+            // without parking gives the same answer to the same frame: the callee's `Resume` pops
+            // whatever was already on top, which is what the identity arm would have handed it,
+            // and an empty stack still breaks the loop with the value. Nothing is dropped early
+            // either: a payload this small is the *reason* there is nothing to drop.
+            //
+            // Nothing may run before the answer is handed on, which is the whole condition: no
+            // value to take back, no store to release, no context pointer to restore and no
+            // prologue to re-derive. `body` being exactly `driver::done` of the resumed value is
+            // what says the continuation is the identity — a group whose members answer with
+            // different types re-wraps into the union there, and so does not qualify. Nor does a
+            // point whose `?` was lifted out: its value is the checked one, and handing *that*
+            // down would offer the next turn's shared check something that is not a carrier.
+            let is_tail = take_backs.is_empty()
+                && unpin.is_empty()
+                && swaps.is_empty()
+                && prologue.is_empty()
+                && !ctx.is_checked(r)
+                && body.to_string() == driver::done(quote! { #v }).to_string();
+            // The identity continuation reserved no point of its own, so `r` is still the last one
+            // and can be given back — which keeps the frame enum, its dispatch and the annotation
+            // that names its slots free of a variant nothing constructs.
+            let is_tail = is_tail && ctx.drop_last_resume(r);
+            if !is_tail {
+                ctx.set_resume_code(
+                    r,
+                    quote! {
+                        #take_backs
+                        #unpin
+                        #(#restores)*
+                        #prologue
+                        #unwrap
+                        #body
+                    },
+                );
+            }
 
             // Without a swap the arguments stay inline, so the common path gains
             // no bindings at all.
@@ -628,11 +656,12 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
                     };
                     quote! { let #tmp #ann = #val; }
                 });
-                driver::call(
-                    quote! { #(#args)* },
-                    quote! { #entry::#callee_variant((#(#tmps,)*)) },
-                    quote! { #frame::#frame_var(#marker) },
-                )
+                let args = quote! { #(#args)* };
+                let enter = quote! { #entry::#callee_variant((#(#tmps,)*)) };
+                match is_tail {
+                    true => driver::enter(args, enter),
+                    false => driver::call(args, enter, quote! { #frame::#frame_var(#marker) }),
+                }
             } else {
                 // With a swap, every argument is bound *in source order* first and
                 // the derived pointers are taken last. Taking a pointer earlier is

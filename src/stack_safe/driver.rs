@@ -113,6 +113,26 @@ pub(super) fn call(args: TokenStream, entry: TokenStream, frame: TokenStream) ->
     }
 }
 
+/// Enter `entry` with `args` bound first, parking nothing: a call in *tail position*.
+///
+/// The frame [`call`] would have parked holds nothing and its resume arm hands the answer straight
+/// on, so the push, the pop and the 25-way dispatch between them have no effect. Skipping them
+/// leaves the answer belonging to whichever frame is already on top, which is what that arm would
+/// have done, and an empty stack still breaks the loop with it.
+///
+/// `args` is here for the same two reasons it is in [`call`] — order and coercion — since this is
+/// still the arm's value. [`tail`] is the same transition for a lowered loop, which has no
+/// arguments to bind.
+pub(super) fn enter(args: TokenStream, entry: TokenStream) -> TokenStream {
+    let input = input_ty();
+    quote! {
+        {
+            #args
+            #input::Enter(#entry)
+        }
+    }
+}
+
 /// One resume arm for every frame, with the `?` every one of them began with done once, above the
 /// dispatch on the frame tag.
 ///
