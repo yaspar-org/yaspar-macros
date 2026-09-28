@@ -664,15 +664,17 @@ struct Pieces<'a> {
     machinery: &'a TokenStream,
     /// The `#[allow(..)]` the rewritten body needs.
     allows: &'a TokenStream,
-    /// One arm per entry point and per resume point.
+    /// One arm per entry point.
     arms: &'a [TokenStream],
+    /// Continuation-frame dispatch, executed by the direct unwind phase.
+    resume: &'a TokenStream,
     /// How each context slot is filled from the member's parameters.
     ctx_inits: &'a [TokenStream],
     /// `: R`, naming the driver's result type.
     ret_ann: &'a TokenStream,
     /// Names the entry type parameters the macro knows, before the body is checked.
     anchor: &'a TokenStream,
-    /// `: Option<Entry<..>>`, the small loop control; completed answers live separately.
+    /// Any annotation required on the entry control.
     input_ann: &'a TokenStream,
     /// `: Frames<Frame<..>>`, naming the frame type parameters on the one place that holds one.
     frames_ann: &'a TokenStream,
@@ -702,6 +704,7 @@ fn lifted(
         machinery,
         allows,
         arms,
+        resume,
         ctx_inits,
         anchor,
         input_ann,
@@ -876,7 +879,7 @@ fn lifted(
             #(#variants,)*
         }
     };
-    let loop_expr = driver::machine(&quote! { __ss_entry }, input_ann, frames_ann, arms);
+    let loop_expr = driver::machine(&quote! { __ss_entry }, input_ann, frames_ann, arms, resume);
     // One `#[track_caller]` member makes the shared machine tracked too: the body runs *in* the
     // machine, so an untracked frame here would be the one `Location::caller()` reports. See
     // `analyze::desugar_receiver`, which keeps the same attribute on the body of a method.
@@ -1301,7 +1304,7 @@ fn member_arms(ctx: &Ctx, funcs: &[ItemFn]) -> syn::Result<(Vec<Item>, Vec<Token
             .collect();
         let prologue = ctx.ctx_prologue();
         main_arms.push(quote! {
-            ::core::option::Option::Some(#entry::#variant((#(#pats,)*))) => {
+            #entry::#variant((#(#pats,)*)) => {
                 #prologue #(#anns)* #arm
             },
         });
@@ -1447,12 +1450,12 @@ pub(super) fn expand_group(
         let stand_in = stand_in.map(|ungated| {
             quote! {
                 #ungated
-                ::core::option::Option::Some(#entry::#v(())) => unreachable!("gated out"),
+                #entry::#v(()) => unreachable!("gated out"),
             }
         });
         arms.push(quote! {
             #gate
-            ::core::option::Option::Some(#entry::#v((#(mut #st,)*))) => {
+            #entry::#v((#(mut #st,)*)) => {
                 #prologue #code
             },
             #stand_in
@@ -1516,13 +1519,14 @@ pub(super) fn expand_group(
             #stand_in
         });
     }
-    // One `Resume` arm either way, since the pop happens inside it: with no recursive call the
-    // frame enum is uninhabited, so its dispatch has no arms and is proved unreachable there.
-    arms.push(match hoist {
+    // One continuation dispatch either way. The direct-unwind driver pops the frame and runs this
+    // separately from entry dispatch, keeping the completed value in a local between frames.
+    let resume = match hoist {
         true => driver::resume(&frame_arms, &frame_drops),
         false => driver::resume_direct(&frame_arms),
-    });
+    };
     let arms: Vec<TokenStream> = arms.into_iter().map(|ts| substitute(ts, &subst)).collect();
+    let resume = substitute(resume, &subst);
 
     let total_entries = loop_base + loops.len();
     let entry_params: Vec<Ident> = (0..total_entries)
@@ -1571,17 +1575,17 @@ pub(super) fn expand_group(
             false => quote! { #frame_ty_name<#(#frame_args),*> },
         }
     };
-    // The control carrier contains only an entry. A completed answer lives in a separate local,
-    // so descending through a cheap node does not move a value as large as the return type.
-    let input_ann = quote! { : ::core::option::Option<_> };
+    // Entry dispatch carries only the entry itself. Completed answers move directly through the
+    // separate unwind phase and never share this control value.
+    let input_ann = TokenStream::new();
     let frames_ann = {
         let frames_ty_name = frames_ty();
         quote! { : #frames_ty_name<#frame_named> }
     };
 
-    // Over everything the expansion writes that could name one of the borrowed items: the arms,
-    // and the context tuple, which is where a `Pin` store is built.
-    let defs_imports = defs_imports(&quote! { #(#arms)* #(#ctx_inits)* });
+    // Over everything the expansion writes that could name one of the borrowed items: entry arms,
+    // continuation dispatch, and the context tuple, which is where a `Pin` store is built.
+    let defs_imports = defs_imports(&quote! { #(#arms)* #resume #(#ctx_inits)* });
     let ret_union_decl = match &ctx.ret_union {
         None => TokenStream::new(),
         Some(union) => {
@@ -1635,6 +1639,7 @@ pub(super) fn expand_group(
             machinery: &machinery,
             allows: &allows,
             arms: &arms,
+            resume: &resume,
             ctx_inits: &ctx_inits,
             anchor: &anchor,
             input_ann: &input_ann,
@@ -1649,7 +1654,13 @@ pub(super) fn expand_group(
     // `liftable` for why a group sometimes has to be emitted this way, and the rejection above
     // for why no member of such a group can have come out of a body.
     let ret_ann = &ctx.ret_ann;
-    let loop_expr = driver::machine(&quote! { __ss_entry }, &input_ann, &frames_ann, &arms);
+    let loop_expr = driver::machine(
+        &quote! { __ss_entry },
+        &input_ann,
+        &frames_ann,
+        &arms,
+        &resume,
+    );
     let mut out = Vec::with_capacity(funcs.len());
     for (i, func) in funcs.iter().enumerate() {
         let attrs = &func.attrs;

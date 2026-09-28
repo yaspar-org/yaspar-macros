@@ -79,7 +79,7 @@ pub(super) fn frames_ty() -> Ident {
 pub(super) fn frames_local() -> Ident {
     format_ident!("__ss_frames")
 }
-/// The loop's small control value: `Some(entry)` descends and `None` resumes the completed value.
+/// The next entry point to execute.
 pub(super) fn input_local() -> Ident {
     format_ident!("__ss_input")
 }
@@ -105,23 +105,15 @@ pub(super) fn res_local() -> Ident {
 pub(super) fn done_local() -> Ident {
     format_ident!("__ss_done")
 }
-/// A completed recursive result waiting to be handed to the top continuation frame.
-///
-/// This is deliberately separate from [`input_local`], whose `Option<Entry>` only selects
-/// whether the next turn descends or resumes. Keeping the large return value out of that control
-/// carrier avoids making every entry transition as wide as the return type.
-pub(super) fn completed_local() -> Ident {
-    format_ident!("__ss_completed")
-}
-/// The loop. A `Done` with no frame left to resume is the whole recursion's answer, so it
-/// breaks this.
+/// The outer descend loop. A recursive call replaces [`input_local`] and continues this loop.
+/// A completed value with no frame left breaks it with the whole recursion's answer.
 pub(super) fn drive_label() -> syn::Lifetime {
     syn::Lifetime::new("'__ss_drive", proc_macro2::Span::call_site())
 }
-/// One turn of the loop, whose value is the next entry control. A transition reached from anywhere
-/// but the end of an arm leaves this with it — see `driver::escape`.
-pub(super) fn body_label() -> syn::Lifetime {
-    syn::Lifetime::new("'__ss_body", proc_macro2::Span::call_site())
+/// The labelled block around entry or continuation code. Finishing that code breaks this block
+/// with the value to feed directly into the unwind loop.
+pub(super) fn done_label() -> syn::Lifetime {
+    syn::Lifetime::new("'__ss_done", proc_macro2::Span::call_site())
 }
 pub(super) fn frame_variant(r: usize) -> Ident {
     format_ident!("R{}", r)
