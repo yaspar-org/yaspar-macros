@@ -38,14 +38,18 @@ struct Split {
 
 /// Parameters split two ways. A `&mut` parameter (and any receiver) becomes a
 /// *context* slot the driver owns and lends out; everything else travels in the
-/// argument payload. Shared references are `Copy`, so the payload is fine for
-/// them.
+/// argument payload. A shared reference proven unchanged across every edge of
+/// the recursive cycle also becomes context, so every frame need not repeat it.
 ///
 /// Payload parameters are plain (optionally `mut`) idents by now: the argument tuple is rebuilt as
 /// an *expression*, so [`desugar_param_patterns`] has already named every pattern.
 /// Callers run [`reject_unsupported_signature`] first, so the signature is known
 /// to be one the transform can handle.
-fn split_params(func: &ItemFn, self_ty: Option<&syn::Type>) -> syn::Result<Split> {
+fn split_params(
+    func: &ItemFn,
+    self_ty: Option<&syn::Type>,
+    invariant_context: &HashSet<usize>,
+) -> syn::Result<Split> {
     let sig = &func.sig;
     // Whether a `mut` on a slot binding matters is a question about the body.
     let func_body = func.block.clone();
@@ -107,7 +111,11 @@ fn split_params(func: &ItemFn, self_ty: Option<&syn::Type>) -> syn::Result<Split
                          inside the body instead",
                     ));
                 };
-                if is_context_slot(&pt.ty) {
+                if is_context_slot(&pt.ty) || invariant_context.contains(&arg_index) {
+                    let mutable = matches!(
+                        peel_type(&pt.ty),
+                        syn::Type::Reference(r) if r.mutability.is_some()
+                    );
                     // A `mut` here is inert unless the body assigns to the binding itself.
                     // Writing *through* it is the ordinary use; only reassignment would be
                     // invisible to the next step, which re-derives the binding.
@@ -133,7 +141,7 @@ fn split_params(func: &ItemFn, self_ty: Option<&syn::Type>) -> syn::Result<Split
                     let ty = &ty;
                     context.push(CtxEntry {
                         name: ident.clone(),
-                        mutable: true,
+                        mutable,
                         init: quote! { #ident },
                         ty: quote! { #ty },
                         raw: Cell::new(false),
@@ -215,6 +223,174 @@ fn split_params(func: &ItemFn, self_ty: Option<&syn::Type>) -> syn::Result<Split
         slot_keys,
         slot_types,
     })
+}
+
+/// Shared-reference parameters that never change along an edge of this recursive cycle.
+///
+/// The test is deliberately conservative: every member must spell the parameter with the same
+/// name and type, no body may shadow or assign that name, and every call to a member must pass the
+/// caller's same binding at the callee's corresponding position. Such a reference is ambient
+/// machine context, just like an immutable field of a hand-written evaluator, rather than data a
+/// continuation has to repeat.
+fn invariant_shared_contexts(
+    funcs: &[ItemFn],
+    assoc: bool,
+    self_ty: Option<&syn::Type>,
+) -> Vec<HashSet<usize>> {
+    fn shared_param(
+        func: &ItemFn,
+        name: &str,
+        key: &str,
+        self_ty: Option<&syn::Type>,
+    ) -> Option<usize> {
+        func.sig.inputs.iter().enumerate().find_map(|(i, arg)| {
+            let FnArg::Typed(pt) = arg else { return None };
+            let Pat::Ident(PatIdent {
+                ident,
+                mutability: None,
+                by_ref: None,
+                subpat: None,
+                ..
+            }) = &*pt.pat
+            else {
+                return None;
+            };
+            let syn::Type::Reference(r) = peel_type(&pt.ty) else {
+                return None;
+            };
+            (r.mutability.is_none()
+                && ident == name
+                && pretty_type(&slot_key(&pt.ty, self_ty)) == key)
+                .then_some(i)
+        })
+    }
+
+    fn body_binds(func: &ItemFn, name: &Ident) -> bool {
+        struct V<'a> {
+            name: &'a Ident,
+            found: bool,
+        }
+        impl<'ast> syn::visit::Visit<'ast> for V<'_> {
+            fn visit_pat_ident(&mut self, pat: &'ast PatIdent) {
+                if &pat.ident == self.name {
+                    self.found = true;
+                    return;
+                }
+                syn::visit::visit_pat_ident(self, pat);
+            }
+
+            fn visit_item(&mut self, _: &'ast Item) {}
+        }
+
+        let mut v = V { name, found: false };
+        syn::visit::Visit::visit_block(&mut v, &func.block);
+        v.found
+    }
+
+    fn called_member(call: &syn::ExprCall, funcs: &[ItemFn], assoc: bool) -> Option<usize> {
+        let syn::Expr::Path(p) = &*call.func else {
+            return None;
+        };
+        let segments = &p.path.segments;
+        let named = match segments.len() {
+            1 => true,
+            2 => !assoc && segments[0].ident == "self",
+            _ => false,
+        };
+        if p.qself.is_some() || !named {
+            return None;
+        }
+        let name = &segments.last()?.ident;
+        funcs.iter().position(|f| &f.sig.ident == name)
+    }
+
+    let mut out = vec![HashSet::new(); funcs.len()];
+    let Some(first) = funcs.first() else {
+        return out;
+    };
+
+    for (first_pos, arg) in first.sig.inputs.iter().enumerate() {
+        let FnArg::Typed(pt) = arg else { continue };
+        let Pat::Ident(PatIdent {
+            ident,
+            mutability: None,
+            by_ref: None,
+            subpat: None,
+            ..
+        }) = &*pt.pat
+        else {
+            continue;
+        };
+        let syn::Type::Reference(r) = peel_type(&pt.ty) else {
+            continue;
+        };
+        if r.mutability.is_some() {
+            continue;
+        }
+
+        let key = pretty_type(&slot_key(&pt.ty, self_ty));
+        let Some(positions) = funcs
+            .iter()
+            .map(|func| shared_param(func, &ident.to_string(), &key, self_ty))
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        if positions[0] != first_pos
+            || funcs
+                .iter()
+                .any(|func| body_binds(func, ident) || assigns_binding(&func.block, ident))
+        {
+            continue;
+        }
+
+        struct Calls<'a> {
+            funcs: &'a [ItemFn],
+            assoc: bool,
+            positions: &'a [usize],
+            name: &'a Ident,
+            seen: bool,
+            valid: bool,
+        }
+        impl<'ast> syn::visit::Visit<'ast> for Calls<'_> {
+            fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+                if let Some(callee) = called_member(call, self.funcs, self.assoc) {
+                    self.seen = true;
+                    let same = call.args.get(self.positions[callee]).is_some_and(|arg| {
+                        matches!(
+                            strip_parens(arg),
+                            syn::Expr::Path(p)
+                                if p.qself.is_none()
+                                    && p.path.segments.len() == 1
+                                    && p.path.segments[0].ident == *self.name
+                        )
+                    });
+                    self.valid &= same;
+                }
+                syn::visit::visit_expr_call(self, call);
+            }
+
+            fn visit_item(&mut self, _: &'ast Item) {}
+        }
+
+        let mut calls = Calls {
+            funcs,
+            assoc,
+            positions: &positions,
+            name: ident,
+            seen: false,
+            valid: true,
+        };
+        for func in funcs {
+            syn::visit::Visit::visit_block(&mut calls, &func.block);
+        }
+        if calls.seen && calls.valid {
+            for (slots, position) in out.iter_mut().zip(positions) {
+                slots.insert(position);
+            }
+        }
+    }
+    out
 }
 
 /// Can this group share one machine, instead of a copy per member?
@@ -887,10 +1063,11 @@ fn analyse(
         }
     }
 
+    let invariant_contexts = invariant_shared_contexts(funcs, assoc, self_ty);
     let mut splits = Vec::new();
-    for func in funcs {
+    for (func, invariant_context) in funcs.iter().zip(&invariant_contexts) {
         reject_unsupported_signature(&func.sig)?;
-        splits.push(split_params(func, self_ty)?);
+        splits.push(split_params(func, self_ty, invariant_context)?);
     }
 
     // The whole group shares one context tuple and one result type, so its
