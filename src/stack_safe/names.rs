@@ -20,10 +20,10 @@ use quote::{format_ident, quote};
 /// shadow an item the body already uses.
 ///
 /// Only what `body` turns out to mention is imported: a function with no `?` has no business
-/// naming `Try`, and one that lends no value has none naming `Pin`. The loop's own two — the state
-/// and the stack — are always there.
+/// naming `Try`, and one that lends no value has none naming `Pin`. The frame stack is always
+/// there.
 pub(super) fn defs_imports(body: &TokenStream) -> TokenStream {
-    let (input, frames) = (input_ty(), frames_ty());
+    let frames = frames_ty();
     let optional = [
         (pin_ty(), quote! { Pin }),
         (try_trait(), quote! { Try }),
@@ -36,7 +36,7 @@ pub(super) fn defs_imports(body: &TokenStream) -> TokenStream {
     quote! {
         use ::yaspar_macros_defs::{
             #(#used)*
-            Frames as #frames, InSplit as #input,
+            Frames as #frames,
         };
     }
 }
@@ -69,11 +69,6 @@ pub(super) fn pinned_param(n: usize) -> Ident {
 pub(super) fn frame_ty() -> Ident {
     format_ident!("__SsFrame")
 }
-/// What one turn of the loop hands the body: either an entry, or a frame plus the result the
-/// child produced. The body's own value is the next turn's input, so this is the loop's state.
-pub(super) fn input_ty() -> Ident {
-    format_ident!("__SsIn")
-}
 /// The frame stack's type, so that the expansion need not name `Vec` in a crate that may be
 /// `no_std`.
 pub(super) fn frames_ty() -> Ident {
@@ -84,7 +79,7 @@ pub(super) fn frames_ty() -> Ident {
 pub(super) fn frames_local() -> Ident {
     format_ident!("__ss_frames")
 }
-/// The loop's state: what the body is entered with this turn.
+/// The loop's small control value: `Some(entry)` descends and `None` resumes the completed value.
 pub(super) fn input_local() -> Ident {
     format_ident!("__ss_input")
 }
@@ -110,13 +105,21 @@ pub(super) fn res_local() -> Ident {
 pub(super) fn done_local() -> Ident {
     format_ident!("__ss_done")
 }
+/// A completed recursive result waiting to be handed to the top continuation frame.
+///
+/// This is deliberately separate from [`input_local`], whose `Option<Entry>` only selects
+/// whether the next turn descends or resumes. Keeping the large return value out of that control
+/// carrier avoids making every entry transition as wide as the return type.
+pub(super) fn completed_local() -> Ident {
+    format_ident!("__ss_completed")
+}
 /// The loop. A `Done` with no frame left to resume is the whole recursion's answer, so it
 /// breaks this.
 pub(super) fn drive_label() -> syn::Lifetime {
     syn::Lifetime::new("'__ss_drive", proc_macro2::Span::call_site())
 }
-/// One turn of the loop, whose value is the next state. A transition reached from anywhere but the
-/// end of an arm leaves this with it — see `driver::escape`.
+/// One turn of the loop, whose value is the next entry control. A transition reached from anywhere
+/// but the end of an arm leaves this with it — see `driver::escape`.
 pub(super) fn body_label() -> syn::Lifetime {
     syn::Lifetime::new("'__ss_body", proc_macro2::Span::call_site())
 }

@@ -496,8 +496,7 @@ struct Pieces<'a> {
     ret_ann: &'a TokenStream,
     /// Names the entry type parameters the macro knows, before the body is checked.
     anchor: &'a TokenStream,
-    /// `: InSplit<_, _>`, the loop's state: an entry or an answer, with the frame left on the
-    /// stack.
+    /// `: Option<Entry<..>>`, the small loop control; completed answers live separately.
     input_ann: &'a TokenStream,
     /// `: Frames<Frame<..>>`, naming the frame type parameters on the one place that holds one.
     frames_ann: &'a TokenStream,
@@ -1061,8 +1060,6 @@ fn member_arms(ctx: &Ctx, funcs: &[ItemFn]) -> syn::Result<(Vec<Item>, Vec<Token
     let mut main_arms: Vec<TokenStream> = Vec::new();
     let entry = entry_ty();
 
-    let input = input_ty();
-
     for (i, func) in funcs.iter().enumerate() {
         let (item_stmts, stmts): (Vec<&Stmt>, Vec<&Stmt>) = func
             .block
@@ -1127,7 +1124,9 @@ fn member_arms(ctx: &Ctx, funcs: &[ItemFn]) -> syn::Result<(Vec<Item>, Vec<Token
             .collect();
         let prologue = ctx.ctx_prologue();
         main_arms.push(quote! {
-            #input::Enter(#entry::#variant((#(#pats,)*))) => { #prologue #(#anns)* #arm },
+            ::core::option::Option::Some(#entry::#variant((#(#pats,)*))) => {
+                #prologue #(#anns)* #arm
+            },
         });
     }
 
@@ -1198,7 +1197,7 @@ pub(super) fn expand_group(
     let ctx = analyse(&funcs, opts, assoc, self_ty)?;
 
     let (items, main_arms) = member_arms(&ctx, &funcs)?;
-    let (entry, input) = (entry_ty(), input_ty());
+    let entry = entry_ty();
 
     // Resolve every payload — loop states and resume frames together, since they
     // reference each other's markers.
@@ -1269,11 +1268,16 @@ pub(super) fn expand_group(
         // would is gone -- so its pattern is what tells the compiler what the payload is: `()`,
         // since nothing reachable travels in it.
         let stand_in = stand_in.map(|ungated| {
-            quote! { #ungated #input::Enter(#entry::#v(())) => unreachable!("gated out"), }
+            quote! {
+                #ungated
+                ::core::option::Option::Some(#entry::#v(())) => unreachable!("gated out"),
+            }
         });
         arms.push(quote! {
             #gate
-            #input::Enter(#entry::#v((#(mut #st,)*))) => { #prologue #code },
+            ::core::option::Option::Some(#entry::#v((#(mut #st,)*))) => {
+                #prologue #code
+            },
             #stand_in
         });
     }
@@ -1390,12 +1394,9 @@ pub(super) fn expand_group(
             false => quote! { #frame_ty_name<#(#frame_args),*> },
         }
     };
-    // The state names an entry and an answer; the frame is not in it any more, so the frame's
-    // slot types are named on the stack instead.
-    let input_ann = {
-        let input_ty_name = input_ty();
-        quote! { : #input_ty_name<_, _> }
-    };
+    // The control carrier contains only an entry. A completed answer lives in a separate local,
+    // so descending through a cheap node does not move a value as large as the return type.
+    let input_ann = quote! { : ::core::option::Option<_> };
     let frames_ann = {
         let frames_ty_name = frames_ty();
         quote! { : #frames_ty_name<#frame_named> }
