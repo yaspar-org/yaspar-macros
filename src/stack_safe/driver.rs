@@ -11,76 +11,82 @@
 //! about 2x; `ladder1_one_loop` in `examples/perf_dispatch_width.rs` is this shape by hand, and
 //! `ladder4_expansion` beside it is what this replaced.
 //!
-//! What the body is is unchanged: one `match` over [`names::input_ty`], with an arm per entry point
-//! and per resume point. What it *answers* with is the next input, so the loop is
+//! What the body is is unchanged: one `match` with an arm per entry point and one resume arm.
+//! The match's control value is deliberately small: `Some(entry)` descends, and `None` resumes
+//! the top frame with the answer held separately in `__ss_completed`.
 //!
 //! ```text
-//! let mut __ss_frames = __SsFrames::new();
-//! let mut __ss_input: __SsIn<_, __SsFrame<..>, _> = __SsIn::Enter(__ss_entry);
+//! let mut __ss_frames = __SsFrames::with_capacity(64);
+//! let mut __ss_completed: Option<R> = None;
+//! let mut __ss_input: Option<Entry> = Some(__ss_entry);
 //! '__ss_drive: loop {
 //!     __ss_input = '__ss_body: { match __ss_input { .. } };
 //! }
 //! ```
 //!
-//! *Answering* rather than storing is worth about 1.7x, and it is the largest single thing in the
-//! shape. The state is as big as a frame plus a return value — 168 bytes in the benchmark — and a
-//! transition that assigns it and jumps back to the top gives it one writer per call site; answered
-//! instead, it has exactly one, and LLVM keeps it in registers rather than copying it between stack
-//! slots. The assembly says so plainly: the answering form has no block copies in its loop.
+//! The previous control carrier was `InSplit<Entry, R>`. Although the frame had already moved out
+//! of it, every descent still travelled through an enum as wide as `R`. Splitting the completed
+//! value from the entry control means a descent only constructs and moves `Option<Entry>`.
 //!
 //! A transition reached from anywhere but the end of an arm — a `?`, a `return`, a `break` out of a
-//! lowered loop — cannot be the arm's value, so it leaves the turn with [`escape`] instead. That is
-//! what the `'__ss_body` label is for, and what those places used to `return`.
+//! lowered loop — cannot be the match arm's value, so it leaves the turn with [`escape`] instead.
+//! That is what the `'__ss_body` label is for, and what those places used to `return`.
 
 use proc_macro2::TokenStream;
 use quote::quote;
 
 use super::names::{
-    body_label, done_local, drive_label, frame_local, frames_local, frames_ty, input_local,
-    input_ty, ok_local, res_local, value_local,
+    body_label, completed_local, done_local, drive_label, frame_local, frames_local, frames_ty,
+    input_local, ok_local, res_local, value_local,
 };
 use super::try_shim;
 
-/// This body is finished: hand the value to the frame below, or answer with it.
+/// This body is finished: put its value in the completed slot and select the resume arm.
 ///
-/// The pop is here rather than in a driver, so the common case — a frame is waiting — reads the
-/// tag it is about to switch on straight out of the `Vec` and goes round again. The empty case is
-/// the whole recursion's answer, and the only way out of the loop.
+/// The resume arm pops the frame whose answer this is. An empty stack means the value is the whole
+/// recursion's answer and leaves the driver.
 pub(super) fn done(v: TokenStream) -> TokenStream {
     let val = done_local();
-    let input = input_ty();
-    // The pop moved into the resume arm, so this is a plain construction: the state names the
-    // answer and nothing else, and whose answer it is is whatever frame is on top. The `let`
-    // stays so that the temporaries of `v` die here, where they died when this was a statement.
+    let completed = completed_local();
+    // Store the answer separately from the small control carrier. The `let` stays so that the
+    // temporaries of `v` die here, where they died when this was a statement.
     quote! {
         {
             let #val = #v;
-            #input::Resume(#val)
+            #completed = ::core::option::Option::Some(#val);
+            ::core::option::Option::None
         }
     }
 }
 
-/// The one `Resume` arm: pop the frame here, and dispatch `inner` on it.
+/// The one resume arm: take the completed value, pop its frame and dispatch `inner` on it.
 ///
-/// With the frame out of the state the pop has to happen somewhere, and this is the only place
-/// that reads it. An empty stack means the value in hand is the whole recursion's answer, so this
-/// is also the only way out of the loop — [`done`] no longer has a `break` of its own, and the
-/// emptiness is tested once per level here instead of once in every `done`.
+/// `None` can only be produced by [`done`], which writes the completed slot first. An empty frame
+/// stack means that value is the whole recursion's answer, so this is also the only way out of the
+/// loop.
 fn resume_shell(inner: TokenStream) -> TokenStream {
     let (frames, frame, value) = (frames_local(), frame_local(), value_local());
-    let (input_ty, drive) = (input_ty(), drive_label());
+    let (completed, drive) = (completed_local(), drive_label());
     quote! {
-        #input_ty::Resume(#value) => match #frames.pop() {
-            ::core::option::Option::None => break #drive #value,
-            ::core::option::Option::Some(#frame) => #inner,
+        ::core::option::Option::None => {
+            let #value = match #completed.take() {
+                ::core::option::Option::Some(#value) => #value,
+                ::core::option::Option::None => {
+                    ::core::unreachable!("stack_safe: resume without a completed value")
+                }
+            };
+            match #frames.pop() {
+                ::core::option::Option::None => break #drive #value,
+                ::core::option::Option::Some(#frame) => #inner,
+            }
         },
     }
 }
 
 /// One arm per frame, each doing its own carrier check, for a group the shared one does not fit.
 ///
-/// `arms` read the resumed value out of [`names::value_local`], which the shell binds: it used to
-/// be a pattern in the state, and the state no longer has a slot for it.
+/// `arms` read the resumed value out of [`names::value_local`], which the shell takes from the
+/// completed slot.
 pub(super) fn resume_direct(arms: &[TokenStream]) -> TokenStream {
     let frame = frame_local();
     resume_shell(quote! { match #frame { #(#arms)* } })
@@ -89,8 +95,8 @@ pub(super) fn resume_direct(arms: &[TokenStream]) -> TokenStream {
 /// Park `frame` and enter `entry`: a recursive call.
 ///
 /// `args` binds the arguments first, and it has to, for two reasons that both come of the entry
-/// being the arm's *value* — which is where it has to be, since answering with the state rather
-/// than storing it is what keeps the state in registers.
+/// being the arm's *value*, which is where it has to be so the enclosing assignment remains the
+/// one writer of the next entry control.
 ///
 /// The first is order. The frame takes ownership of the locals live across the call, and an
 /// argument may still have to read one of them — `walk(n - 1, ids.clone(), ..)` for an `ids` the
@@ -103,12 +109,12 @@ pub(super) fn resume_direct(arms: &[TokenStream]) -> TokenStream {
 /// offers no expectation. Each argument's own `let`, annotated with the callee's declared parameter
 /// type, is that expectation — the same device the swap path already uses.
 pub(super) fn call(args: TokenStream, entry: TokenStream, frame: TokenStream) -> TokenStream {
-    let (frames, input) = (frames_local(), input_ty());
+    let frames = frames_local();
     quote! {
         {
             #args
             #frames.push(#frame);
-            #input::Enter(#entry)
+            ::core::option::Option::Some(#entry)
         }
     }
 }
@@ -124,11 +130,10 @@ pub(super) fn call(args: TokenStream, entry: TokenStream, frame: TokenStream) ->
 /// still the arm's value. [`tail`] is the same transition for a lowered loop, which has no
 /// arguments to bind.
 pub(super) fn enter(args: TokenStream, entry: TokenStream) -> TokenStream {
-    let input = input_ty();
     quote! {
         {
             #args
-            #input::Enter(#entry)
+            ::core::option::Option::Some(#entry)
         }
     }
 }
@@ -152,9 +157,7 @@ pub(super) fn resume(inner: &[TokenStream], drops: &[TokenStream]) -> TokenStrea
     let value = value_local();
     let branch = try_shim::branch(quote! { #value });
     let handed_down = done(try_shim::from_residual(quote! { #res }));
-    // Both ways out are the arm's *value*: binding the checked value to a `let` first and leaving
-    // the turn on the error path would put a second writer back on the state, which is the one
-    // thing this shape is careful not to do — and it cost the single-call-site case 2.8x.
+    // Both ways out are the arm's value, keeping the next-control assignment in one place.
     resume_shell(quote! {
         match #branch {
             ::core::result::Result::Ok(#ok) => match #frame { #(#inner)* },
@@ -169,8 +172,7 @@ pub(super) fn resume(inner: &[TokenStream], drops: &[TokenStream]) -> TokenStrea
 /// Enter `entry` without parking anything: one iteration of a lowered loop, whose result belongs
 /// to whichever frame is already on top.
 pub(super) fn tail(entry: TokenStream) -> TokenStream {
-    let input = input_ty();
-    quote! { #input::Enter(#entry) }
+    quote! { ::core::option::Option::Some(#entry) }
 }
 
 /// A transition reached from somewhere other than the end of an arm: a `?`, a `return`, or a
@@ -186,9 +188,8 @@ pub(super) fn escape(next: TokenStream) -> TokenStream {
 
 /// The loop around one group's body: `arms` entered at `entry`, run to completion.
 ///
-/// `input_ann` names what the macro knows of the frame enum's payload types, for the same reason
-/// the closure's parameter annotation named them: a payload type only the arms construct is
-/// otherwise still an inference variable where the arms need it.
+/// `input_ann` names what the macro knows of the entry enum's payload types: a payload type only
+/// the arms construct is otherwise still an inference variable where the arms need it.
 pub(super) fn machine(
     entry: &TokenStream,
     input_ann: &TokenStream,
@@ -196,7 +197,7 @@ pub(super) fn machine(
     arms: &[TokenStream],
 ) -> TokenStream {
     let (frames, frames_ty) = (frames_local(), frames_ty());
-    let (input, input_ty) = (input_local(), input_ty());
+    let (input, completed) = (input_local(), completed_local());
     let (drive, body) = (drive_label(), body_label());
     quote! {
         {
@@ -211,7 +212,8 @@ pub(super) fn machine(
             // one allocation covers all of it. The price is that a call which parks nothing still
             // allocates, where `new()` would not have.
             let mut #frames #frames_ann = #frames_ty::with_capacity(64);
-            let mut #input #input_ann = #input_ty::Enter(#entry);
+            let mut #completed: ::core::option::Option<_> = ::core::option::Option::None;
+            let mut #input #input_ann = ::core::option::Option::Some(#entry);
             #drive: loop {
                 #input = #body: { match #input { #(#arms)* } };
             }
