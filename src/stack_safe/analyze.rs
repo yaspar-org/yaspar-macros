@@ -44,10 +44,12 @@ pub(super) struct MethodSplit {
 /// ```
 ///
 /// Everything downstream then applies its usual rules: a `&Self` parameter is `Copy`
-/// and travels in the payload, so the callee may be a *different* value of the same
-/// type, as in `tail.len()`. A `&mut Self` parameter becomes a context slot, exactly
-/// as a `&mut` parameter of a free function does, so recursing into a place derived
-/// from it needs `use_nonlinear_mut` — the same rule, stated once.
+/// and may travel in the payload, so the callee may be a *different* value of the same
+/// type, as in `tail.len()`. When every recursive edge passes the same shared receiver,
+/// `emit` can instead promote it to driver context. A `&mut Self` parameter always
+/// becomes a context slot, exactly as a `&mut` parameter of a free function does, so
+/// recursing into a place derived from it needs `use_nonlinear_mut` — the same rule,
+/// stated once.
 ///
 /// The inner function must be an associated one rather than nested in the wrapper,
 /// because a nested `fn` cannot name `Self` (`E0401`).

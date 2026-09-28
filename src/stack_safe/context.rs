@@ -1,8 +1,8 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Context parameters: the `&mut` parameters and receiver that the driver owns
-//! and lends out, instead of letting them travel in the argument payload.
+//! Context parameters: references the driver owns and lends out, instead of
+//! letting them travel in the argument payload.
 
 use proc_macro2::{Ident, TokenStream};
 use quote::quote;
@@ -19,8 +19,10 @@ use super::names::ctx_param;
 // *context* tuple that the driver owns and lends out — one reborrow per body
 // invocation and per continuation resume, so nothing captures it.
 //
-// Shared (`&`) parameters need none of this: they are `Copy`, so the payload is
-// fine, and they stay there.
+// Shared (`&`) parameters are safe in the payload because they are `Copy`.
+// `emit` may nevertheless promote one to context when it proves that every
+// recursive edge passes the same binding, avoiding a repeated pointer in every
+// entry and continuation.
 // ---------------------------------------------------------------------------
 
 /// One parameter threaded through the driver rather than the payload.
