@@ -28,6 +28,9 @@ pub(super) fn defs_imports(body: &TokenStream) -> TokenStream {
         (pin_ty(), quote! { Pin }),
         (try_trait(), quote! { Try }),
         (from_residual_trait(), quote! { FromResidual }),
+        (range_peek_fn(), quote! { range_peek }),
+        (range_at_fn(), quote! { range_at }),
+        (push_fn(), quote! { push }),
     ];
     let used = optional
         .iter()
@@ -35,8 +38,8 @@ pub(super) fn defs_imports(body: &TokenStream) -> TokenStream {
         .map(|(alias, name)| quote! { #name as #alias, });
     quote! {
         use ::yaspar_macros_defs::{
-            #(#used)*
             Frames as #frames,
+            #(#used)*
         };
     }
 }
@@ -73,6 +76,10 @@ pub(super) fn frame_ty() -> Ident {
 /// `no_std`.
 pub(super) fn frames_ty() -> Ident {
     format_ident!("__SsFrames")
+}
+/// How a call site parks a frame: `Vec::push`, but the first push reserves a block at once.
+pub(super) fn push_fn() -> Ident {
+    format_ident!("__ss_push")
 }
 /// The frame stack itself, which the body pushes to and pops from where it used to answer with
 /// a `Call` or a `Done`.
@@ -149,6 +156,17 @@ pub(super) fn try_trait() -> Ident {
 /// The stand-in for `FromResidual`, which builds the early-exit value.
 pub(super) fn from_residual_trait() -> Ident {
     format_ident!("__SsFromResidual")
+}
+
+/// The head of a `for` over `a..b` whose index the frames recompute: the next value, not yet
+/// stepped past. See `cps::lower_loop`.
+pub(super) fn range_peek_fn() -> Ident {
+    format_ident!("__ss_range_peek")
+}
+
+/// The index such a loop's frames recompute, from the iterator they carry in its place.
+pub(super) fn range_at_fn() -> Ident {
+    format_ident!("__ss_range_at")
 }
 
 /// A lifted group's name: every member it covers, joined.

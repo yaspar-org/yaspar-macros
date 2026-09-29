@@ -155,6 +155,15 @@ fn main() {
     let m = measure("manual", calls, || manual(black_box(&tree), 0));
     let s = measure("stack_safe", calls, || safe(black_box(&tree), 0));
 
+    // The frame stack is allocated by the first frame parked, not up front, so a call whose
+    // evaluation never recurses costs the allocator nothing.
+    let leaf = bushy(0);
+    let a0 = ALLOCS.load(Relaxed);
+    black_box(safe(black_box(&leaf), 0));
+    let leaf_allocs = ALLOCS.load(Relaxed) - a0;
+    println!("{:<12} a call that never recurses: {leaf_allocs} allocs", "stack_safe");
+    assert_eq!(leaf_allocs, 0, "a call that parks no frame must not allocate");
+
     let (n, m, s) = (n.as_secs_f64(), m.as_secs_f64(), s.as_secs_f64());
     println!(
         "\nleaving the stack at all costs {:.1}x (manual / naive)\n\

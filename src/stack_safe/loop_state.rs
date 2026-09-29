@@ -12,7 +12,7 @@ use proc_macro2::{Delimiter, Group, Ident, TokenStream, TokenTree};
 use std::collections::{HashMap, HashSet};
 
 use super::names::{frame_marker, state_marker};
-use super::walk::{PayloadPoint, ResumePoint};
+use super::walk::{Derived, PayloadPoint, ResumePoint};
 
 /// Compute, for every payload point, the list of values it carries: the forced ones
 /// (a `for` loop's iterator, a parked context pointer) plus the in-scope bindings its
@@ -32,10 +32,10 @@ use super::walk::{PayloadPoint, ResumePoint};
 /// The main arms are not inputs: they can only *enter* points, never receive their
 /// payloads, so they contribute nothing and are substituted with whatever the points
 /// settle on.
-pub(super) fn solve_payloads(
-    loops: &[PayloadPoint],
-    resumes: &[ResumePoint],
-) -> (Vec<Vec<Ident>>, Vec<Vec<Ident>>) {
+///
+/// A binding a point can recompute (`PayloadPoint::derived`) is never carried: needing it
+/// means needing what it is recomputed from.
+pub(super) fn solve_payloads(loops: &[PayloadPoint], resumes: &[ResumePoint]) -> Solved {
     // One index space while solving: loops first, then resumes.
     let points: Vec<&PayloadPoint> = loops
         .iter()
@@ -59,9 +59,16 @@ pub(super) fn solve_payloads(
                     }
                 }
             }
+            let recomputed = recomputed(points[n], &needed);
+            for d in &recomputed {
+                needed.insert(canonical(&d.from));
+            }
             let mut next: Vec<Ident> = points[n].forced.clone();
             for id in &points[n].scope {
-                if needed.contains(&canonical(id)) && !next.iter().any(|i| i == id) {
+                if needed.contains(&canonical(id))
+                    && !recomputed.iter().any(|d| &d.name == id)
+                    && !next.iter().any(|i| i == id)
+                {
                     next.push(id.clone());
                 }
             }
@@ -88,8 +95,39 @@ pub(super) fn solve_payloads(
         }
     }
 
-    let resume_solved = solved.split_off(loops.len());
-    (solved, resume_solved)
+    // At the fixed point every marker's payload is in `mentioned`, so this is what the arm's
+    // code, and every payload it builds, reads.
+    let derived: Vec<Vec<Derived>> = points
+        .iter()
+        .zip(&mentioned)
+        .map(|(p, m)| recomputed(p, m).into_iter().cloned().collect())
+        .collect();
+    let frames = solved.split_off(loops.len());
+    Solved {
+        states: solved,
+        frames,
+        derived,
+    }
+}
+
+/// What [`solve_payloads`] settles on.
+pub(super) struct Solved {
+    /// Per lowered loop, the values its state carries.
+    pub(super) states: Vec<Vec<Ident>>,
+    /// Per resume point, the values its frame carries.
+    pub(super) frames: Vec<Vec<Ident>>,
+    /// Per point, loops first, the bindings its arm recomputes rather than receives, in the
+    /// order they were bound.
+    pub(super) derived: Vec<Vec<Derived>>,
+}
+
+/// The bindings `point` recomputes rather than carries, of those `needed` names.
+fn recomputed<'p>(point: &'p PayloadPoint, needed: &HashSet<String>) -> Vec<&'p Derived> {
+    point
+        .derived
+        .iter()
+        .filter(|d| needed.contains(&canonical(&d.name)))
+        .collect()
 }
 
 /// A binding's name as a *use* of it spells it. A raw identifier is written `r#type` where it is

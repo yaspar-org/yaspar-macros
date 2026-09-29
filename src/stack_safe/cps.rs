@@ -554,7 +554,14 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
             // Nothing to take back, release or restore means nothing has to run before this
             // point's code, so a `?` at the front of it may be shared with the other points.
             let bare = parked.is_empty() && marks.is_empty() && swaps.is_empty();
-            let r = ctx.reserve_resume(scope, saved.clone(), v.clone(), bare);
+            // A parked local comes back out of the store, so it is not recomputed either.
+            let derived = env
+                .derived
+                .iter()
+                .filter(|d| !parked.iter().any(|(_, root, _)| root == &d.name))
+                .cloned()
+                .collect();
+            let r = ctx.reserve_resume(scope, derived, saved.clone(), v.clone(), bare);
             let frame_var = frame_variant(r);
             let marker = frame_marker(r);
 
@@ -608,15 +615,21 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
             //
             // Nothing may run before the answer is handed on, which is the whole condition: no
             // value to take back, no store to release, no context pointer to restore and no
-            // prologue to re-derive. `body` being exactly `driver::done` of the resumed value is
-            // what says the continuation is the identity — a group whose members answer with
+            // prologue that does more than rebind. The prologue of a method group is never empty
+            // — it re-derives `self` and every other context slot — but a rebinding the identity
+            // continuation never reads is dead, so only a raw slot's is held against the call:
+            // there the arm would reach the slot through a pointer, and that stays the
+            // `use_nonlinear_mut` path's to reason about.
+            //
+            // `body` being exactly `driver::done` of the resumed value is what says the
+            // continuation is the identity — a group whose members answer with
             // different types re-wraps into the union there, and so does not qualify. Nor does a
             // point whose `?` was lifted out: its value is the checked one, and handing *that*
             // down would offer the next turn's shared check something that is not a carrier.
             let is_tail = take_backs.is_empty()
                 && unpin.is_empty()
                 && swaps.is_empty()
-                && prologue.is_empty()
+                && ctx.ctx_prologue_only_rebinds()
                 && !ctx.is_checked(r)
                 && body.to_string() == driver::done(quote! { #v }).to_string();
             // The identity continuation reserved no point of its own, so `r` is still the last one
@@ -908,7 +921,9 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
                 Some(lp) => {
                     let v = entry_variant(lp.variant);
                     let marker = state_marker(lp.idx);
-                    Ok(driver::escape(driver::tail(quote! { #entry::#v(#marker) })))
+                    let advance = &lp.advance;
+                    let enter = driver::tail(quote! { #entry::#v(#marker) });
+                    Ok(driver::escape(quote! { { #advance #enter } }))
                 }
                 None => Err(syn::Error::new(c.span(), "`continue` outside of a loop")),
             }
@@ -1180,6 +1195,22 @@ fn lower_loop(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStrea
             Some((owner, held, ctx.fresh(), elem))
         }
     };
+    // A `for` over `a..b` binding a plain name leaves its iterator one step behind: the head
+    // looks at the next value without moving past it, and the step happens at the end of the
+    // iteration. The iterator then holds this iteration's value as its `start` for the whole of
+    // the body, and since every point in the body parks the iterator anyway, none of them has to
+    // park the name as well; see `walk::Derived`. That is one word less in each such frame, and
+    // those frames are the ones a loop pushes once per element.
+    let peeked = match (e, &store, &iter_ident) {
+        (Expr::ForLoop(f), None, Some(it)) if is_bounded_range(&f.expr) => {
+            plain_binding(&f.pat).map(|name| (name, it.clone()))
+        }
+        _ => None,
+    };
+    let advance = match &peeked {
+        Some((_, it)) => quote! { let _ = ::core::iter::Iterator::next(&mut #it); },
+        None => TokenStream::new(),
+    };
     let store_forced: Vec<Ident> = store.iter().map(|(_, _, mark, _)| mark.clone()).collect();
     // Not an `Env::restores`: that also runs on `continue`, which still needs the collection.
     let release = match &store {
@@ -1192,6 +1223,7 @@ fn lower_loop(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStrea
 
     let idx = ctx.reserve_loop(
         ctx.scope_with_results(&env.scope),
+        env.derived.clone(),
         iter_ident.clone(),
         store_forced,
     );
@@ -1216,6 +1248,7 @@ fn lower_loop(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStrea
         idx,
         variant: ctx.loop_base() + idx,
         brk: k,
+        advance: advance.clone(),
     };
     // The iterator is a binding inside the loop's entry point, so a *nested*
     // loop must be able to thread it onward — otherwise this loop could not
@@ -1228,7 +1261,8 @@ fn lower_loop(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStrea
         .in_loop(&lp)
         .bind(iter_ident.clone())
         .bind(store_bindings);
-    let again = driver::tail(quote! { #entry::#variant(#marker) });
+    let enter = driver::tail(quote! { #entry::#variant(#marker) });
+    let again = quote! { { #advance #enter } };
     // The body's value is discarded, but it must still be *evaluated*: a branch
     // with no recursive call arrives here as a whole expression rather than as
     // statements already emitted, so dropping it would drop its side effects.
@@ -1240,10 +1274,18 @@ fn lower_loop(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStrea
             let it = iter_ident.as_ref().expect("for loop has an iterator");
             let pat = &f.pat;
             let benv = lenv.bind(pat_bindings(&f.pat));
+            let (benv, step) = match &peeked {
+                Some((name, it)) => {
+                    let (peek, at) = (range_peek_fn(), range_at_fn());
+                    let benv = benv.derive(name.clone(), it.clone(), quote! { #at(&#it) });
+                    (benv, quote! { #peek(&#it) })
+                }
+                None => (benv, quote! { ::core::iter::Iterator::next(&mut #it) }),
+            };
             let body = cps_block(ctx, &benv, &f.body, &next)?;
             let exhausted = k(quote! { () })?;
             quote! {
-                match ::core::iter::Iterator::next(&mut #it) {
+                match #step {
                     ::core::option::Option::None => #exhausted,
                     ::core::option::Option::Some(#pat) => #body,
                 }
@@ -1306,7 +1348,7 @@ fn lower_loop(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStrea
                     // payload slot. The shape is enough; regionck settles the lifetime.
                     let mut #it: <&#elem as ::core::iter::IntoIterator>::IntoIter =
                         ::core::iter::IntoIterator::into_iter(unsafe { &*__ss_owned });
-                    #again
+                    #enter
                 }
                 })
             }
@@ -1314,12 +1356,43 @@ fn lower_loop(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStrea
                 Ok(quote! {
                     {
                         let mut #it = ::core::iter::IntoIterator::into_iter(#iter_val);
-                        #again
+                        #enter
                     }
                 })
             }),
         },
-        _ => Ok(again.clone()),
+        _ => Ok(enter),
+    }
+}
+
+/// Is this `a..b` with both ends written? That syntax always builds a `core::ops::Range`, whatever
+/// is in scope, which is what makes it safe to read the iterator's `start`.
+fn is_bounded_range(e: &Expr) -> bool {
+    match e {
+        Expr::Range(r) => {
+            matches!(r.limits, syn::RangeLimits::HalfOpen(_))
+                && r.start.is_some()
+                && r.end.is_some()
+        }
+        Expr::Paren(p) => is_bounded_range(&p.expr),
+        Expr::Group(g) => is_bounded_range(&g.expr),
+        _ => false,
+    }
+}
+
+/// The name a pattern binds, when it is nothing but an immutable by-value binding: a value the
+/// body cannot change, so the iterator it came from can still say what it is.
+fn plain_binding(pat: &Pat) -> Option<Ident> {
+    match pat {
+        Pat::Ident(p)
+            if p.by_ref.is_none()
+                && p.mutability.is_none()
+                && p.subpat.is_none()
+                && pat_bindings(pat).as_slice() == [p.ident.clone()] =>
+        {
+            Some(p.ident.clone())
+        }
+        _ => None,
     }
 }
 

@@ -32,6 +32,26 @@ pub(super) struct PayloadPoint {
     /// The `#[cfg]` predicates this point was written under, outermost first. The arm generated
     /// for it exists only when they all hold; see `Ctx::gates`.
     pub(super) gates: Vec<TokenStream>,
+    /// Bindings in scope here that the arm recomputes instead of carrying; see [`Derived`].
+    pub(super) derived: Vec<Derived>,
+}
+
+/// A binding whose value, wherever it is in scope, can be recomputed from another binding that
+/// is threaded anyway: a payload then carries the source and not the binding, and the arm the
+/// payload arrives at rebinds the name from it before running its code.
+///
+/// The one kind there is is the index of a `for` over `a..b`. Its iterator has to travel to every
+/// point in the body regardless, since the next iteration needs it, and a `Range` that has not
+/// yet been stepped past this iteration's value holds that value as its `start`. See
+/// `cps::lower_loop`.
+#[derive(Clone)]
+pub(super) struct Derived {
+    /// The binding, as the user's pattern spells it.
+    pub(super) name: Ident,
+    /// What it is recomputed from, which the payload carries in its place.
+    pub(super) from: Ident,
+    /// The expression recomputing it, in terms of `from`.
+    pub(super) expr: TokenStream,
 }
 
 /// A resume point: where execution continues once a callee returns.
@@ -424,10 +444,18 @@ impl Ctx {
         quote! { #(#binds)* }
     }
 
+    /// Whether [`Self::ctx_prologue`] only rebinds names, with no slot reached through a raw
+    /// pointer. Such a prologue has no effect of its own, so a continuation that reads none of
+    /// the names can leave it out.
+    pub(super) fn ctx_prologue_only_rebinds(&self) -> bool {
+        self.context.iter().all(|e| !e.raw.get())
+    }
+
     /// Reserve an entry point for a loop; the code is filled in afterwards.
     pub(super) fn reserve_loop(
         &self,
         scope: Vec<Ident>,
+        derived: Vec<Derived>,
         iter: Option<Ident>,
         also_forced: Vec<Ident>,
     ) -> usize {
@@ -438,6 +466,7 @@ impl Ctx {
             forced: iter.into_iter().chain(also_forced).collect(),
             code: TokenStream::new(),
             gates: self.gates.borrow().clone(),
+            derived,
         });
         loops.len() - 1
     }
@@ -528,6 +557,7 @@ impl Ctx {
     pub(super) fn reserve_resume(
         &self,
         scope: Vec<Ident>,
+        derived: Vec<Derived>,
         forced: Vec<Ident>,
         value: Ident,
         hoistable: bool,
@@ -540,6 +570,7 @@ impl Ctx {
                 forced,
                 code: TokenStream::new(),
                 gates: self.gates.borrow().clone(),
+                derived,
             },
             value,
             hoistable: Cell::new(hoistable),
@@ -650,6 +681,10 @@ pub(super) struct LoopCtx<'a> {
     pub(super) variant: usize,
     /// `break` runs the code that follows the loop.
     pub(super) brk: Cont<'a>,
+    /// What moves the iterator past the iteration just finished, run before re-entering the loop
+    /// at the end of the body and at every `continue`. Empty for a loop whose head does that
+    /// itself; see `cps::lower_loop` for the one whose head does not.
+    pub(super) advance: TokenStream,
 }
 
 /// What the transform needs to know at each point in the walk.
@@ -671,6 +706,9 @@ pub(super) struct Env<'a> {
     /// type and this member's variant. `return` and `?` finish the member from wherever
     /// they stand, so they have to wrap the value just as a normal exit does.
     pub(super) wrap: Option<(Ident, Ident)>,
+    /// Bindings in `scope` a payload need not carry, because the arm it arrives at can recompute
+    /// them. A binding that shadows one drops it: the name then means something else.
+    pub(super) derived: Vec<Derived>,
 }
 
 impl Env<'_> {
@@ -689,10 +727,19 @@ impl<'a> Env<'a> {
     pub(super) fn bind(&self, ids: impl IntoIterator<Item = Ident>) -> Env<'a> {
         let mut next = self.clone();
         for id in ids {
+            next.derived.retain(|d| d.name != id);
             if !next.scope.iter().any(|i| i == &id) {
                 next.scope.push(id);
             }
         }
+        next
+    }
+
+    /// `name`, just bound, can be recomputed from `from` by `expr` everywhere it stays in scope.
+    pub(super) fn derive(&self, name: Ident, from: Ident, expr: TokenStream) -> Env<'a> {
+        let mut next = self.clone();
+        next.derived.retain(|d| d.name != name);
+        next.derived.push(Derived { name, from, expr });
         next
     }
 
@@ -704,6 +751,7 @@ impl<'a> Env<'a> {
             restores: self.restores.clone(),
             teardown: self.teardown.clone(),
             wrap: self.wrap.clone(),
+            derived: self.derived.clone(),
         }
     }
 

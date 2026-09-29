@@ -122,7 +122,8 @@ overhead per call: 1 ns
 Where the stack is not a constraint, the stack *is* the fastest place to be: a native frame costs nothing to push and the
 recursion stays in cache. Leaving it costs about 1 ns per call — and that cost is the leaving, not the macro. The
 transform lands level with the hand-written worklist, which is the comparison that isolates its encoding. One allocation
-covers the whole descent, since frames are allocated 64 at a time.
+covers the whole descent: the frame stack starts out unallocated, and the first frame parked reserves room for 64 at
+once, so a call that never recurses allocates nothing and one that stays within 64 levels allocates once.
 
 Deep recursion reverses it. `cargo run --release --example perf_dispatch_width` walks a 1024-deep chain, where a native
 frame per level starts to hurt:

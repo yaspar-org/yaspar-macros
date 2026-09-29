@@ -59,6 +59,11 @@
 //! bindings are in scope, and intersects that with the identifiers appearing in
 //! the generated entry-point code (see [`loop_state::solve_payloads`]).
 //!
+//! A `for i in a..b` is the common case and gets one refinement: its iterator is
+//! stepped at the end of each iteration rather than the start, so for the whole
+//! body it still holds `i` as its `start`, and a frame pushed from the body
+//! carries the iterator alone and reads `i` back out of it (see `walk::Derived`).
+//!
 //! # `&mut` parameters and methods
 //!
 //! A `&mut` parameter cannot ride in the argument payload: the payload is moved
