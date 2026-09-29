@@ -21,7 +21,7 @@ use super::analyze::{
 use super::context::{CtxEntry, is_context_slot, peel_type, slot_key, slot_type, strip_parens};
 use super::cps::cps_stmts;
 use super::driver;
-use super::loop_state::{solve_payloads, substitute};
+use super::loop_state::{Solved, solve_payloads, substitute};
 use super::names::*;
 use super::walk::{Ctx, Env, Member};
 
@@ -1283,6 +1283,7 @@ fn member_arms(ctx: &Ctx, funcs: &[ItemFn]) -> syn::Result<(Vec<Item>, Vec<Token
             lp: None,
             restores: TokenStream::new(),
             teardown: TokenStream::new(),
+            derived: Vec::new(),
         };
         // Each member's own result enters the union under its own variant.
         let done = |v: TokenStream| -> syn::Result<TokenStream> {
@@ -1411,7 +1412,19 @@ pub(super) fn expand_group(
     let loop_base = ctx.loop_base();
     let loops = ctx.loops.take();
     let resumes = ctx.resumes.take();
-    let (states, frames) = solve_payloads(&loops, &resumes);
+    let Solved {
+        states,
+        frames,
+        derived,
+    } = solve_payloads(&loops, &resumes);
+    // What an arm recomputes rather than receives, bound ahead of its code; see `walk::Derived`.
+    let recompute = |n: usize| -> TokenStream {
+        let binds = derived[n].iter().map(|d| {
+            let (name, expr) = (&d.name, &d.expr);
+            quote! { let #name = #expr; }
+        });
+        quote! { #(#binds)* }
+    };
 
     // The seed lifetime only exists in the lifted path, and only when some member takes a
     // reference: elsewhere an elided `&` in a slot annotation stays elided.
@@ -1441,6 +1454,7 @@ pub(super) fn expand_group(
         let v = entry_variant(loop_base + n);
         let st = &states[n];
         let code = &lp.code;
+        let recomputed = recompute(n);
         let prologue = ctx.ctx_prologue();
         let (gate, stand_in) = gating(&lp.gates);
         // The stand-in exists only for a gated point: the variant is declared whether the predicate
@@ -1456,7 +1470,7 @@ pub(super) fn expand_group(
         arms.push(quote! {
             #gate
             #entry::#v((#(mut #st,)*)) => {
-                #prologue #code
+                #recomputed #prologue #code
             },
             #stand_in
         });
@@ -1483,6 +1497,7 @@ pub(super) fn expand_group(
         let payload = &frames[r];
         let value = &res.value;
         let code = &res.point.code;
+        let recomputed = recompute(loops.len() + r);
         let (gate, stand_in) = gating(&res.point.gates);
         if hoist {
             let ok = ok_local();
@@ -1492,7 +1507,7 @@ pub(super) fn expand_group(
             });
             frame_arms.push(quote! {
                 #gate
-                #frame::#variant((#(mut #payload,)*)) => { let #value = #ok; #code },
+                #frame::#variant((#(mut #payload,)*)) => { let #value = #ok; #recomputed #code },
                 #stand_in
             });
             let dropped = payload.iter().rev();
@@ -1515,7 +1530,7 @@ pub(super) fn expand_group(
         });
         frame_arms.push(quote! {
             #gate
-            #frame::#variant((#(mut #payload,)*)) => { let #value = #resumed; #code },
+            #frame::#variant((#(mut #payload,)*)) => { let #value = #resumed; #recomputed #code },
             #stand_in
         });
     }

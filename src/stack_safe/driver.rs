@@ -8,7 +8,7 @@
 //! makes another recursive call jumps back to entry dispatch.
 //!
 //! ```text
-//! let mut __ss_frames = __SsFrames::with_capacity(64);
+//! let mut __ss_frames = __SsFrames::new(); // allocates on the first `__ss_push`
 //! let mut __ss_input: Entry = __ss_entry;
 //! '__ss_drive: loop {
 //!     let mut __ss_value = '__ss_done: { match __ss_input { .. } };
@@ -26,7 +26,7 @@ use quote::quote;
 
 use super::names::{
     done_label, done_local, drive_label, frame_local, frames_local, frames_ty, input_local,
-    ok_local, res_local, value_local,
+    ok_local, push_fn, res_local, value_local,
 };
 use super::try_shim;
 
@@ -57,10 +57,11 @@ pub(super) fn resume_direct(arms: &[TokenStream]) -> TokenStream {
 /// sites remain the same as in the recursive function.
 pub(super) fn call(args: TokenStream, entry: TokenStream, frame: TokenStream) -> TokenStream {
     let (frames, input, drive) = (frames_local(), input_local(), drive_label());
+    let push = push_fn();
     quote! {
         {
             #args
-            #frames.push(#frame);
+            #push(&mut #frames, #frame);
             #input = #entry;
             continue #drive
         }
@@ -128,7 +129,7 @@ pub(super) fn machine(
     let (drive, done) = (drive_label(), done_label());
     quote! {
         {
-            let mut #frames #frames_ann = #frames_ty::with_capacity(64);
+            let mut #frames #frames_ann = #frames_ty::new();
             let mut #input #input_ann = #entry;
             #drive: loop {
                 let mut #value = #done: {

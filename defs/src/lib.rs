@@ -10,13 +10,15 @@
 //! each one:
 //!
 //! - [`In`], what the loop hands the body on each step, and [`Frames`], the stack it parks
-//!   frames on instead of using the native one;
+//!   frames on instead of using the native one, with [`push`], how a call site parks one;
 //! - [`Step`] and [`drive`], the same protocol and loop as a function the body is handed to,
 //!   which is what an expansion used to be written as and what its benchmarks compare against;
 //! - [`Pin`], the store for values a call site lends its callee, under
 //!   `#[stack_safe(data_in_frame)]`;
 //! - [`Try`] and [`FromResidual`], a stable stand-in for the unstable traits of the
-//!   same names, so that `?` works on a `Result`, an `Option` and a `ControlFlow` alike.
+//!   same names, so that `?` works on a `Result`, an `Option` and a `ControlFlow` alike;
+//! - [`range_peek`] and [`range_at`], how a `for` over `a..b` reads its index back out of
+//!   its iterator instead of parking the index in every frame of its body.
 //!
 //! Nothing here is meant to be named by hand, except [`Try`] and [`FromResidual`]: those are
 //! how a carrier of your own joins `?`. It is all `pub` because the expansions refer to it by
@@ -27,6 +29,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use core::ops::Range;
 
 /// What one turn of the loop hands the body, and what the body hands back to be the next
 /// turn's input.
@@ -56,7 +59,46 @@ pub enum InSplit<A, R> {
 /// A plain `Vec`, named because the expansion has to name it and cannot say `Vec` — the crate
 /// it lands in may be `no_std`, and an expansion that worked or not depending on that would be
 /// a poor bargain. One alias also gives any future change of stack one place to happen.
+///
+/// It starts out empty and unallocated — `Vec::new()` — so a call whose evaluation never
+/// recurses never touches the allocator. The first frame parked reserves room for
+/// [`FIRST_FRAMES`] at once, through [`push`], rather than walking `Vec`'s own 4, 8, 16, 32
+/// regrowths on the way to a typical depth; from there on it grows as a `Vec` does.
 pub type Frames<F> = Vec<F>;
+
+/// How many frames the first push onto an empty [`Frames`] makes room for.
+pub const FIRST_FRAMES: usize = 64;
+
+/// Park `frame` on `frames`: what a recursive call site does.
+///
+/// When there is room this is `Vec::push` and nothing else — the capacity check here is the
+/// one `Vec::push` makes, so the optimiser folds the two into one. When there is not, the push
+/// happens out of line in [`push_grow`], which is where the first push's [`FIRST_FRAMES`]
+/// reservation lives.
+#[inline(always)]
+pub fn push<F>(frames: &mut Frames<F>, frame: F) {
+    if frames.len() == frames.capacity() {
+        push_grow(frames, frame);
+    } else {
+        frames.push(frame);
+    }
+}
+
+/// The full-stack half of [`push`]: make room, then park the frame.
+///
+/// An empty stack gets [`FIRST_FRAMES`] of room; a full one doubles, as `Vec` would have.
+#[cold]
+#[inline(never)]
+pub fn push_grow<F>(frames: &mut Frames<F>, frame: F) {
+    if frames.capacity() == 0 {
+        // A fresh allocation of exactly the first block, rather than `reserve`'s general
+        // growth path, which a stack that never grows past it would pay for on every call.
+        *frames = Frames::with_capacity(FIRST_FRAMES);
+    } else {
+        frames.reserve(frames.capacity());
+    }
+    frames.push(frame);
+}
 
 /// What the body hands back, in the [`drive`] protocol.
 pub enum Step<A, F, R> {
@@ -104,6 +146,30 @@ pub fn drive<C, A, F, R>(
             },
         }
     }
+}
+
+/// The value a `for` over a `Range` binds next, without stepping past it.
+///
+/// A lowered `for idx in a..b` parks its iterator in every frame of its body, since the next
+/// iteration needs it. Stepping the iterator at the *end* of an iteration instead of the start
+/// keeps this iteration's value in it for the whole body — as its `start` — so the frames need
+/// not park `idx` as well: [`range_at`] reads it back. The values bound are the `Range`'s own,
+/// by its own `Iterator::next`, run on a copy.
+#[inline]
+pub fn range_peek<T: Clone>(r: &Range<T>) -> Option<T>
+where
+    Range<T>: Iterator<Item = T>,
+{
+    Iterator::next(&mut r.clone())
+}
+
+/// The value [`range_peek`] last answered for `r`, which has not been stepped since.
+///
+/// `Range::next` answers its `start` and moves `start` on, so an unstepped range still holds the
+/// value it would answer.
+#[inline]
+pub fn range_at<T: Clone>(r: &Range<T>) -> T {
+    r.start.clone()
 }
 
 /// Storage for values a call site builds and lends to its callee.
@@ -358,6 +424,39 @@ impl<B, C> FromResidual<ControlFlowBreak<B>> for core::ops::ControlFlow<B, C> {
     #[inline]
     fn from_residual(r: ControlFlowBreak<B>) -> Self {
         core::ops::ControlFlow::Break(r.0)
+    }
+}
+
+#[cfg(test)]
+mod frames_tests {
+    use super::{FIRST_FRAMES, Frames, push};
+
+    /// An empty stack has not allocated, the first push makes room for `FIRST_FRAMES` at
+    /// once, and a full one doubles.
+    #[test]
+    fn first_push_reserves_a_block_then_doubles() {
+        let mut frames: Frames<u64> = Frames::new();
+        assert_eq!(frames.capacity(), 0);
+        push(&mut frames, 0);
+        assert_eq!(frames.capacity(), FIRST_FRAMES);
+        for i in 1..FIRST_FRAMES as u64 {
+            push(&mut frames, i);
+        }
+        assert_eq!(frames.capacity(), FIRST_FRAMES);
+        push(&mut frames, FIRST_FRAMES as u64);
+        assert_eq!(frames.capacity(), 2 * FIRST_FRAMES);
+        let expect: alloc::vec::Vec<u64> = (0..=FIRST_FRAMES as u64).collect();
+        assert_eq!(frames, expect);
+    }
+
+    /// A frame with no bytes never needs room, and is still counted.
+    #[test]
+    fn zero_sized_frames() {
+        let mut frames: Frames<()> = Frames::new();
+        for _ in 0..1000 {
+            push(&mut frames, ());
+        }
+        assert_eq!(frames.len(), 1000);
     }
 }
 

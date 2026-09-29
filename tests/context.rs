@@ -1160,3 +1160,106 @@ fn deep_cycle_spelling_one_slot_two_ways_is_flat() {
     });
     assert_eq!(out.len(), depth as usize);
 }
+
+// ---------------------------------------------------------------------------
+// Tail calls in a group with context slots. The continuation of `even`'s call to `odd` is the
+// identity, so the call enters `odd` without parking a frame, even though every arm of the group
+// rebinds `self` and `out`. What this pins is that skipping that rebinding hands the answer to
+// the right frame: `sum` resumes after each tail chain, below frames that the chain never saw.
+// ---------------------------------------------------------------------------
+
+struct Parity {
+    calls: u64,
+}
+
+#[stack_safe]
+impl Parity {
+    fn even(&mut self, n: u64, out: &mut Vec<u64>) -> u64 {
+        self.calls += 1;
+        if n == 0 {
+            return 0;
+        }
+        out.push(n);
+        self.odd(n - 1, out)
+    }
+
+    fn odd(&mut self, n: u64, out: &mut Vec<u64>) -> u64 {
+        self.calls += 1;
+        if n == 0 {
+            return 1;
+        }
+        match n % 3 {
+            // A tail call again, so chains of them stack up with nothing parked between.
+            0 => self.even(n - 1, out),
+            // Not a tail call: this frame resumes with what the chain below it hands down.
+            _ => {
+                let below = self.even(n - 1, out);
+                out.push(below);
+                below + n
+            }
+        }
+    }
+}
+
+fn even_naive(calls: &mut u64, n: u64, out: &mut Vec<u64>) -> u64 {
+    *calls += 1;
+    if n == 0 {
+        return 0;
+    }
+    out.push(n);
+    odd_naive(calls, n - 1, out)
+}
+
+fn odd_naive(calls: &mut u64, n: u64, out: &mut Vec<u64>) -> u64 {
+    *calls += 1;
+    if n == 0 {
+        return 1;
+    }
+    match n % 3 {
+        0 => even_naive(calls, n - 1, out),
+        _ => {
+            let below = even_naive(calls, n - 1, out);
+            out.push(below);
+            below + n
+        }
+    }
+}
+
+#[test]
+fn tail_calls_between_methods_agree_with_naive() {
+    for n in 0..60 {
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        let mut p = Parity { calls: 0 };
+        let mut calls = 0;
+        assert_eq!(
+            p.even(n, &mut a),
+            even_naive(&mut calls, n, &mut b),
+            "n = {n}"
+        );
+        assert_eq!((p.calls, a), (calls, b), "n = {n}");
+    }
+}
+
+#[test]
+fn deep_tail_calls_between_methods_are_flat() {
+    let (got, calls, len) = on_tiny_stack(|| {
+        let mut out = Vec::new();
+        let mut p = Parity { calls: 0 };
+        let got = p.even(DEEP, &mut out);
+        (got, p.calls, out.len())
+    });
+    let (mut out, mut calls_naive) = (Vec::new(), 0);
+    let want = std::thread::Builder::new()
+        .stack_size(1 << 30)
+        .spawn(move || {
+            (
+                even_naive(&mut calls_naive, DEEP, &mut out),
+                calls_naive,
+                out.len(),
+            )
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+    assert_eq!((got, calls, len), want);
+}

@@ -20,7 +20,7 @@ Those are generated. The other half is the same for every function, so it is wri
 | item                  | what it is                                                                                                     |
 |-----------------------|----------------------------------------------------------------------------------------------------------------|
 | `In`                  | the loop's state: enter an entry point, or resume a frame with the value a callee produced                      |
-| `Frames`              | the stack it parks frames on instead of using the native one                                                   |
+| `Frames`, `push`      | the stack it parks frames on instead of using the native one, unallocated until the first push reserves 64     |
 | `Pin`                 | the store for values a call site lends its callee, under `#[stack_safe(data_in_frame)]`                        |
 | `Try`, `FromResidual` | a stand-in for the unstable traits of the same names, so that `?` works on a `Result` and on an `Option` alike |
 | `Step`, `drive`       | the same machine as a loop the body is handed to, which is what an expansion used to be; kept as the reference its benchmarks measure against |

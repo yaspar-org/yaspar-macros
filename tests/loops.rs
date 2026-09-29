@@ -824,3 +824,205 @@ fn loop_after_a_call_is_flat() {
     });
     assert_eq!(deep, 1);
 }
+
+// ---------------------------------------------------------------------------
+// `for i in a..b`: the index is not parked but read back out of the iterator,
+// which is stepped at the end of each iteration instead of the start. Every
+// way of reaching the next iteration has to step it exactly once, and every
+// way of rebinding the name has to stop it being read back.
+// ---------------------------------------------------------------------------
+
+/// The index read after a call, both by position and in a format capture, with `continue` from
+/// code that recurses and code that does not, and a `break` that ends the loop early.
+#[stack_safe]
+fn indexed(t: &Tree, i: usize) -> u64 {
+    let mut acc = t.vals[i];
+    for k in 1..t.kids[i].len() + 1 {
+        let c = t.kids[i][k - 1];
+        if t.vals[c] % 7 == 3 {
+            continue;
+        }
+        let s = indexed(t, c);
+        if s % 5 == 1 {
+            acc += k as u64;
+            continue;
+        }
+        if t.vals[c] % 13 == 4 {
+            break;
+        }
+        let label = format!("{k}");
+        acc += s * (k as u64) + label.len() as u64 + t.kids[i][k - 1] as u64;
+    }
+    acc
+}
+
+fn indexed_naive(t: &Tree, i: usize) -> u64 {
+    let mut acc = t.vals[i];
+    for k in 1..t.kids[i].len() + 1 {
+        let c = t.kids[i][k - 1];
+        if t.vals[c] % 7 == 3 {
+            continue;
+        }
+        let s = indexed_naive(t, c);
+        if s % 5 == 1 {
+            acc += k as u64;
+            continue;
+        }
+        if t.vals[c] % 13 == 4 {
+            break;
+        }
+        let label = format!("{k}");
+        acc += s * (k as u64) + label.len() as u64 + t.kids[i][k - 1] as u64;
+    }
+    acc
+}
+
+#[test]
+fn range_index_survives_calls() {
+    for (branch, depth) in [(2, 6), (4, 4), (7, 3)] {
+        let t = Tree::bushy(branch, depth);
+        assert_eq!(
+            indexed(&t, 0),
+            indexed_naive(&t, 0),
+            "bushy {branch}^{depth}"
+        );
+    }
+}
+
+/// A `let` that shadows the index after one call must be what the next call's continuation sees,
+/// not the iterator's value.
+#[stack_safe]
+fn shadowed(t: &Tree, i: usize) -> u64 {
+    let mut acc = t.vals[i];
+    for k in 0..t.kids[i].len() {
+        let a = shadowed(t, t.kids[i][k]);
+        let k = k * 10 + 3;
+        let b = shadowed(t, t.kids[i][(k - 3) / 10]);
+        acc += a + b * k as u64;
+    }
+    acc
+}
+
+fn shadowed_naive(t: &Tree, i: usize) -> u64 {
+    let mut acc = t.vals[i];
+    for k in 0..t.kids[i].len() {
+        let a = shadowed_naive(t, t.kids[i][k]);
+        let k = k * 10 + 3;
+        let b = shadowed_naive(t, t.kids[i][(k - 3) / 10]);
+        acc += a + b * k as u64;
+    }
+    acc
+}
+
+#[test]
+fn shadowed_range_index() {
+    for (branch, depth) in [(2, 5), (3, 4)] {
+        let t = Tree::bushy(branch, depth);
+        assert_eq!(
+            shadowed(&t, 0),
+            shadowed_naive(&t, 0),
+            "bushy {branch}^{depth}"
+        );
+    }
+}
+
+/// Nested range loops: the inner loop's state and frames carry the outer iterator, and read the
+/// outer index back out of it, after the inner loop's own calls.
+#[stack_safe]
+fn nested_ranges(t: &Tree, i: usize) -> u64 {
+    let mut acc = t.vals[i];
+    for a in 0..t.kids[i].len() {
+        for b in a..t.kids[i].len() {
+            let s = nested_ranges(t, t.kids[i][b]);
+            acc += s * (a as u64 + 1) + b as u64;
+        }
+        acc += nested_ranges(t, t.kids[i][a]) ^ a as u64;
+    }
+    acc
+}
+
+fn nested_ranges_naive(t: &Tree, i: usize) -> u64 {
+    let mut acc = t.vals[i];
+    for a in 0..t.kids[i].len() {
+        for b in a..t.kids[i].len() {
+            let s = nested_ranges_naive(t, t.kids[i][b]);
+            acc += s * (a as u64 + 1) + b as u64;
+        }
+        acc += nested_ranges_naive(t, t.kids[i][a]) ^ a as u64;
+    }
+    acc
+}
+
+#[test]
+fn nested_range_indices() {
+    for (branch, depth) in [(2, 4), (3, 3)] {
+        let t = Tree::bushy(branch, depth);
+        assert_eq!(
+            nested_ranges(&t, 0),
+            nested_ranges_naive(&t, 0),
+            "bushy {branch}^{depth}"
+        );
+    }
+}
+
+/// The element type is the range's, not `usize`: a `char` range steps and reads back the same.
+/// `?` inside the body leaves the loop without stepping it again.
+#[stack_safe]
+fn spell(n: u32) -> Result<String, u32> {
+    if n == 0 {
+        return Ok(String::new());
+    }
+    let mut out = String::new();
+    for c in 'a'..'e' {
+        let inner = spell(n - 1)?;
+        if n == 7 && c == 'c' {
+            return Err(n);
+        }
+        out.push(c);
+        out.push_str(&inner[..inner.len().min(2)]);
+    }
+    Ok(out)
+}
+
+fn spell_naive(n: u32) -> Result<String, u32> {
+    if n == 0 {
+        return Ok(String::new());
+    }
+    let mut out = String::new();
+    for c in 'a'..'e' {
+        let inner = spell_naive(n - 1)?;
+        if n == 7 && c == 'c' {
+            return Err(n);
+        }
+        out.push(c);
+        out.push_str(&inner[..inner.len().min(2)]);
+    }
+    Ok(out)
+}
+
+#[test]
+fn char_range_index() {
+    for n in 0..9 {
+        assert_eq!(spell(n), spell_naive(n), "n = {n}");
+    }
+}
+
+/// A wide range loop still costs no stack per iteration, with the index read after the call.
+#[stack_safe]
+fn wide_indexed(t: &Tree, i: usize) -> u64 {
+    let mut acc = t.vals[i];
+    for k in 0..t.kids[i].len() {
+        acc += wide_indexed(t, t.kids[i][k]) + (k as u64 & 1);
+    }
+    acc
+}
+
+#[test]
+fn wide_range_loop_is_flat() {
+    let n = 200_000;
+    let got = on_tiny_stack(move || {
+        let t = Tree::star(n);
+        wide_indexed(&t, 0)
+    });
+    assert_eq!(got, n as u64 + 1 + (n as u64 / 2));
+}

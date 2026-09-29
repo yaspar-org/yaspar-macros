@@ -1429,3 +1429,37 @@ fn suffixed_counter_is_flat() {
         .join();
     assert_eq!(deep.ok(), Some(100_000));
 }
+
+// ---------------------------------------------------------------------------
+// The frame stack is allocated lazily: nothing until the first frame is
+// parked, then room for 64 at once, then doubling. Every depth either side of
+// those boundaries has to come out the same as the recursion it replaces.
+// ---------------------------------------------------------------------------
+
+/// A local live across the call, so each level parks a frame that carries it.
+#[stack_safe]
+fn weighted(n: u64) -> u64 {
+    if n == 0 {
+        return 7;
+    }
+    let w = n * 3 + 1;
+    weighted(n - 1) * 31 % 1_000_003 + w
+}
+
+fn weighted_naive(n: u64) -> u64 {
+    if n == 0 {
+        return 7;
+    }
+    let w = n * 3 + 1;
+    weighted_naive(n - 1) * 31 % 1_000_003 + w
+}
+
+#[test]
+fn lazy_frame_stack_across_growth_boundaries() {
+    // 0 parks nothing; 64 fills the first block; 65 and 129 each regrow it.
+    for n in (0..=3).chain(60..=70).chain(125..=131).chain([255, 256, 257, 1000]) {
+        assert_eq!(weighted(n), weighted_naive(n), "n = {n}");
+    }
+    let deep = on_tiny_stack(|| weighted(100_000));
+    assert_eq!(deep, (1..=100_000).fold(7, |acc, n| acc * 31 % 1_000_003 + n * 3 + 1));
+}

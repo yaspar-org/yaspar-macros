@@ -110,7 +110,9 @@ impl VisitMut for LeafRewrite<'_> {
                 if let Some(lp) = self.lp {
                     let v = entry_variant(lp.variant);
                     let marker = state_marker(lp.idx);
-                    let again = driver::escape(driver::tail(quote! { #entry::#v(#marker) }));
+                    let advance = &lp.advance;
+                    let enter = driver::tail(quote! { #entry::#v(#marker) });
+                    let again = driver::escape(quote! { { #advance #enter } });
                     *e = parse_quote! { { #undo #again } };
                 }
             }
