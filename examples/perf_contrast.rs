@@ -161,8 +161,14 @@ fn main() {
     let a0 = ALLOCS.load(Relaxed);
     black_box(safe(black_box(&leaf), 0));
     let leaf_allocs = ALLOCS.load(Relaxed) - a0;
-    println!("{:<12} a call that never recurses: {leaf_allocs} allocs", "stack_safe");
-    assert_eq!(leaf_allocs, 0, "a call that parks no frame must not allocate");
+    println!(
+        "{:<12} a call that never recurses: {leaf_allocs} allocs",
+        "stack_safe"
+    );
+    assert_eq!(
+        leaf_allocs, 0,
+        "a call that parks no frame must not allocate"
+    );
 
     let (n, m, s) = (n.as_secs_f64(), m.as_secs_f64(), s.as_secs_f64());
     println!(

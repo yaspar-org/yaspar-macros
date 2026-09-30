@@ -1457,9 +1457,16 @@ fn weighted_naive(n: u64) -> u64 {
 #[test]
 fn lazy_frame_stack_across_growth_boundaries() {
     // 0 parks nothing; 64 fills the first block; 65 and 129 each regrow it.
-    for n in (0..=3).chain(60..=70).chain(125..=131).chain([255, 256, 257, 1000]) {
+    for n in (0..=3)
+        .chain(60..=70)
+        .chain(125..=131)
+        .chain([255, 256, 257, 1000])
+    {
         assert_eq!(weighted(n), weighted_naive(n), "n = {n}");
     }
     let deep = on_tiny_stack(|| weighted(100_000));
-    assert_eq!(deep, (1..=100_000).fold(7, |acc, n| acc * 31 % 1_000_003 + n * 3 + 1));
+    assert_eq!(
+        deep,
+        (1..=100_000).fold(7, |acc, n| acc * 31 % 1_000_003 + n * 3 + 1)
+    );
 }
