@@ -239,8 +239,14 @@ fn sites9(e: &E) -> R {
 /// This is the open question in one function. `hand3` is fast and concrete; what the macro emits
 /// is one loop and generic. If *this* is fast, the two-loop shape survives genericity and is
 /// worth emitting. If it is slow, genericity is the wall and restructuring cannot pay.
-enum GEntry<A0> { E0(A0) }
-enum GFrame<F0, F1, F2> { R0(F0), R1(F1), R2(F2) }
+enum GEntry<A0> {
+    E0(A0),
+}
+enum GFrame<F0, F1, F2> {
+    R0(F0),
+    R1(F1),
+    R2(F2),
+}
 
 fn hand3_generic(root: &E) -> R {
     let mut frames: Vec<GFrame<(), &E, V>> = Vec::new();
@@ -273,7 +279,10 @@ fn hand3_generic(root: &E) -> R {
                         Err(e) => return Err(e),
                     };
                     match f {
-                        GFrame::R0(()) => { v.1[0] ^= v.0.len() as u64; val = Ok(v); }
+                        GFrame::R0(()) => {
+                            v.1[0] ^= v.0.len() as u64;
+                            val = Ok(v);
+                        }
                         GFrame::R1(b) => {
                             frames.push(GFrame::R2(v));
                             cur = GEntry::E0(b);
@@ -287,7 +296,6 @@ fn hand3_generic(root: &E) -> R {
     }
 }
 
-
 // ---- the ladder: hand3_generic -> the macro's expansion, one change per rung ----
 // Every rung keeps generic enums and heap frames. Read the deltas, not the absolutes.
 
@@ -295,7 +303,10 @@ type GF<'a> = GFrame<(), &'a E, V>;
 
 /// L1: one loop instead of two. "Which phase am I in" moves from the program counter into a
 /// data tag. Everything else is `hand3_generic`.
-enum L1In<'a> { Enter(GEntry<&'a E>), Resume(GF<'a>, R) }
+enum L1In<'a> {
+    Enter(GEntry<&'a E>),
+    Resume(GF<'a>, R),
+}
 
 fn ladder1_one_loop(root: &E) -> R {
     let mut frames: Vec<GF<'_>> = Vec::new();
@@ -310,14 +321,23 @@ fn ladder1_one_loop(root: &E) -> R {
                         Some(f) => L1In::Resume(f, Ok(v)),
                     }
                 }
-                E::N0(a) => { frames.push(GFrame::R0(())); L1In::Enter(GEntry::E0(a)) }
-                E::N1(a, b) => { frames.push(GFrame::R1(b)); L1In::Enter(GEntry::E0(a)) }
+                E::N0(a) => {
+                    frames.push(GFrame::R0(()));
+                    L1In::Enter(GEntry::E0(a))
+                }
+                E::N1(a, b) => {
+                    frames.push(GFrame::R1(b));
+                    L1In::Enter(GEntry::E0(a))
+                }
                 E::N2(..) | E::N3(..) | E::N4(..) => {
-                    return Err("not reached".to_string().into_boxed_str())
+                    return Err("not reached".to_string().into_boxed_str());
                 }
             },
             L1In::Resume(f, r) => {
-                let mut v = match r { Ok(v) => v, Err(e) => return Err(e) };
+                let mut v = match r {
+                    Ok(v) => v,
+                    Err(e) => return Err(e),
+                };
                 match f {
                     GFrame::R0(()) => {
                         v.1[0] ^= v.0.len() as u64;
@@ -326,7 +346,10 @@ fn ladder1_one_loop(root: &E) -> R {
                             Some(f2) => L1In::Resume(f2, Ok(v)),
                         }
                     }
-                    GFrame::R1(b) => { frames.push(GFrame::R2(v)); L1In::Enter(GEntry::E0(b)) }
+                    GFrame::R1(b) => {
+                        frames.push(GFrame::R2(v));
+                        L1In::Enter(GEntry::E0(b))
+                    }
                     GFrame::R2(x) => {
                         let nv = V(x.0, [v.1[0]; 8]);
                         match frames.pop() {
@@ -342,7 +365,12 @@ fn ladder1_one_loop(root: &E) -> R {
 
 /// L2: L1 plus the driver protocol -- the body answers with a `Step` and a second match does the
 /// push and pop, instead of the body doing them itself.
-enum L2Step<'a> { Done(R), Call(GEntry<&'a E>, GF<'a>), #[allow(dead_code)] Tail(GEntry<&'a E>) }
+enum L2Step<'a> {
+    Done(R),
+    Call(GEntry<&'a E>, GF<'a>),
+    #[allow(dead_code)]
+    Tail(GEntry<&'a E>),
+}
 
 fn ladder2_step_protocol(root: &E) -> R {
     let mut frames: Vec<GF<'_>> = Vec::new();
@@ -358,9 +386,15 @@ fn ladder2_step_protocol(root: &E) -> R {
                 }
             },
             L1In::Resume(f, r) => {
-                let mut v = match r { Ok(v) => v, Err(e) => return Err(e) };
+                let mut v = match r {
+                    Ok(v) => v,
+                    Err(e) => return Err(e),
+                };
                 match f {
-                    GFrame::R0(()) => { v.1[0] ^= v.0.len() as u64; L2Step::Done(Ok(v)) }
+                    GFrame::R0(()) => {
+                        v.1[0] ^= v.0.len() as u64;
+                        L2Step::Done(Ok(v))
+                    }
                     GFrame::R1(b) => L2Step::Call(GEntry::E0(b), GFrame::R2(v)),
                     GFrame::R2(x) => L2Step::Done(Ok(V(x.0, [v.1[0]; 8]))),
                 }
@@ -368,7 +402,10 @@ fn ladder2_step_protocol(root: &E) -> R {
         };
         match step {
             L2Step::Tail(a) => input = L1In::Enter(a),
-            L2Step::Call(a, f) => { frames.push(f); input = L1In::Enter(a); }
+            L2Step::Call(a, f) => {
+                frames.push(f);
+                input = L1In::Enter(a);
+            }
             L2Step::Done(r) => match frames.pop() {
                 None => return r,
                 Some(f) => input = L1In::Resume(f, r),
@@ -378,11 +415,25 @@ fn ladder2_step_protocol(root: &E) -> R {
 }
 
 /// L3: L2 with every payload wrapped in a one-tuple, as the expansion writes them.
-enum TEntry<A0> { E0(A0) }
-enum TFrame<F0, F1, F2> { R0(F0), R1(F1), R2(F2) }
+enum TEntry<A0> {
+    E0(A0),
+}
+enum TFrame<F0, F1, F2> {
+    R0(F0),
+    R1(F1),
+    R2(F2),
+}
 type TF<'a> = TFrame<(), (&'a E,), (V,)>;
-enum L3In<'a> { Enter(TEntry<(&'a E,)>), Resume(TF<'a>, R) }
-enum L3Step<'a> { Done(R), Call(TEntry<(&'a E,)>, TF<'a>), #[allow(dead_code)] Tail(TEntry<(&'a E,)>) }
+enum L3In<'a> {
+    Enter(TEntry<(&'a E,)>),
+    Resume(TF<'a>, R),
+}
+enum L3Step<'a> {
+    Done(R),
+    Call(TEntry<(&'a E,)>, TF<'a>),
+    #[allow(dead_code)]
+    Tail(TEntry<(&'a E,)>),
+}
 
 fn ladder3_tuple_payloads(root: &E) -> R {
     let mut frames: Vec<TF<'_>> = Vec::new();
@@ -398,9 +449,15 @@ fn ladder3_tuple_payloads(root: &E) -> R {
                 }
             },
             L3In::Resume(f, r) => {
-                let mut v = match r { Ok(v) => v, Err(e) => return Err(e) };
+                let mut v = match r {
+                    Ok(v) => v,
+                    Err(e) => return Err(e),
+                };
                 match f {
-                    TFrame::R0(()) => { v.1[0] ^= v.0.len() as u64; L3Step::Done(Ok(v)) }
+                    TFrame::R0(()) => {
+                        v.1[0] ^= v.0.len() as u64;
+                        L3Step::Done(Ok(v))
+                    }
                     TFrame::R1((b,)) => L3Step::Call(TEntry::E0((b,)), TFrame::R2((v,))),
                     TFrame::R2((x,)) => L3Step::Done(Ok(V(x.0, [v.1[0]; 8]))),
                 }
@@ -408,7 +465,10 @@ fn ladder3_tuple_payloads(root: &E) -> R {
         };
         match step {
             L3Step::Tail(a) => input = L3In::Enter(a),
-            L3Step::Call(a, f) => { frames.push(f); input = L3In::Enter(a); }
+            L3Step::Call(a, f) => {
+                frames.push(f);
+                input = L3In::Enter(a);
+            }
             L3Step::Done(r) => match frames.pop() {
                 None => return r,
                 Some(f) => input = L3In::Resume(f, r),
@@ -438,7 +498,10 @@ fn ladder3c_one_call_site(root: &E) -> R {
                     Err(e) => return L3Step::Done(Err(e)),
                 };
                 match f {
-                    TFrame::R0(()) => { v.1[0] ^= v.0.len() as u64; L3Step::Done(Ok(v)) }
+                    TFrame::R0(()) => {
+                        v.1[0] ^= v.0.len() as u64;
+                        L3Step::Done(Ok(v))
+                    }
                     TFrame::R1((b,)) => L3Step::Call(TEntry::E0((b,)), TFrame::R2((v,))),
                     TFrame::R2((x,)) => L3Step::Done(Ok(V(x.0, [v.1[0]; 8]))),
                 }
@@ -450,7 +513,10 @@ fn ladder3c_one_call_site(root: &E) -> R {
     loop {
         match body(input) {
             L3Step::Tail(a) => input = L3In::Enter(a),
-            L3Step::Call(a, f) => { frames.push(f); input = L3In::Enter(a); }
+            L3Step::Call(a, f) => {
+                frames.push(f);
+                input = L3In::Enter(a);
+            }
             L3Step::Done(r) => match frames.pop() {
                 None => return r,
                 Some(f) => input = L3In::Resume(f, r),
@@ -470,7 +536,10 @@ fn ladder3b_transition_first(root: &E) -> R {
     loop {
         match step {
             L3Step::Tail(a) => input = L3In::Enter(a),
-            L3Step::Call(a, f) => { frames.push(f); input = L3In::Enter(a); }
+            L3Step::Call(a, f) => {
+                frames.push(f);
+                input = L3In::Enter(a);
+            }
             L3Step::Done(r) => match frames.pop() {
                 None => return r,
                 Some(f) => input = L3In::Resume(f, r),
@@ -486,9 +555,15 @@ fn ladder3b_transition_first(root: &E) -> R {
                 }
             },
             L3In::Resume(f, r) => {
-                let mut v = match r { Ok(v) => v, Err(e) => return Err(e) };
+                let mut v = match r {
+                    Ok(v) => v,
+                    Err(e) => return Err(e),
+                };
                 match f {
-                    TFrame::R0(()) => { v.1[0] ^= v.0.len() as u64; L3Step::Done(Ok(v)) }
+                    TFrame::R0(()) => {
+                        v.1[0] ^= v.0.len() as u64;
+                        L3Step::Done(Ok(v))
+                    }
                     TFrame::R1((b,)) => L3Step::Call(TEntry::E0((b,)), TFrame::R2((v,))),
                     TFrame::R2((x,)) => L3Step::Done(Ok(V(x.0, [v.1[0]; 8]))),
                 }
@@ -499,7 +574,7 @@ fn ladder3b_transition_first(root: &E) -> R {
 
 /// L4a: L3 plus the closure handed to `drive`, but the residual still a plain `match`.
 fn ladder4a_closure(root: &E) -> R {
-    use yaspar_macros_defs::{drive, In, Step};
+    use yaspar_macros_defs::{In, Step, drive};
     drive(
         &mut (),
         TEntry::E0((root,)),
@@ -513,9 +588,15 @@ fn ladder4a_closure(root: &E) -> R {
                 }
             },
             In::Resume(f, r) => {
-                let mut v = match r { Ok(v) => v, Err(e) => return Step::Done(Err(e)) };
+                let mut v = match r {
+                    Ok(v) => v,
+                    Err(e) => return Step::Done(Err(e)),
+                };
                 match f {
-                    TFrame::R0(()) => { v.1[0] ^= v.0.len() as u64; Step::Done(Ok(v)) }
+                    TFrame::R0(()) => {
+                        v.1[0] ^= v.0.len() as u64;
+                        Step::Done(Ok(v))
+                    }
                     TFrame::R1((b,)) => Step::Call(TEntry::E0((b,)), TFrame::R2((v,))),
                     TFrame::R2((x,)) => Step::Done(Ok(V(x.0, [v.1[0]; 8]))),
                 }
@@ -541,7 +622,10 @@ fn ladder4b_try(root: &E) -> R {
             },
             L3In::Resume(f, r) => match f {
                 TFrame::R0(()) => match Try::branch(r) {
-                    Ok(mut v) => { v.1[0] ^= v.0.len() as u64; L3Step::Done(Ok(v)) }
+                    Ok(mut v) => {
+                        v.1[0] ^= v.0.len() as u64;
+                        L3Step::Done(Ok(v))
+                    }
                     Err(res) => L3Step::Done(FromResidual::from_residual(res)),
                 },
                 TFrame::R1((b,)) => match Try::branch(r) {
@@ -556,7 +640,10 @@ fn ladder4b_try(root: &E) -> R {
         };
         match step {
             L3Step::Tail(a) => input = L3In::Enter(a),
-            L3Step::Call(a, f) => { frames.push(f); input = L3In::Enter(a); }
+            L3Step::Call(a, f) => {
+                frames.push(f);
+                input = L3In::Enter(a);
+            }
             L3Step::Done(r) => match frames.pop() {
                 None => return r,
                 Some(f) => input = L3In::Resume(f, r),
@@ -569,7 +656,7 @@ fn ladder4b_try(root: &E) -> R {
 /// `Try`/`FromResidual`. This is what the expansion *was*, written out: the rung the current
 /// one is measured against. `ladder1_one_loop` above is what it is now, near enough.
 fn ladder4_expansion(root: &E) -> R {
-    use yaspar_macros_defs::{drive, FromResidual, In, Step, Try};
+    use yaspar_macros_defs::{FromResidual, In, Step, Try, drive};
     drive(
         &mut (),
         TEntry::E0((root,)),
@@ -584,7 +671,10 @@ fn ladder4_expansion(root: &E) -> R {
             },
             In::Resume(f, r) => match f {
                 TFrame::R0(()) => match Try::branch(r) {
-                    Ok(mut v) => { v.1[0] ^= v.0.len() as u64; Step::Done(Ok(v)) }
+                    Ok(mut v) => {
+                        v.1[0] ^= v.0.len() as u64;
+                        Step::Done(Ok(v))
+                    }
                     Err(res) => Step::Done(FromResidual::from_residual(res)),
                 },
                 TFrame::R1((b,)) => match Try::branch(r) {
@@ -625,29 +715,149 @@ fn main() {
     for depth in [4usize, 1024] {
         let e = chain(depth);
         let iters = if depth > 512 { 50_000 } else { 500_000 };
-        let base = time(|| { black_box(native(black_box(&e))).ok(); }, iters);
+        let base = time(
+            || {
+                black_box(native(black_box(&e))).ok();
+            },
+            iters,
+        );
         println!("depth {depth}, native {base:.0} ns");
         for (sites, ns) in [
-            (1, time(|| { black_box(sites1(black_box(&e))).ok(); }, iters)),
-            (3, time(|| { black_box(sites3(black_box(&e))).ok(); }, iters)),
-            (5, time(|| { black_box(sites5(black_box(&e))).ok(); }, iters)),
-            (9, time(|| { black_box(sites9(black_box(&e))).ok(); }, iters)),
+            (
+                1,
+                time(
+                    || {
+                        black_box(sites1(black_box(&e))).ok();
+                    },
+                    iters,
+                ),
+            ),
+            (
+                3,
+                time(
+                    || {
+                        black_box(sites3(black_box(&e))).ok();
+                    },
+                    iters,
+                ),
+            ),
+            (
+                5,
+                time(
+                    || {
+                        black_box(sites5(black_box(&e))).ok();
+                    },
+                    iters,
+                ),
+            ),
+            (
+                9,
+                time(
+                    || {
+                        black_box(sites9(black_box(&e))).ok();
+                    },
+                    iters,
+                ),
+            ),
         ] {
-            println!("  {sites:>2} call sites: {ns:8.0} ns  {:5.2}x native", ns / base);
+            println!(
+                "  {sites:>2} call sites: {ns:8.0} ns  {:5.2}x native",
+                ns / base
+            );
         }
-        let hand = time(|| { black_box(hand3(black_box(&e))).ok(); }, iters);
-        println!("   3 by hand:    {hand:8.0} ns  {:5.2}x native", hand / base);
-        let handg = time(|| { black_box(hand3_generic(black_box(&e))).ok(); }, iters);
-        println!("   L0 two loops, generic:    {handg:8.0} ns  {:5.2}x native", handg / base);
+        let hand = time(
+            || {
+                black_box(hand3(black_box(&e))).ok();
+            },
+            iters,
+        );
+        println!(
+            "   3 by hand:    {hand:8.0} ns  {:5.2}x native",
+            hand / base
+        );
+        let handg = time(
+            || {
+                black_box(hand3_generic(black_box(&e))).ok();
+            },
+            iters,
+        );
+        println!(
+            "   L0 two loops, generic:    {handg:8.0} ns  {:5.2}x native",
+            handg / base
+        );
         for (name, ns) in [
-            ("L1 + one loop (phase in tag)", time(|| { black_box(ladder1_one_loop(black_box(&e))).ok(); }, iters)),
-            ("L2 + Step/driver protocol   ", time(|| { black_box(ladder2_step_protocol(black_box(&e))).ok(); }, iters)),
-            ("L3 + tuple payloads         ", time(|| { black_box(ladder3_tuple_payloads(black_box(&e))).ok(); }, iters)),
-            ("L3c closure, 1 call site    ", time(|| { black_box(ladder3c_one_call_site(black_box(&e))).ok(); }, iters)),
-            ("L3b transition above arms   ", time(|| { black_box(ladder3b_transition_first(black_box(&e))).ok(); }, iters)),
-            ("L4a + closure/drive only    ", time(|| { black_box(ladder4a_closure(black_box(&e))).ok(); }, iters)),
-            ("L4b + Try only              ", time(|| { black_box(ladder4b_try(black_box(&e))).ok(); }, iters)),
-            ("L4 + both (= old expansion)  ", time(|| { black_box(ladder4_expansion(black_box(&e))).ok(); }, iters)),
+            (
+                "L1 + one loop (phase in tag)",
+                time(
+                    || {
+                        black_box(ladder1_one_loop(black_box(&e))).ok();
+                    },
+                    iters,
+                ),
+            ),
+            (
+                "L2 + Step/driver protocol   ",
+                time(
+                    || {
+                        black_box(ladder2_step_protocol(black_box(&e))).ok();
+                    },
+                    iters,
+                ),
+            ),
+            (
+                "L3 + tuple payloads         ",
+                time(
+                    || {
+                        black_box(ladder3_tuple_payloads(black_box(&e))).ok();
+                    },
+                    iters,
+                ),
+            ),
+            (
+                "L3c closure, 1 call site    ",
+                time(
+                    || {
+                        black_box(ladder3c_one_call_site(black_box(&e))).ok();
+                    },
+                    iters,
+                ),
+            ),
+            (
+                "L3b transition above arms   ",
+                time(
+                    || {
+                        black_box(ladder3b_transition_first(black_box(&e))).ok();
+                    },
+                    iters,
+                ),
+            ),
+            (
+                "L4a + closure/drive only    ",
+                time(
+                    || {
+                        black_box(ladder4a_closure(black_box(&e))).ok();
+                    },
+                    iters,
+                ),
+            ),
+            (
+                "L4b + Try only              ",
+                time(
+                    || {
+                        black_box(ladder4b_try(black_box(&e))).ok();
+                    },
+                    iters,
+                ),
+            ),
+            (
+                "L4 + both (= old expansion)  ",
+                time(
+                    || {
+                        black_box(ladder4_expansion(black_box(&e))).ok();
+                    },
+                    iters,
+                ),
+            ),
         ] {
             println!("   {name} {ns:8.0} ns  {:5.2}x native", ns / base);
         }
