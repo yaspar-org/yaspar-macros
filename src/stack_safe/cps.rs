@@ -1,9 +1,8 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The CPS transform itself: every recursive call becomes a `call` transition plus a frame — the
-//! defunctionalized continuation, one variant per call site carrying the locals live across
-//! it — and a loop whose body recurses becomes a new entry point.
+//! The CPS transform: each recursive call becomes a `call` transition plus a frame variant
+//! holding the locals live across it; a loop whose body recurses becomes a new entry point.
 
 use proc_macro2::{Ident, TokenStream};
 use quote::{ToTokens, format_ident, quote};
@@ -30,10 +29,8 @@ pub(super) fn cps_stmts(ctx: &Ctx, env: &Env, stmts: &[Stmt], k: Cont) -> syn::R
         return k(quote! { () });
     };
 
-    // A `#[cfg]` on a statement that recurses cannot ride along on the pieces the statement is cut
-    // into: the code *after* it is generated inside them, and gating that away with it would lose
-    // it. So the block is lowered twice -- with the statement and without -- and the two are
-    // written as gated bindings of one name, of which the predicate leaves exactly one.
+    // A `#[cfg]` statement that recurses can't gate its pieces (the rest of the block lives
+    // inside them), so lower the block both with and without it and pick one by the predicate.
     if stmt_contains_rec(ctx, first)
         && let Some(gate) = stmt_gate(first)?
     {
@@ -44,8 +41,7 @@ pub(super) fn cps_stmts(ctx: &Ctx, env: &Env, stmts: &[Stmt], k: Cont) -> syn::R
             let stmts: Vec<Stmt> = std::iter::once(kept).chain(rest.iter().cloned()).collect();
             cps_stmts(ctx, env, &stmts, k)
         })?;
-        // Under `not` for the same reason: the arms this lowering grows are the ones that exist
-        // when the predicate does not hold, and the driver's match holds both sets.
+        // `not`: these are the arms that exist when the predicate is false.
         let without = ctx.under_gate(quote! { not(#gate) }, || cps_stmts(ctx, env, rest, k))?;
         return Ok(quote! {
             {
@@ -59,25 +55,19 @@ pub(super) fn cps_stmts(ctx: &Ctx, env: &Env, stmts: &[Stmt], k: Cont) -> syn::R
     }
 
     if !stmt_contains_rec(ctx, first) {
-        // A trailing expression without a semicolon is the block's value. A
-        // *block-like* statement (`if c { .. }`) also parses as
-        // `Stmt::Expr(_, None)` even with statements after it.
+        // The block's value. A block-like statement (`if c {..}`) also parses as
+        // `Stmt::Expr(_, None)` even when statements follow it.
         if let Stmt::Expr(e, None) = first
             && rest.is_empty()
         {
             return k(leaf_expr(env, e)?);
         }
         let head = leaf_stmt(env, first)?;
-        // A statement that leaves the block makes the continuation unreachable, so
-        // it is not generated at all. That is not just a size saving: a lowered loop
-        // generated only in dead code has nothing to pin its payload's type, and
-        // rustc does not infer through unreachable code — the user would get
-        // `type annotations needed` pointing into their own body.
+        // Code after a diverging statement is skipped, not just for size: a loop lowered only in
+        // dead code has nothing to infer its payload type from.
         if diverges(first) {
             return Ok(quote! { { #head } });
         }
-        // Bindings introduced here are visible to everything that follows,
-        // including any loop that needs to thread them.
         let env = match first {
             Stmt::Local(l) => env.bind(pat_bindings(&l.pat)),
             _ => env.clone(),
@@ -99,8 +89,7 @@ pub(super) fn cps_stmts(ctx: &Ctx, env: &Env, stmts: &[Stmt], k: Cont) -> syn::R
                      statement; bind the call first",
                 ));
             }
-            // A `#[cfg]` here was handled by `cps_stmts` before the statement was split, so what
-            // is left cannot gate anything away; `cfg_attr` still can.
+            // `#[cfg]` was handled by `cps_stmts`; `cfg_attr` still has to be refused.
             reject_cfg_attr(&local.attrs, "a `let` whose initializer recurses")?;
             let pat = &local.pat;
             let attrs = &local.attrs;
@@ -110,9 +99,7 @@ pub(super) fn cps_stmts(ctx: &Ctx, env: &Env, stmts: &[Stmt], k: Cont) -> syn::R
                 Ok(quote! { { #(#attrs)* let #pat = #v; #tail } })
             })
         }
-        // A statement's attributes are the expression's, and a `#[cfg]` among them would
-        // have to gate this statement alone — but the code after it is generated *inside*
-        // the statement, as the continuation of the call being cut here.
+        // A `#[cfg]` here can't gate just this statement: the code after it is generated inside.
         Stmt::Expr(e, semi) => {
             reject_cfg_attr(&expr_attrs(e), "a statement that recurses")?;
             if semi.is_none() && rest.is_empty() {
@@ -127,16 +114,9 @@ pub(super) fn cps_stmts(ctx: &Ctx, env: &Env, stmts: &[Stmt], k: Cont) -> syn::R
     }
 }
 
-/// Pull the *value* subexpressions out of a place so its side effects can run where
-/// the source put them, leaving a place whose evaluation is just projections.
-///
-/// `&mut t.kids[idx()]` becomes `let __ss_vN = idx();` plus `&mut t.kids[__ss_vN]`.
-/// The pointer itself still has to be taken last — user code must not run between
-/// the derived pointer being created and the callee using it — but with the side
-/// effects hoisted, "last" is no longer observable.
-///
-/// The root is left alone: it names the context, and hoisting it would copy or move
-/// the very reference being projected from.
+/// Hoist the value subexpressions out of a place, leaving only projections:
+/// `&mut t.kids[idx()]` becomes `let __ss_vN = idx();` and `&mut t.kids[__ss_vN]`.
+/// The root (the context) is left alone.
 fn hoist_place(ctx: &Ctx, place: &Expr) -> (Vec<TokenStream>, Expr) {
     struct H<'a> {
         ctx: &'a Ctx,
@@ -145,7 +125,6 @@ fn hoist_place(ctx: &Ctx, place: &Expr) -> (Vec<TokenStream>, Expr) {
 
     impl H<'_> {
         fn take(&mut self, e: &mut Expr) {
-            // A path or a literal has nothing to run; anything else might.
             if matches!(e, Expr::Path(_) | Expr::Lit(_)) {
                 return;
             }
@@ -158,14 +137,11 @@ fn hoist_place(ctx: &Ctx, place: &Expr) -> (Vec<TokenStream>, Expr) {
     impl VisitMut for H<'_> {
         fn visit_expr_mut(&mut self, e: &mut Expr) {
             match e {
-                // Children first, so nested projections hoist in evaluation order.
+                // Children first, to keep evaluation order.
                 Expr::Index(i) => {
                     self.visit_expr_mut(&mut i.expr);
-                    // A base that *runs* something — `node.select(..)[i]` — has to run before the
-                    // index, which is the order the source has. Leaving it in the place would run
-                    // it after, since the place is what evaluation is deferred to. A base that
-                    // only projects (`self.kids[i]`) is left alone: it is part of the place, and
-                    // hoisting it would take a reference where the source took none.
+                    // A base that runs code (`node.select(..)[i]`) is hoisted to run before the
+                    // index; a pure projection (`self.kids[i]`) stays part of the place.
                     if matches!(&*i.expr, Expr::MethodCall(_) | Expr::Call(_)) {
                         self.take(&mut i.expr);
                     }
@@ -181,8 +157,7 @@ fn hoist_place(ctx: &Ctx, place: &Expr) -> (Vec<TokenStream>, Expr) {
                 Expr::Unary(u) => self.visit_expr_mut(&mut u.expr),
                 Expr::Paren(p) => self.visit_expr_mut(&mut p.expr),
                 Expr::Reference(r) => self.visit_expr_mut(&mut r.expr),
-                // Anything else is left whole: it is either the root or a shape the
-                // place walk in `place_root` would not have accepted.
+                // The root, or a shape `place_root` rejects.
                 _ => {}
             }
         }
@@ -197,28 +172,17 @@ fn hoist_place(ctx: &Ctx, place: &Expr) -> (Vec<TokenStream>, Expr) {
     (h.pre, place)
 }
 
-/// Split a place into the values inside it, in evaluation order, and the place with
-/// each of those values replaced by the temporary it was bound to.
+/// Split a place into its inner values (in evaluation order) and the place with each value
+/// replaced by its temporary.
 ///
-/// This is what lets a place *stay* a place across a cut. `xs[0].bump(f(n - 1))` must
-/// not bind `xs[0]` to a temporary: `bump` takes `&mut self`, so it would mutate a copy
-/// and the original would answer afterwards — silently, whenever the element is `Copy`.
-/// Splicing the place itself into the continuation instead denotes the same location,
-/// because the local it is rooted at travels in the frame, and nothing left in the place
-/// can run user code.
-///
-/// A root that is not itself a place (`foo()[i]`) is taken too: binding it by value keeps the
-/// location, since a reference copied out of a temporary still points where it did. Only a path root
-/// stays, and it must — its identity is the whole point.
-///
-/// Unlike [`hoist_place`], which prepares a place for a `ptr::from_mut` a few tokens later, this one
-/// is evaluated in a *later* invocation of the body closure, so a method call in the chain is a root
-/// to bind rather than a projection to keep.
+/// Keeps a place a place across a cut: `xs[0].bump(f(n - 1))` must not copy `xs[0]` into a
+/// temporary, or `bump(&mut self)` would mutate the copy. Only a path root is kept; any other
+/// root, including a method call, is bound. Unlike [`hoist_place`], the result is used in a
+/// later invocation of the body.
 fn split_place(ctx: &Ctx, place: &Expr, later: &[&Expr]) -> (Vec<(Ident, Expr)>, Expr) {
     struct S<'a> {
         ctx: &'a Ctx,
-        /// What the source evaluates *after* this place: a path read from it could be written
-        /// there in between, and the continuation would then read the new value.
+        /// What the source evaluates after the place, which may write a path read from it.
         later: &'a [&'a Expr],
         values: Vec<(Ident, Expr)>,
     }
@@ -230,8 +194,7 @@ fn split_place(ctx: &Ctx, place: &Expr, later: &[&Expr]) -> (Vec<(Ident, Expr)>,
             *e = parse_quote! { #tmp };
         }
 
-        /// A value inside the place, an index say: read where the source reads it, unless reading
-        /// it plainly cannot run code and cannot change in between.
+        /// Bind an inner value, unless it is a plain read that nothing in `later` can change.
         fn take(&mut self, e: &mut Expr) {
             let stable = match &*e {
                 Expr::Lit(_) => true,
@@ -246,11 +209,10 @@ fn split_place(ctx: &Ctx, place: &Expr, later: &[&Expr]) -> (Vec<(Ident, Expr)>,
             }
         }
 
-        /// Walk down the projections, taking the values they contain. Whatever is
-        /// innermost is the root.
+        /// Walk the projections down to the root, binding inner values.
         fn walk(&mut self, e: &mut Expr) {
             match e {
-                // Children first, so nested projections are taken in evaluation order.
+                // Children first, to keep evaluation order.
                 Expr::Index(i) => {
                     self.walk(&mut i.expr);
                     self.take(&mut i.index);
@@ -259,8 +221,7 @@ fn split_place(ctx: &Ctx, place: &Expr, later: &[&Expr]) -> (Vec<(Ident, Expr)>,
                 Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => self.walk(&mut u.expr),
                 Expr::Paren(p) => self.walk(&mut p.expr),
                 Expr::Group(g) => self.walk(&mut g.expr),
-                // The root. A path names a place the frame carries; anything else is
-                // evaluated here, exactly where the source evaluates it.
+                // A path root stays; any other root is evaluated here.
                 Expr::Path(p) if p.qself.is_none() => {}
                 root => self.bind(root),
             }
@@ -277,13 +238,12 @@ fn split_place(ctx: &Ctx, place: &Expr, later: &[&Expr]) -> (Vec<(Ident, Expr)>,
     (s.values, place)
 }
 
-/// Does this expression name this identifier anywhere?
+/// Does `e` mention `id`?
 fn mentions_ident(e: &Expr, id: &Ident) -> bool {
     tokens_mention(&e.to_token_stream(), id)
 }
 
-/// The outer attributes of an expression, whatever kind it is. `syn` keeps them per variant with no
-/// accessor across variants, but they are the first thing in the tokens, so they can be read back.
+/// The outer attributes of any expression (read back from its leading tokens).
 fn expr_attrs(e: &Expr) -> Vec<syn::Attribute> {
     let parser = |input: syn::parse::ParseStream| {
         let attrs = input.call(syn::Attribute::parse_outer)?;
@@ -293,11 +253,7 @@ fn expr_attrs(e: &Expr) -> Vec<syn::Attribute> {
     syn::parse::Parser::parse2(parser, e.to_token_stream()).unwrap_or_default()
 }
 
-/// The `#[cfg]` predicate among `attrs`, if any.
-///
-/// A recursive call under it is cut across the driver's arms, so the predicate travels with every
-/// piece: onto the arm generated for a resume point (`PayloadPoint::gates`), and onto the two
-/// bindings a gated statement becomes. Two predicates on one node are an `all(..)` of them.
+/// The `#[cfg]` predicate in `attrs`, if any; several are combined with `all(..)`.
 fn cfg_gate(attrs: &[syn::Attribute]) -> syn::Result<Option<TokenStream>> {
     reject_cfg_attr(attrs, "code that recurses")?;
     let preds: Vec<TokenStream> = attrs
@@ -312,7 +268,7 @@ fn cfg_gate(attrs: &[syn::Attribute]) -> syn::Result<Option<TokenStream>> {
     })
 }
 
-/// A statement's `#[cfg]` predicate, wherever its kind keeps its attributes.
+/// A statement's `#[cfg]` predicate.
 fn stmt_gate(stmt: &Stmt) -> syn::Result<Option<TokenStream>> {
     match stmt {
         Stmt::Local(local) => cfg_gate(&local.attrs),
@@ -321,8 +277,7 @@ fn stmt_gate(stmt: &Stmt) -> syn::Result<Option<TokenStream>> {
     }
 }
 
-/// Take the `#[cfg]`s off a statement, which is what makes the two lowerings of a gated statement
-/// differ: the kept copy is the statement as if it had never been gated.
+/// Remove the `#[cfg]`s from a statement.
 fn strip_cfg(stmt: &mut Stmt) {
     fn drop_cfgs(attrs: &mut Vec<syn::Attribute>) {
         attrs.retain(|a| !a.path().is_ident("cfg"));
@@ -334,7 +289,7 @@ fn strip_cfg(stmt: &mut Stmt) {
     }
 }
 
-/// The same for an expression, which keeps its attributes per variant.
+/// Remove the `#[cfg]`s from an expression.
 fn drop_expr_cfgs(e: &mut Expr) {
     macro_rules! strip {
         ($($variant:ident),*) => {
@@ -352,12 +307,8 @@ fn drop_expr_cfgs(e: &mut Expr) {
     );
 }
 
-/// Refuse a `#[cfg]` in a position whose pieces cannot each carry it.
-///
-/// Statements, match arms and struct-expression fields are handled: each is a place where the gate
-/// can travel to every piece. Anywhere else the pieces do not all stay in this position -- the code
-/// after the call becomes an arm of another `match` -- so dropping the attribute would compile and
-/// run what the user disabled.
+/// Reject a `#[cfg]` outside statements, match arms and struct fields: elsewhere the pieces
+/// of a cut move to other arms, so dropping it would run disabled code.
 fn reject_cfg(attrs: &[syn::Attribute], what: &str) -> syn::Result<()> {
     reject_cfg_attr(attrs, what)?;
     for attr in attrs {
@@ -377,10 +328,8 @@ fn reject_cfg(attrs: &[syn::Attribute], what: &str) -> syn::Result<()> {
     Ok(())
 }
 
-/// Refuse a `#[cfg_attr]` on something a recursive call is cut out of.
-///
-/// Unlike `cfg`, what it expands to is arbitrary — it could name an attribute that only means
-/// something in the position the source wrote it, which the pieces are no longer in.
+/// Reject a `#[cfg_attr]` on something a recursive call is cut out of: its expansion may only
+/// make sense in the original position.
 fn reject_cfg_attr(attrs: &[syn::Attribute], what: &str) -> syn::Result<()> {
     for attr in attrs {
         if attr.path().is_ident("cfg_attr") {
@@ -397,10 +346,8 @@ fn reject_cfg_attr(attrs: &[syn::Attribute], what: &str) -> syn::Result<()> {
     Ok(())
 }
 
-/// CPS an expression the rebuilt expression will use as a *place*: evaluate the values inside it
-/// where the source does, then hand `k` the place itself and the environment its temporaries are
-/// bound in. `later` is what the source evaluates after the place — a method call's arguments —
-/// which decides whether a plain path inside it has to be read now.
+/// CPS an expression used as a place: evaluate its inner values, then call `k` with the place.
+/// `later` is what the source evaluates after it (e.g. method arguments).
 fn cps_place(
     ctx: &Ctx,
     env: &Env,
@@ -418,8 +365,7 @@ fn cps_place(
         let Some(((tmp, value), rest)) = values.split_first() else {
             return k(env, place);
         };
-        // The temporary is in scope for everything that follows, including the
-        // continuation the place is spliced into, which has to thread it.
+        // The temporary must be visible to the continuation, which may thread it.
         let inner = env.bind([tmp.clone()]);
         if !contains_rec(ctx, value) {
             let head = leaf_expr(env, value)?;
@@ -436,50 +382,36 @@ fn cps_place(
     bind_values(ctx, env, &values, &place, k)
 }
 
-/// Does this statement leave the enclosing block unconditionally? Only the shapes
-/// that plainly do — a bare `return`, `break` or `continue` — which is enough for the
-/// continuation duplication that branching produces.
+/// Does this statement always leave the block (a bare `return`, `break` or `continue`)?
 fn diverges(stmt: &Stmt) -> bool {
     let Stmt::Expr(e, _) = stmt else { return false };
     matches!(e, Expr::Return(_) | Expr::Break(_) | Expr::Continue(_))
 }
 
 fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream> {
-    // The base case that makes this tractable: anything with no recursive call
-    // is just an expression, spliced into the continuation.
+    // No recursive call: splice as is.
     if !contains_rec(ctx, e) {
         return k(leaf_expr(env, e)?);
     }
-    // Everything below rebuilds this expression from pieces, so an attribute on it has no position
-    // to keep. Only `#[cfg]` matters; see `reject_cfg`.
+    // The expression is rebuilt, so its attributes are lost; only `#[cfg]` matters (`reject_cfg`).
     reject_cfg(&expr_attrs(e), "an expression that recurses")?;
 
     let entry = entry_ty();
     let frame = frame_ty();
 
     // ---- the recursive call itself --------------------------------------
-    // Checked before the match so the callee and its arguments are named once.
     if let Some((callee, call)) = ctx.rec_call(e) {
         let callee_variant = entry_variant(callee);
-        // Context arguments do not travel in the payload. Either the child
-        // shares the parent's slot, in which case there is nothing to pass,
-        // or it works on a place derived from it, in which case the slot is
-        // swapped for the child and restored by the continuation.
+        // Context arguments skip the payload: either the child shares the parent's slot, or it
+        // gets a derived place that is swapped in and restored by the continuation.
         let mut payload: Vec<Expr> = Vec::new();
         let mut swaps: Vec<(usize, Expr)> = Vec::new();
         let ctxp = ctx_param();
-        // A pinned position is where this call lends the callee a value built here: the
-        // value moves into the driver's store for that position, which keeps it at a
-        // fixed address, and the pointer travels in the payload. Anything else at such a
-        // position becomes a pointer too, since the payload has one type.
-        //
-        // One store per position, so positions of different types do not have to agree.
+        // A pinned position lends a value built here: it moves into that position's store and
+        // a pointer travels in the payload. Other arguments there become pointers too.
         let mut pinned_slots: Vec<syn::Index> = Vec::new();
-        // The locals this call parks so that it can lend a place inside one: where each is held,
-        // the name to hand it back to when the frame resumes, and how many of this call's pushes
-        // came before it, which is where in the store it sits.
+        // Locals parked to lend a place inside them: (store, name, index among this call's pushes).
         let mut parked: Vec<(Held, Ident, usize)> = Vec::new();
-        // How many values this call has pushed so far, counted in argument order.
         let mut pushes = 0usize;
         for (i, arg) in call.args.iter().enumerate() {
             match ctx.member(callee).context_at.get(&i) {
@@ -496,9 +428,7 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
                                 pushes += 1;
                                 push_into(&held, built, &|_| None)
                             }
-                            // The local is parked, and the pointer is to the place inside it.
-                            // `take_last` in the resume arm hands it back, so the code after the
-                            // call still owns it — a lend, as the source wrote it.
+                            // Park the local and point inside it; the resume arm takes it back.
                             Some(Lend::Place { root, place }) => {
                                 let held = ctx.held_root(&root);
                                 let slot = held.slot();
@@ -525,10 +455,8 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
             }
         }
         let payload: Vec<&Expr> = payload.iter().collect();
-        // One mark per store this call pushes into, taken before any argument is
-        // evaluated so that it covers every push. Fresh names rather than ones keyed to
-        // the resume index, because an argument may itself contain a call and reserve a
-        // point first.
+        // One mark per store, taken before any argument runs. Fresh names, since an argument may
+        // itself contain a call.
         let marks: Vec<(syn::Index, Ident)> = pinned_slots
             .iter()
             .map(|slot| (slot.clone(), ctx.fresh()))
@@ -536,25 +464,17 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
         let out = cps_seq(ctx, env, &payload, Vec::new(), &|vals| {
             let v = ctx.fresh();
             let mut saved: Vec<Ident> = swaps.iter().map(|(slot, _)| saved_slot(*slot)).collect();
-            // The mark has to be carried whether or not the continuation mentions it,
-            // exactly like a parked pointer, so it is forced into the payload.
+            // Forced into the payload even if the continuation doesn't mention it.
             for (_, mark) in &marks {
                 saved.push(mark.clone());
             }
 
-            // Reserve the resume point before generating its code, so a nested call
-            // inside the continuation gets a later index.
-            //
-            // Its payload is solved from the same scope a loop's would be: the
-            // bindings in scope at the call, plus the parked pointers, minus whatever
-            // the resume code turns out not to mention.
-            // A parked local is not carried: the resume arm takes it back out of the store.
+            // Reserve the resume point first so nested calls get later indices. Parked locals
+            // are not carried: the resume arm takes them back from the store.
             let mut scope = ctx.scope_with_results(&env.scope);
             scope.retain(|name| !parked.iter().any(|(_, root, _)| root == name));
-            // Nothing to take back, release or restore means nothing has to run before this
-            // point's code, so a `?` at the front of it may be shared with the other points.
+            // Nothing to run before this point's code, so a leading `?` can be shared.
             let bare = parked.is_empty() && marks.is_empty() && swaps.is_empty();
-            // A parked local comes back out of the store, so it is not recomputed either.
             let derived = env
                 .derived
                 .iter()
@@ -565,15 +485,11 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
             let frame_var = frame_variant(r);
             let marker = frame_marker(r);
 
-            // `v` is in scope for everything the continuation contains, including any
-            // loop it lowers, which has to thread it.
             let body = ctx.with_result(v.clone(), || k(quote! { #v }))?;
             let prologue = ctx.ctx_prologue();
 
-            // A resumed value arrives in the union when the members' return types differ,
-            // and the callee is known here, so the variant is too. A point whose check was
-            // lifted out has no union to take apart -- that is one of the conditions for
-            // lifting -- and its value is no longer the carrier, so it is left alone.
+            // Unwrap the union variant when members' return types differ (not needed when the
+            // `?` check was lifted).
             let unwrap = if ctx.is_checked(r) {
                 ctx.note_unwrapped(callee, &v);
                 TokenStream::new()
@@ -581,15 +497,12 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
                 ctx.unwrap_result(callee, &v)
             };
 
-            // Restoring a parked pointer has to happen *before* the prologue derives
-            // the context bindings from it, or they would be the child's.
+            // Restore swapped pointers before the prologue re-derives context bindings.
             let restores = swaps.iter().map(|(slot, _)| {
                 let (saved, idx) = (saved_slot(*slot), syn::Index::from(*slot));
                 quote! { #ctxp.#idx = #saved; }
             });
-            // What was parked is owned again, and taking it back is what leaves the store at the
-            // mark, so the truncate below finds nothing of this call's to drop.
-            // In reverse, so that each take drops only what this call pushed after it.
+            // Take parked locals back, last first, so each `take_at` drops only later pushes.
             let take_backs = parked.iter().rev().map(|(held, root, at)| {
                 let mark = marks
                     .iter()
@@ -599,42 +512,22 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
                 take_back(held, root, &mark, *at)
             });
             let take_backs = quote! { #(#take_backs)* };
-            // Whatever this call lent the callee dies with the callee, i.e. now.
+            // Drop what this call lent the callee.
             let unpin = marks
                 .iter()
                 .map(|(slot, mark)| quote! { #ctxp.#slot.truncate(#mark); });
             let unpin = quote! { #(#unpin)* };
-            // A call whose continuation is *hand the answer straight down* is in tail position.
-            // The frame it would park holds nothing — nothing after the call mentions anything —
-            // and its resume arm is the identity, so the push, the pop and the dispatch on the
-            // frame tag are three transitions with nothing between them. Entering the callee
-            // without parking gives the same answer to the same frame: the callee's `Resume` pops
-            // whatever was already on top, which is what the identity arm would have handed it,
-            // and an empty stack still breaks the loop with the value. Nothing is dropped early
-            // either: a payload this small is the *reason* there is nothing to drop.
-            //
-            // Nothing may run before the answer is handed on, which is the whole condition: no
-            // value to take back, no store to release, no context pointer to restore and no
-            // prologue that does more than rebind. The prologue of a method group is never empty
-            // — it re-derives `self` and every other context slot — but a rebinding the identity
-            // continuation never reads is dead, so only a raw slot's is held against the call:
-            // there the arm would reach the slot through a pointer, and that stays the
-            // `use_nonlinear_mut` path's to reason about.
-            //
-            // `body` being exactly `driver::done` of the resumed value is what says the
-            // continuation is the identity — a group whose members answer with
-            // different types re-wraps into the union there, and so does not qualify. Nor does a
-            // point whose `?` was lifted out: its value is the checked one, and handing *that*
-            // down would offer the next turn's shared check something that is not a carrier.
+            // Tail call: if the continuation is the identity (`driver::done(v)`) and nothing runs
+            // before it (no take-backs, store release, swaps, or non-rebinding prologue), enter the
+            // callee without pushing a frame. Excluded: groups that re-wrap into a union, and
+            // points whose `?` was lifted.
             let is_tail = take_backs.is_empty()
                 && unpin.is_empty()
                 && swaps.is_empty()
                 && ctx.ctx_prologue_only_rebinds()
                 && !ctx.is_checked(r)
                 && body.to_string() == driver::done(quote! { #v }).to_string();
-            // The identity continuation reserved no point of its own, so `r` is still the last one
-            // and can be given back — which keeps the frame enum, its dispatch and the annotation
-            // that names its slots free of a variant nothing constructs.
+            // Drop the unused resume point so no frame variant is generated for it.
             let is_tail = is_tail && ctx.drop_last_resume(r);
             if !is_tail {
                 ctx.set_resume_code(
@@ -650,12 +543,10 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
                 );
             }
 
-            // Without a swap the arguments stay inline, so the common path gains
-            // no bindings at all.
+            // Without a swap, arguments stay inline.
             let call = if swaps.is_empty() {
-                // One `let` per argument, in source order: see `driver::call` for why the value
-                // position needs them. A pinned position holds a pointer into the store rather
-                // than the parameter's own reference type, so it goes unannotated.
+                // One `let` per argument, in source order (see `driver::call`). Pinned positions
+                // hold store pointers, so they are unannotated.
                 let tmps: Vec<Ident> = vals.iter().map(|_| ctx.fresh()).collect();
                 let args = tmps.iter().zip(vals).enumerate().map(|(j, (tmp, val))| {
                     let ann = if ctx.member(callee).pinned[j].get() {
@@ -676,14 +567,8 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
                     false => driver::call(args, enter, quote! { #frame::#frame_var(#marker) }),
                 }
             } else {
-                // With a swap, every argument is bound *in source order* first and
-                // the derived pointers are taken last. Taking a pointer earlier is
-                // not an option: user code running between its creation and the
-                // callee's use of it is either a foreign write to it (UB) or an
-                // escape that skips the restore. Hoisting the side effects out of
-                // the place is what keeps the observable order the source's.
-                // Park each parent pointer in a local — it is `Copy`, so it just
-                // rides in the frame — and take the derived one from the place.
+                // With a swap: bind every argument in source order, park each parent pointer (it's
+                // `Copy`), and take the derived pointer from the hoisted place.
                 let swap_for = |slot: usize, place: &Expr| {
                     let (saved, idx) = (saved_slot(slot), syn::Index::from(slot));
                     let derived = if ctx.context[slot].mutable {
@@ -697,15 +582,9 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
                     }
                 };
 
-                // The derived pointer is taken *where the source takes it*. Borrowck
-                // is what makes that safe: an argument written after a `&mut` place
-                // cannot touch the parent — `f(&mut b[0], b.len())` is E0502 — so
-                // nothing between taking the pointer and the callee's use of it can
-                // invalidate it. An argument that *escapes* is handled by giving it
-                // the restores to run first (`Env::restores`). Only an argument that
-                // recurses — possible with a *shared* context, where several borrows
-                // coexist — still forces the swap to the end, because its own frames
-                // would outlive the window.
+                // Take the derived pointer where the source does; borrowck keeps later arguments
+                // from touching the parent. Escaping arguments run the restores first
+                // (`Env::restores`). Only a recursing argument forces the swap to the end.
                 let defer_after =
                     |i: usize| call.args.iter().skip(i + 1).any(|a| contains_rec(ctx, a));
 
@@ -718,8 +597,7 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
                     match ctx.member(callee).context_at.get(&i) {
                         None => {
                             let ann = if ctx.member(callee).pinned[payload_seen].get() {
-                                // Holds a pointer into the pinned store, not the
-                                // parameter's own reference type.
+                                // A pointer into the pinned store.
                                 TokenStream::new()
                             } else {
                                 ctx.member(callee)
@@ -728,11 +606,8 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
                                     .cloned()
                                     .unwrap_or_default()
                             };
-                            // Re-evaluated here rather than reused from `cps_seq`, so that an
-                            // escape inside it can be given the restores of any swap already
-                            // performed. From `payload` rather than from `call.args`: that is
-                            // the argument as the driver needs it, in particular a value built
-                            // here moved into the pinned store instead of merely referenced.
+                            // Re-lowered from `payload` (not reused from `cps_seq`) so escapes
+                            // get the restores of earlier swaps and built values go to the store.
                             let value = if pending.is_empty() {
                                 vals[payload_seen].clone()
                             } else {
@@ -819,7 +694,7 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
             cps_expr(ctx, env, scrutinee, &|s| {
                 let mut arms = Vec::new();
                 for arm in &m.arms {
-                    // A guard is part of the pattern now: `Pat::Guard { pat, guard }`.
+                    // syn represents a match guard as `Pat::Guard`.
                     let (pat, guard) = match &arm.pat {
                         Pat::Guard(g) => (&*g.pat, Some(&*g.guard)),
                         other => (other, None),
@@ -841,17 +716,14 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
                         }
                         None => quote! {},
                     };
-                    // The arm keeps its own attributes below, but a `#[cfg]` among them also has
-                    // to reach the arms the driver grows for the calls inside this one: the code
-                    // after such a call lands there, not here.
+                    // A `#[cfg]` on the arm also gates the driver arms for calls inside it.
                     let body = match cfg_gate(&arm.attrs)? {
                         None => cps_expr(ctx, &inner, &arm.body, k)?,
                         Some(gate) => {
                             ctx.under_gate(gate, || cps_expr(ctx, &inner, &arm.body, k))?
                         }
                     };
-                    // Attributes travel with the arm. Dropping a `#[cfg]` would leave a gated
-                    // arm in beside its twin, shadowing whatever fell through to it.
+                    // Keep the arm's attributes; dropping a `#[cfg]` would duplicate the arm.
                     let attrs = &arm.attrs;
                     arms.push(quote! { #(#attrs)* #pat #guard => #body, });
                 }
@@ -875,12 +747,8 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
         }
 
         Expr::Try(t) => cps_expr(ctx, env, &t.expr, &|v| {
-            // `f(a)?` on a recursive call: the check is the first thing that resume point does, so
-            // it can be lifted out of every point that begins the same way and done once, above
-            // the frame dispatch -- which is what `ladder1_one_loop` does by hand, and worth a
-            // third of native on a three-call-site recursion. Not when something is pending here:
-            // a swap to undo or a store to release has to happen on the error path too, and the
-            // lifted check leaves the loop without reaching it.
+            // `f(a)?`: the check can be lifted out of the resume point and shared above the frame
+            // dispatch, unless a swap or store release is pending (the error path must undo it).
             if ctx.hoist.get()
                 && env.restores.is_empty()
                 && env.teardown.is_empty()
@@ -889,9 +757,7 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
                 return k(v);
             }
             let ok = ctx.fresh();
-            // `ok` is a binding the transform introduces, so nothing in the user's
-            // scope names it. A later call in the same expression still has to carry
-            // it, as in `f(..)? + g(..)?`, hence recording it as a live result.
+            // `ok` is ours; record it as live so later calls (`f()? + g()?`) carry it.
             let body = ctx.with_result(ok.clone(), || k(quote! { #ok }))?;
             let branch = try_shim::branch(v.clone());
             let exit = env.wrapped(try_shim::from_residual(quote! { __ss_res }));
@@ -907,8 +773,7 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
         // ---- loops ------------------------------------------------------
         Expr::ForLoop(_) | Expr::While(_) | Expr::Loop(_) => lower_loop(ctx, env, e, k),
 
-        // `break` / `continue` reached through CPS (the surrounding code
-        // recurses), as opposed to through leaf rewriting.
+        // `break` / `continue` in recursing code (not leaf-rewritten).
         Expr::Continue(c) => {
             if c.label.is_some() {
                 return Err(syn::Error::new(
@@ -963,8 +828,7 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
             })
         }
 
-        // Compound assignment. The left operand is a *place*, not a value, so it
-        // must not be hoisted into a temporary the way a strict operand would be.
+        // Compound assignment: the left operand is a place, so it is not bound to a temporary.
         Expr::Binary(b) if is_assign_op(&b.op) => {
             if contains_rec(ctx, &b.left) {
                 return Err(syn::Error::new(
@@ -1005,8 +869,7 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
             let member = &f.member;
             cps_expr(ctx, env, &f.base, &|v| k(quote! { (#v).#member }))
         }
-        // An index is a *place* and may be used as one — `&mut xs[i]`, `xs[i].bump(..)` — so it is
-        // spliced back as a place rather than bound by value; only the values inside it run here.
+        // An index is a place (`&mut xs[i]`, `xs[i].bump(..)`); only its inner values run here.
         Expr::Index(_) => cps_place(ctx, env, e, &[], &|_, place| k(quote! { (#place) })),
         Expr::Tuple(t) => {
             let elems: Vec<&Expr> = t.elems.iter().collect();
@@ -1018,14 +881,8 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
         }
         Expr::Call(call) => {
             let args: Vec<&Expr> = call.args.iter().collect();
-            // Rust evaluates the callable *before* the arguments, so a computed one has to be
-            // sequenced first: left in place it would run after the recursion, and
-            // `choose(calls)(rec(..))` would pick its callee with the counter the recursion left
-            // behind. `cps_seq` binds it for us, since a later operand recurses.
-            //
-            // A path callee stays where it is. It has no side effects to order, and binding it
-            // would turn a function *item* into a value — which changes what inference has to work
-            // from, and can fail outright for a generic one.
+            // The callee runs before the arguments, so a computed one is sequenced first
+            // (`cps_seq` binds it). A path callee stays: binding a generic fn item hurts inference.
             if matches!(&*call.func, Expr::Path(_)) {
                 let func = &call.func;
                 return cps_seq(ctx, env, &args, Vec::new(), &|v| {
@@ -1043,9 +900,7 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
         Expr::MethodCall(mc) => {
             let method = &mc.method;
             let turbofish = &mc.turbofish;
-            // The receiver is a place and the method may take it by `&mut`, so it is spliced back
-            // as one — see [`split_place`]. Rust evaluates it before the arguments, so its values
-            // are bound first and the arguments sequenced after.
+            // The receiver is a place (the method may take `&mut self`); see [`split_place`].
             let args: Vec<&Expr> = mc.args.iter().collect();
             cps_place(ctx, env, &mc.receiver, &args, &|env, recv| {
                 cps_seq(ctx, env, &args, Vec::new(), &|v| {
@@ -1055,9 +910,7 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
         }
         Expr::Struct(s) => {
             let path = &s.path;
-            // A gated field is not rebuilt with its attribute -- the literal below is assembled
-            // from names and values -- so, as for a gated statement, the expression is lowered
-            // twice and the predicate picks one: with the field, and without it.
+            // A gated field can't keep its attribute, so lower the expression with and without it.
             if let Some((at, gate)) = s
                 .fields
                 .iter()
@@ -1100,8 +953,7 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
                         ));
                     }
                     let r = leaf_expr(env, r)?;
-                    // The fields above already emit a trailing comma each, so this
-                    // must not add another: `S { v: x, , ..b }` does not parse.
+                    // No comma here: each field already emits one.
                     quote! { .. #r }
                 }
                 None => quote! {},
@@ -1147,11 +999,8 @@ fn cps_expr(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream>
     }
 }
 
-/// Lower a loop whose body recurses into a fresh entry point.
-///
-/// One iteration becomes a `tail` transition to `En(state)`: re-enter the body at the loop's
-/// entry point without pushing a frame, so iterating costs no stack. The loop's state —
-/// iterator plus the locals live across it — travels in the entry payload.
+/// Lower a loop whose body recurses into a new entry point. Each iteration is a `tail`
+/// re-entry (no frame pushed); the iterator and live locals travel in the entry payload.
 fn lower_loop(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStream> {
     let entry = entry_ty();
     let ctxp = ctx_param();
@@ -1161,8 +1010,8 @@ fn lower_loop(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStrea
         _ => None,
     };
 
-    // A `for` loop over a borrow moves its collection into the store first: the iterator is
-    // parked in the payload, and one over `&local` would borrow what that payload owns.
+    // A `for` over a borrow moves the collection into the store, since the iterator is carried
+    // in the payload and can't borrow a local.
     let store = match e {
         Expr::ForLoop(f) => borrowed_owner(&f.expr),
         _ => None,
@@ -1195,12 +1044,8 @@ fn lower_loop(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStrea
             Some((owner, held, ctx.fresh(), elem))
         }
     };
-    // A `for` over `a..b` binding a plain name leaves its iterator one step behind: the head
-    // looks at the next value without moving past it, and the step happens at the end of the
-    // iteration. The iterator then holds this iteration's value as its `start` for the whole of
-    // the body, and since every point in the body parks the iterator anyway, none of them has to
-    // park the name as well; see `walk::Derived`. That is one word less in each such frame, and
-    // those frames are the ones a loop pushes once per element.
+    // `for x in a..b`: advance at the end of the iteration, so the range's `start` is this
+    // iteration's value and frames needn't also carry `x` (see `walk::Derived`).
     let peeked = match (e, &store, &iter_ident) {
         (Expr::ForLoop(f), None, Some(it)) if is_bounded_range(&f.expr) => {
             plain_binding(&f.pat).map(|name| (name, it.clone()))
@@ -1212,7 +1057,7 @@ fn lower_loop(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStrea
         None => TokenStream::new(),
     };
     let store_forced: Vec<Ident> = store.iter().map(|(_, _, mark, _)| mark.clone()).collect();
-    // Not an `Env::restores`: that also runs on `continue`, which still needs the collection.
+    // Not `Env::restores`: those also run on `continue`, which still needs the collection.
     let release = match &store {
         Some((_, held, mark, _)) => {
             let slot = held.slot();
@@ -1230,8 +1075,8 @@ fn lower_loop(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStrea
     let variant = entry_variant(ctx.loop_base() + idx);
     let marker = state_marker(idx);
 
-    // Leaving the loop releases the store; `?` and `return` go through `Env::teardown`.
-    // The value may come out of the store, so it is bound before the store is released.
+    // Leaving the loop releases the store (`?` and `return` use `Env::teardown`). Bind the
+    // value first, since it may live in the store.
     let released_k = |v: TokenStream| -> syn::Result<TokenStream> {
         if release.is_empty() {
             return k(v);
@@ -1242,19 +1087,14 @@ fn lower_loop(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStrea
     };
     let k: Cont = &released_k;
 
-    // Inside the loop, `continue` re-enters this entry point and `break` runs
-    // the code that follows the loop.
+    // `continue` re-enters this entry point; `break` runs the code after the loop.
     let lp = LoopCtx {
         idx,
         variant: ctx.loop_base() + idx,
         brk: k,
         advance: advance.clone(),
     };
-    // The iterator is a binding inside the loop's entry point, so a *nested*
-    // loop must be able to thread it onward — otherwise this loop could not
-    // resume once the inner one finished.
-    // A binding of the loop's entry point like the iterator: a resume point inside the body
-    // re-enters the loop and must thread it onward.
+    // The iterator and store marks are entry-point bindings that resume points must thread.
     let store_bindings: Vec<Ident> = store.iter().map(|(_, _, mark, _)| mark.clone()).collect();
     let lenv = env
         .with_teardown(release.clone())
@@ -1263,9 +1103,7 @@ fn lower_loop(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStrea
         .bind(store_bindings);
     let enter = driver::tail(quote! { #entry::#variant(#marker) });
     let again = quote! { { #advance #enter } };
-    // The body's value is discarded, but it must still be *evaluated*: a branch
-    // with no recursive call arrives here as a whole expression rather than as
-    // statements already emitted, so dropping it would drop its side effects.
+    // Evaluate and discard the body's value: it may be a whole expression with side effects.
     let next =
         |v: TokenStream| -> syn::Result<TokenStream> { Ok(quote! { { let _ = #v; #again } }) };
 
@@ -1325,18 +1163,13 @@ fn lower_loop(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStrea
 
     ctx.set_loop_body(idx, arm);
 
-    // Entering the loop is also a tail transfer: the entry point computes the
-    // loop *and* everything after it, which is exactly the rest of this frame.
+    // Entering the loop is a tail transfer: the entry point runs the loop and everything after.
     match (e, iter_ident) {
         (Expr::ForLoop(f), Some(it)) => match &store {
-            // SAFETY: this lands in the caller's crate and the invariant is ours. The pointer is
-            // one `Pin::push` returned for a value moved into the driver's store, and `Pin` never
-            // moves a value it holds, so the address is good for as long as it is there. It is
-            // there until this loop's mark is truncated, which happens on the way out of the loop
-            // and nowhere else: `released_k` covers the exhausted branch and every `break`,
-            // `Env::teardown` covers `?` and `return`, and `continue` deliberately does not
-            // release. So every iteration that reads the iterator runs while the value is still
-            // owned by the store. Gated behind `data_in_frame`.
+            // SAFETY: the pointer comes from `push_into`, and `Pin` never moves what it holds. The
+            // value stays until this loop's mark is truncated, which only happens on leaving the
+            // loop (`released_k` on exhaustion and `break`, `Env::teardown` on `?` and `return`;
+            // not on `continue`). Only emitted under `data_in_frame`.
             Some((owner, held, mark, elem)) => {
                 let slot = held.slot();
                 let push = push_into(held, &root_expr(owner), &|_| None);
@@ -1344,8 +1177,7 @@ fn lower_loop(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStrea
                 {
                     let #mark = #ctxp.#slot.mark();
                     let __ss_owned = #push;
-                    // The iterator's type is named because nothing outside the body builds its
-                    // payload slot. The shape is enough; regionck settles the lifetime.
+                    // Named because nothing outside the body builds this payload slot.
                     let mut #it: <&#elem as ::core::iter::IntoIterator>::IntoIter =
                         ::core::iter::IntoIterator::into_iter(unsafe { &*__ss_owned });
                     #enter
@@ -1365,8 +1197,7 @@ fn lower_loop(ctx: &Ctx, env: &Env, e: &Expr, k: Cont) -> syn::Result<TokenStrea
     }
 }
 
-/// Is this `a..b` with both ends written? That syntax always builds a `core::ops::Range`, whatever
-/// is in scope, which is what makes it safe to read the iterator's `start`.
+/// Is this `a..b` with both ends? That always builds a `core::ops::Range`, so `start` is readable.
 fn is_bounded_range(e: &Expr) -> bool {
     match e {
         Expr::Range(r) => {
@@ -1380,8 +1211,7 @@ fn is_bounded_range(e: &Expr) -> bool {
     }
 }
 
-/// The name a pattern binds, when it is nothing but an immutable by-value binding: a value the
-/// body cannot change, so the iterator it came from can still say what it is.
+/// The name bound by a plain immutable by-value pattern.
 fn plain_binding(pat: &Pat) -> Option<Ident> {
     match pat {
         Pat::Ident(p)
@@ -1396,17 +1226,13 @@ fn plain_binding(pat: &Pat) -> Option<Ident> {
     }
 }
 
-/// `x` as an expression, for a value that travels into the store by name.
+/// `name` as an expression.
 fn root_expr(name: &Ident) -> Expr {
     parse_quote! { #name }
 }
 
-/// Push `value` into the store `held` names, handing back a pointer to what `project` reaches
-/// inside it — the value itself when `project` answers `None`.
-///
-/// The shared store holds an enum, so the projection runs inside `Pin::push_projected`, on a
-/// reference to the value just pushed. A store of a position's own holds the value bare, and there
-/// only the whole-value form arises: a place lend always parks a local, which is nameable.
+/// Push `value` into the store `held` names and return a pointer to it, or to the place
+/// `project` selects inside it (shared store only, via `Pin::push_projected`).
 fn push_into(held: &Held, value: &Expr, project: &dyn Fn(&Ident) -> Option<Expr>) -> Expr {
     let ctxp = ctx_param();
     let slot = held.slot();
@@ -1430,13 +1256,8 @@ fn push_into(held: &Held, value: &Expr, project: &dyn Fn(&Ident) -> Option<Expr>
     }
 }
 
-/// Take a parked local back out of the store, as the resume arm does.
-///
-/// `mark` is where the store stood before this call pushed anything and `at` counts the pushes
-/// before this one, so `mark + at` is where the value sits: a later lend to the same call, or
-/// anything a nested call left, is above it and dies here rather than a moment later in the
-/// truncate. The variant is checked rather than assumed, so an unbalanced push is a panic instead
-/// of somebody else's value.
+/// Take a parked local back out of the store at `mark + at`, dropping anything above it.
+/// Panics if the variant is wrong.
 fn take_back(held: &Held, root: &Ident, mark: &Ident, at: usize) -> TokenStream {
     let ctxp = ctx_param();
     let slot = held.slot();
@@ -1457,10 +1278,7 @@ fn take_back(held: &Held, root: &Ident, mark: &Ident, at: usize) -> TokenStream 
     }
 }
 
-/// A lent place, rewritten to read through the pointer the store handed back.
-///
-/// `&def.body` parks `def`, so the place has to be reached through the parked copy: the root is
-/// replaced by the reference the store's projection binds, giving `&owned.body`.
+/// Rewrite a lent place to go through the parked copy: `&def.body` becomes `&owned.body`.
 fn project_from(place: &Expr, root: &Ident, owned: &Ident) -> Expr {
     struct V<'a> {
         root: &'a Ident,
@@ -1468,12 +1286,7 @@ fn project_from(place: &Expr, root: &Ident, owned: &Ident) -> Expr {
     }
 
     impl V<'_> {
-        /// Does this rebind the root, so that the paths under it name something else?
-        ///
-        /// The place is rewritten by name, and a name is only the root's until something else
-        /// claims it. A block that declares its own `bag` — as an index expression may —  makes
-        /// every mention inside it a mention of *that* one, and rewriting those to the stored root
-        /// silently read the wrong value.
+        /// Does this block rebind the root? Then mentions inside it are not the root.
         fn rebinds_root(&self, e: &Expr) -> bool {
             match e {
                 Expr::Block(b) => b.block.stmts.iter().any(|s| match s {
@@ -1510,23 +1323,21 @@ fn project_from(place: &Expr, root: &Ident, owned: &Ident) -> Expr {
     V { root, owned }.visit_expr_mut(&mut out);
     parse_quote! { &#out }
 }
-/// The local a loop's iterator borrows, for the two forms that name a place: `&xs` and
-/// `xs.iter()`. Anything else either owns what it yields or borrows something unidentifiable.
+/// The local a loop iterator borrows, for `&xs` and `xs.iter()`.
 fn borrowed_owner(e: &Expr) -> Option<Ident> {
     let path_ident = |e: &Expr| match e {
         Expr::Path(p) => p.path.get_ident().cloned(),
         _ => None,
     };
     match e {
-        // Shared borrows only: the store lends through `&*ptr`, so leaving `&mut xs` alone keeps
-        // the borrow-checker error naming the loop.
+        // Shared borrows only, so `&mut xs` still gets borrowck's error.
         Expr::Reference(r) if r.mutability.is_none() => path_ident(&r.expr),
         Expr::MethodCall(m) if m.method == "iter" && m.args.is_empty() => path_ident(&m.receiver),
         _ => None,
     }
 }
 
-/// Is this a compound assignment (`+=`, `<<=`, ...)? Its left operand is a place.
+/// Is this a compound assignment (`+=`, `<<=`, ...)?
 fn is_assign_op(op: &syn::BinOp) -> bool {
     use syn::BinOp::*;
     matches!(
@@ -1544,13 +1355,8 @@ fn is_assign_op(op: &syn::BinOp) -> bool {
     )
 }
 
-/// CPS a list of subexpressions in left-to-right evaluation order, then hand the
-/// resulting value tokens to `k`.
-///
-/// A subexpression with no recursive call is normally spliced straight through,
-/// but if anything *after* it recurses, it must be bound to a temporary first —
-/// otherwise it would be moved into a continuation and evaluated after the
-/// recursive call, reordering side effects.
+/// CPS subexpressions left to right, then call `k` with their values. A value followed by a
+/// recursing one is bound to a temporary first, to keep side-effect order.
 fn cps_seq(
     ctx: &Ctx,
     env: &Env,
@@ -1562,8 +1368,7 @@ fn cps_seq(
         return k(&acc);
     };
 
-    // One operand recurses, so all of them move into positions the source did not write them in: a
-    // temporary, or a value produced by a continuation. A `#[cfg]` cannot travel there.
+    // Operands move out of their written positions, where a `#[cfg]` can't follow.
     reject_cfg(
         &expr_attrs(first),
         "an operand of an expression that recurses",

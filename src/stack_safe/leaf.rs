@@ -1,10 +1,8 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Rewriting code that contains no recursive call. It is spliced verbatim, but
-//! it now lives inside one turn of the driver's loop, so `?`, `return`, and —
-//! inside a lowered loop — `break` and `continue` still have to be adjusted: each
-//! of them leaves that turn with the next input instead of leaving the function.
+//! Code with no recursive call, spliced as written except that `?`, `return`, and (in a lowered
+//! loop) `break` / `continue` are redirected to the driver instead of leaving the function.
 
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::{ToTokens, quote};
@@ -26,8 +24,7 @@ struct LeafRewrite<'a> {
     wrap: Option<(Ident, Ident)>,
     /// Innermost lowered loop, if any: the target for `break` / `continue`.
     lp: Option<&'a LoopCtx<'a>>,
-    /// Nesting depth of ordinary (non-lowered) loops, whose `break` and
-    /// `continue` belong to themselves.
+    /// Nesting depth of ordinary loops, which own their `break` / `continue`.
     depth: usize,
     err: Option<syn::Error>,
 }
@@ -170,7 +167,7 @@ where
     }
 }
 
-/// Tiny helper so `rewrite_leaf` works for both `Expr` and `Stmt`.
+/// Lets `rewrite_leaf` take an `Expr` or a `Stmt`.
 trait VisitMutOn<T> {
     fn apply(&mut self, node: &mut T);
 }

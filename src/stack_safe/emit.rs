@@ -1,9 +1,8 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Assembling one cycle's expansion: split the parameters, run the transform, and emit the
-//! entry enum, the frame enum, the driver's `match` over them, and a rewritten function per
-//! member. Which cycles there are, and where each one's driver goes, is `scan.rs`.
+//! Emits one cycle's expansion: entry and frame enums, the driver, and a wrapper per member.
+//! Finding cycles and placing drivers is `scan.rs`.
 
 use proc_macro2::{Ident, TokenStream};
 use quote::{ToTokens, format_ident, quote};
@@ -29,29 +28,20 @@ use super::walk::{Ctx, Env, Member};
 struct Split {
     context: Vec<CtxEntry>,
     member: Member,
-    /// What a group compares its members' slots by: the declared type with parentheses peeled,
-    /// lifetimes erased and `Self` resolved. See `context::slot_key`.
+    /// Normalized slot types, for comparing members. See `context::slot_key`.
     slot_keys: Vec<String>,
-    /// Each slot's type as the user wrote it, for the message that names a mismatch.
+    /// Slot types as written, for error messages.
     slot_types: Vec<String>,
 }
 
-/// Parameters split two ways. A `&mut` parameter (and any receiver) becomes a
-/// *context* slot the driver owns and lends out; everything else travels in the
-/// argument payload. A shared reference proven unchanged across every edge of
-/// the recursive cycle also becomes context, so every frame need not repeat it.
-///
-/// Payload parameters are plain (optionally `mut`) idents by now: the argument tuple is rebuilt as
-/// an *expression*, so [`desugar_param_patterns`] has already named every pattern.
-/// Callers run [`reject_unsupported_signature`] first, so the signature is known
-/// to be one the transform can handle.
+/// Split parameters into context slots (`&mut`, receivers, and invariant shared references) and
+/// payload. Expects [`desugar_param_patterns`] and [`reject_unsupported_signature`] to have run.
 fn split_params(
     func: &ItemFn,
     self_ty: Option<&syn::Type>,
     invariant_context: &HashSet<usize>,
 ) -> syn::Result<Split> {
     let sig = &func.sig;
-    // Whether a `mut` on a slot binding matters is a question about the body.
     let func_body = func.block.clone();
 
     let mut param_pats = Vec::new();
@@ -63,16 +53,12 @@ fn split_params(
     let mut param_names = Vec::new();
     let mut context: Vec<CtxEntry> = Vec::new();
     let mut context_at: HashMap<usize, usize> = HashMap::new();
-    // Slots are compared by *key* — parentheses peeled, named lifetimes erased — so that two
-    // spellings of one type are not a mismatch. The pretty form is kept for the message, which
-    // should quote what was written.
     let mut slot_keys: Vec<String> = Vec::new();
     let mut slot_types: Vec<String> = Vec::new();
     let mut arg_index = 0usize;
     for arg in &sig.inputs {
         match arg {
-            // `desugar_receiver` has already turned any receiver into a typed
-            // parameter, so this is unreachable in practice.
+            // Unreachable: `desugar_receiver` already ran.
             FnArg::Receiver(r) => {
                 return Err(syn::Error::new(
                     r.span(),
@@ -80,8 +66,6 @@ fn split_params(
                 ));
             }
             FnArg::Typed(pt) => {
-                // The payload and the context tuple have one shape for the whole group, so a
-                // parameter that exists only under a predicate cannot be one of them.
                 if let Some(attr) = pt
                     .attrs
                     .iter()
@@ -103,8 +87,7 @@ fn split_params(
                     ..
                 }) = &*pt.pat
                 else {
-                    // Payload patterns are already named by `desugar_param_patterns`, so what is
-                    // left is a `&mut` that destructures — a slot, not a value to take apart.
+                    // Unreachable: `desugar_param_patterns` names or rejects every other pattern.
                     return Err(syn::Error::new(
                         pt.pat.span(),
                         "`#[stack_safe]` requires plain identifier parameters; bind the pattern \
@@ -116,9 +99,7 @@ fn split_params(
                         peel_type(&pt.ty),
                         syn::Type::Reference(r) if r.mutability.is_some()
                     );
-                    // A `mut` here is inert unless the body assigns to the binding itself.
-                    // Writing *through* it is the ordinary use; only reassignment would be
-                    // invisible to the next step, which re-derives the binding.
+                    // Reassigning a slot binding would be lost; each step re-derives it.
                     if let Some(m) = mutability
                         && assigns_binding(&func_body, ident)
                     {
@@ -135,8 +116,7 @@ fn split_params(
                     context_at.insert(arg_index, context.len());
                     slot_keys.push(pretty_type(&slot_key(&pt.ty, self_ty)));
                     slot_types.push(pretty_type(&pt.ty));
-                    // The context tuple is one type for the whole group, so it holds the erased
-                    // form: a lifetime one member happens to name is no name the driver can use.
+                    // Lifetime-erased: the tuple type is shared by the whole group.
                     let ty = slot_type(&pt.ty);
                     let ty = &ty;
                     context.push(CtxEntry {
@@ -149,8 +129,7 @@ fn split_params(
                 } else {
                     param_pats.push(quote! { #mutability #ident });
                     param_names.push(ident.clone());
-                    // A type no `let` can carry — `impl Trait`, nested or not, and `!` — cannot be
-                    // annotated here, and such a parameter goes unpinned. See `annotatable`.
+                    // See `annotatable`.
                     let ty = &pt.ty;
                     param_types.push(if !annotatable(ty) {
                         TokenStream::new()
@@ -174,21 +153,12 @@ fn split_params(
                     } else {
                         quote! { let #mutability #ident: #ty = #ident; }
                     });
-                    // Used only if `scan_pinned_args` marks this position: the payload
-                    // then holds a pointer into the driver's pinned store. The pointer's
-                    // own type is named first, for the same reason the ordinary case
-                    // names the reference's: nothing else fixes this payload's type, and
-                    // in a group one member's payload is only ever built inside another
-                    // member's arm.
+                    // Used when `scan_pinned_args` marks this position (`data_in_frame`): the
+                    // payload is a pointer into the driver's pinned store. The pointer type is
+                    // named first to fix the payload's type.
                     //
-                    // SAFETY: as in `CtxEntry::rebind`, this lands in the caller's crate
-                    // and the invariant is ours. The pointer is one `Pin::push` returned
-                    // for a value moved into the driver's store, and `Pin` never moves a
-                    // value it holds, so the address stays valid. The frame that pushed
-                    // it holds the mark that drops it, so the value outlives every arm
-                    // that can reach this payload and is dropped once. Gated behind
-                    // `data_in_frame`; covered by `tests/transform.rs` and
-                    // `tests/group.rs` under both of Miri's aliasing models.
+                    // SAFETY: the pointer came from `Pin::push`, which never moves its values,
+                    // and the pushing frame drops it only after every arm that can see it.
                     param_anns_pinned.push(match &**ty {
                         syn::Type::Reference(r) => {
                             let elem = &r.elem;
@@ -225,13 +195,8 @@ fn split_params(
     })
 }
 
-/// Shared-reference parameters that never change along an edge of this recursive cycle.
-///
-/// The test is deliberately conservative: every member must spell the parameter with the same
-/// name and type, no body may shadow or assign that name, and every call to a member must pass the
-/// caller's same binding at the callee's corresponding position. Such a reference is ambient
-/// machine context, just like an immutable field of a hand-written evaluator, rather than data a
-/// continuation has to repeat.
+/// Per member, the positions of shared-reference parameters passed through unchanged by every
+/// recursive call: same name and type in every member, never rebound, always passed as-is.
 fn invariant_shared_contexts(
     funcs: &[ItemFn],
     assoc: bool,
@@ -393,33 +358,12 @@ fn invariant_shared_contexts(
     out
 }
 
-/// Can this group share one machine, instead of a copy per member?
+/// Whether the group can share one machine, taking a seed enum of each member's parameters.
 ///
-/// The machine can be lifted into a sibling function as long as that function's signature can be
-/// written, and the only thing it has to name is a *seed*: one variant per member carrying that
-/// member's own parameters. The entry and frame enums stay nested inside it, so their payloads — a
-/// loop's state, a resume point's locals — are still inferred, and a loop is therefore no obstacle.
-///
-/// What cannot be written is what rules a group out:
-///
-/// - a lone member, which has nothing to share. A cycle of one is its own outermost member, so it
-///   never holds a member that came out of a body — the case that has no other shape;
-/// - `impl Trait` in a parameter, which cannot be an enum field at all: it would have to become a
-///   generic parameter, which is a rewrite of the signature rather than a copy of it;
-/// - `Self`, unless the caller supplies the concrete type it stands for, which it can when the
-///   group came from an impl block without generics of its own;
-/// - generic parameters the members cannot share — see [`shared_generics`].
-///
-/// One shape slips through, because it cannot be told apart from an ordinary type: a parameter
-/// written as a bare path that *hides* a reference, such as an alias
-/// `type Words<'a> = &'a [&'a str]` used as `w: Words`. Nothing in the tokens says a lifetime is
-/// elided there, so the seed field is emitted verbatim and the enum has no lifetime to give it,
-/// which is an `E0106` on the parameter. Writing the elision out, `w: Words<'_>`, both fixes it and
-/// keeps the group lifted.
+/// Not when: there is one member, a parameter is `impl Trait`, a parameter names `Self` with no
+/// concrete type known, or [`shared_generics`] fails. An alias hiding a lifetime (`w: Words`)
+/// passes this check but fails with `E0106`; `Words<'_>` fixes it.
 fn liftable(funcs: &[ItemFn], has_self_ty: bool) -> bool {
-    // A `dyn` type needs no test: bare, it is unsized and could not have been a parameter in the
-    // first place, and behind a reference or a `Box` it is a field like any other. A named lifetime
-    // needs none either, since the seed carries the parameter that declares it.
     let writable = |ty: &syn::Type| -> bool {
         let (impl_trait, self_ty_named) = names_impl_trait_or_self(ty);
         !impl_trait && (has_self_ty || !self_ty_named)
@@ -435,10 +379,7 @@ fn liftable(funcs: &[ItemFn], has_self_ty: bool) -> bool {
         })
 }
 
-/// Does this type name an `impl Trait`, and does it name `Self`?
-///
-/// Asked of the syntax rather than of the rendered text, so that a type of the user's whose name
-/// merely *contains* `Self`, such as `MySelf`, is not mistaken for it.
+/// Whether the type contains `impl Trait`, and whether it names `Self`.
 fn names_impl_trait_or_self(ty: &syn::Type) -> (bool, bool) {
     struct V {
         impl_trait: bool,
@@ -466,20 +407,12 @@ fn names_impl_trait_or_self(ty: &syn::Type) -> (bool, bool) {
     (v.impl_trait, v.self_ty)
 }
 
-/// The generic parameters and where-predicates a lifted group's seed and machine carry: the union
-/// of its members', keyed by name, since a cycle written the ordinary way declares the same ones on
-/// every member and one written with a nested member declares them only on the host.
+/// The union of the members' generics and where-predicates, keyed by name.
 ///
-/// `None` when they cannot be shared, in which case the group is emitted as a copy per member:
-///
-/// - two members declaring the same name differently, which one list cannot satisfy;
-/// - a parameter no member's *parameters* mention, which the seed enum cannot declare — an enum
-///   may not have a parameter its variants never use (`E0392`). A type appearing only in a return
-///   type is the usual way to hit this.
+/// `None` if two members declare one name with different bounds, or a generic is unused by every
+/// parameter list (the seed enum would hit `E0392`).
 fn shared_generics(funcs: &[ItemFn]) -> Option<(Vec<syn::GenericParam>, Vec<syn::WherePredicate>)> {
-    /// What a member asks of one parameter: the bounds as a *set*, so that two members asking the
-    /// same thing agree however they spelled it — `T: Copy + Into<u64>` is `T: Into<u64> + Copy`,
-    /// and either is `T` with `where T: Copy + Into<u64>`.
+    /// Bounds per generic, as sets so spelling order and inline vs. `where` don't matter.
     type Asked = std::collections::BTreeMap<String, std::collections::BTreeSet<String>>;
 
     fn name(param: &syn::GenericParam) -> String {
@@ -490,8 +423,7 @@ fn shared_generics(funcs: &[ItemFn]) -> Option<(Vec<syn::GenericParam>, Vec<syn:
         }
     }
 
-    /// The name a predicate bounds, when it bounds a parameter rather than some type built from
-    /// one: `where T: Copy` belongs to `T`, `where Vec<T>: Clone` belongs to nobody.
+    /// The generic a predicate bounds directly: `T` for `T: Copy`, `None` for `Vec<T>: Clone`.
     fn bounded_param(predicate: &syn::WherePredicate) -> Option<String> {
         match predicate {
             syn::WherePredicate::Type(t) => match &t.bounded_ty {
@@ -503,8 +435,7 @@ fn shared_generics(funcs: &[ItemFn]) -> Option<(Vec<syn::GenericParam>, Vec<syn:
         }
     }
 
-    /// Every parameter this member declares, with the bounds it asks of it from both places they
-    /// can be written. A const parameter's type is one of its "bounds", since it has to agree too.
+    /// Each generic's bounds, inline and `where`. A const generic's type counts as a bound.
     fn asked(func: &ItemFn) -> Asked {
         let mut asked = Asked::new();
         for param in &func.sig.generics.params {
@@ -539,9 +470,7 @@ fn shared_generics(funcs: &[ItemFn]) -> Option<(Vec<syn::GenericParam>, Vec<syn:
         asked
     }
 
-    // Each parameter is taken from the first member that declares it, together with that member's
-    // own predicates about it — one spelling of the requirement, which every other member declaring
-    // the same parameter has to match as a set.
+    // Take each generic from its first declarer; later declarers must agree.
     let mut params: Vec<syn::GenericParam> = Vec::new();
     let mut predicates: Vec<syn::WherePredicate> = Vec::new();
     let mut agreed: Asked = Asked::new();
@@ -567,8 +496,7 @@ fn shared_generics(funcs: &[ItemFn]) -> Option<(Vec<syn::GenericParam>, Vec<syn:
                 }
             }
         }
-        // A predicate about something built from a parameter belongs to no parameter, so it is
-        // carried as written, once.
+        // Other predicates are carried once, as written.
         let free: Vec<syn::WherePredicate> = func
             .sig
             .generics
@@ -588,8 +516,7 @@ fn shared_generics(funcs: &[ItemFn]) -> Option<(Vec<syn::GenericParam>, Vec<syn:
         }
     }
 
-    // Every parameter has to be used by some variant of the seed, which carries the members'
-    // parameters and nothing else.
+    // Every generic must appear in some parameter type.
     let mentioned: Vec<String> = funcs
         .iter()
         .flat_map(|f| &f.sig.inputs)
@@ -611,12 +538,8 @@ fn shared_generics(funcs: &[ItemFn]) -> Option<(Vec<syn::GenericParam>, Vec<syn:
     params.iter().all(used).then_some((params, predicates))
 }
 
-/// A parameter type as the seed carries it./// A parameter type as the seed carries it./// A parameter type as the seed carries it.
-///
-/// Two rewrites. Every elided lifetime becomes the seed's own, since an enum field cannot
-/// elide one. And `Self` becomes the type it stands for, since the seed is declared beside
-/// the impl block rather than inside it — which is why an impl group has to supply that
-/// type to be lifted at all.
+/// A parameter type as a seed field: elided lifetimes become the seed lifetime, `Self` becomes
+/// the concrete type.
 fn seed_field_type(ty: &syn::Type, self_ty: Option<&syn::Type>) -> syn::Type {
     struct V<'a> {
         lt: syn::Lifetime,
@@ -666,32 +589,25 @@ struct Pieces<'a> {
     allows: &'a TokenStream,
     /// One arm per entry point.
     arms: &'a [TokenStream],
-    /// Continuation-frame dispatch, executed by the direct unwind phase.
+    /// Continuation-frame dispatch.
     resume: &'a TokenStream,
     /// How each context slot is filled from the member's parameters.
     ctx_inits: &'a [TokenStream],
     /// `: R`, naming the driver's result type.
     ret_ann: &'a TokenStream,
-    /// Names the entry type parameters the macro knows, before the body is checked.
+    /// Type ascription for the entry's known payload types.
     anchor: &'a TokenStream,
-    /// Any annotation required on the entry control.
+    /// Annotation on the entry value, if any.
     input_ann: &'a TokenStream,
-    /// `: Frames<Frame<..>>`, naming the frame type parameters on the one place that holds one.
+    /// `: Frames<Frame<..>>`.
     frames_ann: &'a TokenStream,
-    /// The union of the members' return types, when they differ. It is named by the
-    /// shared machine's own signature, so it cannot live inside it.
+    /// The return-type union, declared outside the machine since its signature names it.
     ret_union_decl: &'a TokenStream,
 }
 
-/// One machine for the whole group, with each member reduced to a seeded call.
+/// Emit one shared machine for the group, with each member a call into it. See [`liftable`].
 ///
-/// The seed enum is what makes this possible: it carries only the members' own parameters,
-/// whose types their signatures give, so the shared function's signature can be written. The
-/// entry and frame enums stay inside that function, where their payloads are still inferred.
-/// See [`liftable`] for when a group qualifies.
-///
-/// A member marked `inner` came out of a body, so its own entry is written *inside* the machine
-/// rather than beside it, and the slot it would have taken comes back empty.
+/// Members marked `inner` are written inside the machine; their output slot is empty.
 fn lifted(
     funcs: &[ItemFn],
     ctx: &Ctx,
@@ -715,15 +631,13 @@ fn lifted(
     let members: Vec<Ident> = funcs.iter().map(|f| f.sig.ident.clone()).collect();
     let (seed_ty, machine, ctxp) = (seed_ty(&members), machine_fn(&members), ctx_param());
     let (entry, lt) = (entry_ty(), seed_lifetime());
-    // The shared machine answers with whatever the driver answers with, which is the
-    // union when the members' return types differ.
     let ret = {
         let ann = ctx.ret_ann.clone();
         let ty = ann.into_iter().skip(1).collect::<TokenStream>();
         quote! { -> #ty }
     };
 
-    // One variant per member, holding that member's parameters as written.
+    // Seed variants: one per member, holding its parameters.
     let variants: Vec<TokenStream> = funcs
         .iter()
         .enumerate()
@@ -737,10 +651,7 @@ fn lifted(
         })
         .collect();
 
-    // The members' own generic parameters, which the seed and the machine both carry, plus the
-    // seed's own lifetime — left out when no member takes a reference, since an unused lifetime
-    // parameter is an error. Declared with their bounds, used without: `<'__ss, T: Copy>` names
-    // them, `<'__ss, T>` passes them on.
+    // Generics plus the seed lifetime (only if some field borrows).
     let (params, predicates) =
         shared_generics(funcs).expect("`liftable` said the members share their generics");
     let borrows = variants
@@ -776,8 +687,6 @@ fn lifted(
         false => quote! { where #(#predicates),* },
     };
 
-    // Taking a seed apart gives back that member's parameters under their own names, so
-    // the context tuple and the entry payload are built exactly as they are per member.
     let dispatch = funcs.iter().enumerate().map(|(i, f)| {
         let v = entry_variant(i);
         let names: Vec<&Ident> = f
@@ -811,9 +720,7 @@ fn lifted(
         }
     });
 
-    // Each member keeps its signature and seeds its own entry. A method keeps the two levels it
-    // already had: the method itself, and the plain function it forwards to, whose body is now
-    // one seeded call rather than a machine of its own.
+    // Each member keeps its signature and calls the machine with its seed.
     let entries = funcs.iter().enumerate().map(|(i, f)| {
         let (attrs, vis) = (&f.attrs, &f.vis);
         let (outer, sig) = match &methods[i] {
@@ -839,8 +746,7 @@ fn lifted(
             })
             .collect();
         let call = match self_ty {
-            // Written inside the machine, where `Self` belongs to no item: a nested `fn` cannot
-            // name it (E0401), so the impl's own type is spelled out instead.
+            // A nested `fn` cannot name `Self` (E0401).
             Some(ty) if inner[i] => quote! { <#ty>::#machine },
             Some(_) => quote! { Self::#machine },
             None => quote! { #machine },
@@ -858,9 +764,7 @@ fn lifted(
         }
     });
 
-    // A member declared inside another's body goes into the driver rather than beside it,
-    // where the items those bodies declared are, and where a helper that called it still
-    // finds it under the name it had.
+    // Members declared in a body go inside the machine.
     let entries: Vec<TokenStream> = entries.collect();
     let within: Vec<&TokenStream> = entries
         .iter()
@@ -872,17 +776,13 @@ fn lifted(
     let seed_decl = quote! {
         #ret_union_decl
 
-        // Named after a function, hence not camel case; it is generated and not meant
-        // to be written.
         #[allow(non_camel_case_types)]
         enum #seed_ty #seed_generics #where_clause {
             #(#variants,)*
         }
     };
     let loop_expr = driver::machine(&quote! { __ss_entry }, input_ann, frames_ann, arms, resume);
-    // One `#[track_caller]` member makes the shared machine tracked too: the body runs *in* the
-    // machine, so an untracked frame here would be the one `Location::caller()` reports. See
-    // `analyze::desugar_receiver`, which keeps the same attribute on the body of a method.
+    // Bodies run in the machine, so it must be `#[track_caller]` if any member is.
     let tracked = funcs
         .iter()
         .any(|f| f.attrs.iter().any(|a| a.path().is_ident("track_caller")))
@@ -903,16 +803,13 @@ fn lifted(
         }
     };
 
-    // An enum cannot be declared inside an impl block, so for a group of methods the seed
-    // is hoisted beside the impl and only the machine stays in it, as an associated
-    // function — which is also what keeps `Self` working in the arms.
+    // In an impl block, the seed enum is hoisted out beside it.
     let (hoisted, with_first) = match self_ty {
         Some(_) => (seed_decl, machine_decl),
         None => (TokenStream::new(), quote! { #seed_decl #machine_decl }),
     };
 
-    // The declarations ride with the first member written beside the driver rather than inside
-    // it — slot 0 today, but saying which one it is keeps that from being load-bearing.
+    // Declarations go with the first member not written inside the machine.
     let beside = inner
         .iter()
         .position(|&nested| !nested)
@@ -922,7 +819,6 @@ fn lifted(
         .enumerate()
         .map(|(i, entry)| {
             if inner[i] {
-                // Already written inside the driver.
                 TokenStream::new()
             } else if i == beside {
                 let with_first = &with_first;
@@ -935,11 +831,7 @@ fn lifted(
     Ok((out, hoisted))
 }
 
-/// The name an item declares, where it declares a single one.
-///
-/// A `use`, an `impl` and a macro-generated item declare no name this can compare, so they
-/// are gathered without being checked; a genuine clash between two of those is then Rust's
-/// own duplicate-definition error rather than the macro's.
+/// The single name an item declares, if any (`use`, `impl` etc. give `None`).
 fn item_name(item: &Item) -> Option<&Ident> {
     match item {
         Item::Const(i) => Some(&i.ident),
@@ -963,8 +855,7 @@ fn param_names_len_cells(names: &[Ident]) -> Vec<Cell<bool>> {
     names.iter().map(|_| Cell::new(false)).collect()
 }
 
-/// A type as the user would write it, for error messages: `to_token_stream`
-/// renders `&mut Vec<u64>` as `& mut Vec < u64 >`.
+/// A type rendered without token spacing (`&mut Vec<u64>`, not `& mut Vec < u64 >`).
 fn pretty_type(ty: &impl ToTokens) -> String {
     let mut out = ty.to_token_stream().to_string();
     for (from, to) in [
@@ -980,13 +871,7 @@ fn pretty_type(ty: &impl ToTokens) -> String {
     out
 }
 
-/// The driver's result type is exactly the members' return type. Naming it —
-/// on the driver's `let` and on every continuation's parameter — is what lets
-/// method resolution inside a continuation see its receiver's type; left to
-/// inference, `f(n - 1).wrapping_add(1)` fails with E0689 ("ambiguous numeric
-/// type"). `impl Trait` is the one return type that cannot be written down, so it
-/// goes unannotated.
-/// The return type on its own, for a payload slot; empty where [`ret_annotation`] is.
+/// The return type alone; empty where [`ret_annotation`] is.
 fn ret_bare_type(sig: &syn::Signature) -> TokenStream {
     match &sig.output {
         ReturnType::Default => quote! { () },
@@ -995,6 +880,8 @@ fn ret_bare_type(sig: &syn::Signature) -> TokenStream {
     }
 }
 
+/// `: R` for the return type, so continuations can resolve methods on it (else E0689).
+/// Empty if not [`annotatable`].
 fn ret_annotation(sig: &syn::Signature) -> TokenStream {
     match &sig.output {
         ReturnType::Default => quote! { : () },
@@ -1003,9 +890,7 @@ fn ret_annotation(sig: &syn::Signature) -> TokenStream {
     }
 }
 
-/// May this type be written on a `let` in the driver? Two may not, and both are legal where the
-/// user wrote them: `impl Trait`, which `E0562` forbids on a binding and which need not be the whole
-/// type (`Box<impl Iterator>`), and `!`, which is stable in return position only.
+/// Whether the type can annotate a `let`: not if it contains `impl Trait` (E0562) or is `!`.
 fn annotatable(ty: &syn::Type) -> bool {
     !names_impl_trait_or_self(ty).0 && !matches!(peel_type(ty), syn::Type::Never(_))
 }
@@ -1033,24 +918,15 @@ fn reject_unsupported_signature(sig: &syn::Signature) -> syn::Result<()> {
     Ok(())
 }
 
-/// Transform a group of functions that share one driver: a self-recursive
-/// function alone, or every member of a mutually recursive cycle. Emits one
-/// rewritten function per member, each seeded at its own entry point.
-/// What the whole group shares, worked out before a line of it is generated: how each member's
-/// parameters split into a payload and context slots, what the members have to agree on, and what
-/// the driver answers with. The body scans run here too, since everything the arms are built from
-/// depends on their answers.
+/// Build the group's [`Ctx`]: split parameters, check members agree, settle the result type,
+/// and run the body scans code generation depends on.
 fn analyse(
     funcs: &[ItemFn],
     opts: Opts,
     assoc: bool,
     self_ty: Option<&syn::Type>,
 ) -> syn::Result<Ctx> {
-    // Two members of one cycle with the same name. A call is matched by its *final identifier* —
-    // a macro resolves no paths — so the transform cannot tell which of the two a given call
-    // means: both would enter whichever entry point comes first, silently. Sibling blocks each
-    // declaring `fn step`, and a nested `fn f` inside an outer `fn f`, are the shapes that get
-    // here.
+    // Calls are matched by name, so members must have distinct names.
     for (i, func) in funcs.iter().enumerate() {
         if funcs[..i].iter().any(|g| g.sig.ident == func.sig.ident) {
             return Err(syn::Error::new(
@@ -1073,8 +949,7 @@ fn analyse(
         splits.push(split_params(func, self_ty, invariant_context)?);
     }
 
-    // The whole group shares one context tuple and one result type, so its
-    // members have to agree on both.
+    // Members share one context tuple.
     let first = &splits[0];
     for (split, func) in splits.iter().zip(funcs).skip(1) {
         if split.slot_keys != first.slot_keys {
@@ -1095,15 +970,11 @@ fn analyse(
         }
     }
 
-    // The driver has one result type. Members that answer with different types answer
-    // with a union of them instead, which each member's entry takes its own variant out of.
-    // `impl Trait` cannot be named, so such a return goes unannotated and unjoined.
+    // Differing return types are joined into a union enum.
     let rets: Vec<TokenStream> = funcs.iter().map(|f| ret_annotation(&f.sig)).collect();
     let ret_types: Vec<TokenStream> = funcs.iter().map(|f| ret_bare_type(&f.sig)).collect();
     let differ = rets.iter().any(|r| r.to_string() != rets[0].to_string());
-    // An `impl Trait` return is its own opaque type, so two members that spell one
-    // identically still return *different* types, and neither one can be named to join
-    // them. A lone function is unaffected: it is the only thing the driver answers for.
+    // `impl Trait` returns can't be named, so they are only allowed for a lone function.
     if funcs.len() > 1
         && let Some((_, f)) = funcs.iter().enumerate().find(|(i, _)| rets[*i].is_empty())
     {
@@ -1154,33 +1025,22 @@ fn analyse(
     ctx.hoist.set(checks_are_shareable(&ctx, funcs));
 
     for (i, func) in funcs.iter().enumerate() {
-        // Before the scans: whether a borrowed local is owned here is judged from its annotation.
+        // Must precede the scans.
         ctx.current.set(i);
         note_annotated_lets(&ctx, &func.block);
         validate(&ctx, func)?;
         reject_shadowed_across_a_call(&ctx, func)?;
-        // Must run before any code is generated: it decides which slots are raw,
-        // which every context rebinding depends on.
+        // Both scans must run before codegen: they decide which slots and payload positions
+        // become raw pointers.
         scan_context_args(&ctx, &func.block)?;
-        // Likewise: it decides which payload positions travel as a raw pointer into
-        // the driver's pinned store.
         scan_pinned_args(&ctx, &func.block)?;
     }
     Ok(ctx)
 }
 
-/// May this group's resume arms share one carrier check, as `driver::resume` writes it?
-///
-/// Three things have to hold, and all of them are known before anything is lowered — which is when
-/// the question has to be settled, since a point whose check is lifted out keeps none of its own.
-///
-/// 1. Every recursive call is the operand of a `?`. Only then is the check the first thing every
-///    resume point does, and only then is there one check rather than several to share.
-/// 2. The members share a return type. A union would have to be taken apart per callee first, and
-///    the check is on what is inside it.
-/// 3. Neither unsafe option is in play. Under them a point may have a value to take back, a store
-///    to release or a context pointer to restore, all of which have to happen on the error path
-///    too — and a lifted check leaves the loop without reaching them.
+/// Whether all resume arms can share one `?` check (see `driver::resume`). Requires every
+/// recursive call to be under `?`, a single return type, and no unsafe options (their cleanup
+/// would be skipped on the error path).
 fn checks_are_shareable(ctx: &Ctx, funcs: &[ItemFn]) -> bool {
     struct V<'a> {
         ctx: &'a Ctx,
@@ -1189,8 +1049,7 @@ fn checks_are_shareable(ctx: &Ctx, funcs: &[ItemFn]) -> bool {
 
     impl<'ast> syn::visit::Visit<'ast> for V<'_> {
         fn visit_expr(&mut self, e: &'ast syn::Expr) {
-            // `rec(..)?` is the shape being looked for, so the call itself is not reported —
-            // only whatever its arguments turn out to hold.
+            // `rec(..)?` is fine; still check its arguments.
             if let syn::Expr::Try(t) = e
                 && let Some((_, call)) = self.ctx.rec_call(strip_parens(&t.expr))
             {
@@ -1206,7 +1065,6 @@ fn checks_are_shareable(ctx: &Ctx, funcs: &[ItemFn]) -> bool {
             syn::visit::visit_expr(self, e);
         }
 
-        /// An item a body declares is a scope of its own; a member declared there is in `funcs`.
         fn visit_item(&mut self, _: &'ast Item) {}
     }
 
@@ -1218,23 +1076,15 @@ fn checks_are_shareable(ctx: &Ctx, funcs: &[ItemFn]) -> bool {
         shareable: true,
     };
     for (i, func) in funcs.iter().enumerate() {
-        // `rec_call` reads the member being lowered, for the same reason the lowering does.
         ctx.current.set(i);
         syn::visit::Visit::visit_block(&mut v, &func.block);
     }
     v.shareable
 }
 
-/// Each member's body, turned into the arms it is entered at, and the items those bodies declared.
-///
-/// A body is split across several arms of the shared `match`, so an item it declares is moved out to
-/// one place enclosing all of them, and that place serves the whole group. Two members declaring the
-/// same name would therefore declare it twice, which is the one thing to reject.
+/// Lower each member's body to its entry arm, hoisting out the items bodies declare.
+/// Hoisted items share one scope, so two members declaring the same name is an error.
 fn member_arms(ctx: &Ctx, funcs: &[ItemFn]) -> syn::Result<(Vec<Item>, Vec<TokenStream>)> {
-    // A body is split across several arms of the shared `match`, so an item it declares is
-    // moved out to one place enclosing all of them — and that place serves the whole group.
-    // Two members declaring the same name would therefore declare it twice, which is the one
-    // thing to reject: `declared` records who declared what.
     let mut declared: HashMap<String, &Ident> = HashMap::new();
     let mut items: Vec<Item> = Vec::new();
     let mut main_arms: Vec<TokenStream> = Vec::new();
@@ -1285,7 +1135,6 @@ fn member_arms(ctx: &Ctx, funcs: &[ItemFn]) -> syn::Result<(Vec<Item>, Vec<Token
             teardown: TokenStream::new(),
             derived: Vec::new(),
         };
-        // Each member's own result enters the union under its own variant.
         let done = |v: TokenStream| -> syn::Result<TokenStream> {
             Ok(driver::done(ctx.wrap_result(i, v)))
         };
@@ -1314,10 +1163,8 @@ fn member_arms(ctx: &Ctx, funcs: &[ItemFn]) -> syn::Result<(Vec<Item>, Vec<Token
     Ok((items, main_arms))
 }
 
-/// `inner[i]` says that member `i` was declared inside another member's body. It keeps the
-/// name it had — a body's name is nobody else's — but is written *inside* the shared driver,
-/// beside the items those bodies declared, rather than out at the group's own scope, where it
-/// was never visible in the first place.
+/// Expand one group. `inner[i]` marks member `i` as declared in another member's body; such
+/// members are written inside the shared driver.
 pub(super) fn expand_group(
     funcs: Vec<ItemFn>,
     opts: Opts,
@@ -1330,33 +1177,23 @@ pub(super) fn expand_group(
 
     let mut funcs = funcs;
 
-    // `self` is special only to Rust's syntax, so it is desugared away first: a method
-    // becomes a plain function of an ordinary `&Self` or `&mut Self` parameter, plus a
-    // wrapper that keeps the method's own signature. Everything below then deals with
-    // functions only, and a receiver obeys whatever rule its type already implies.
+    // Desugar receivers into typed `Self` parameters plus a wrapper method.
     let group_names: Vec<Ident> = funcs.iter().map(|f| f.sig.ident.clone()).collect();
     let mut methods: Vec<Option<MethodSplit>> = Vec::with_capacity(funcs.len());
     for func in &mut funcs {
-        // Before anything reads a signature: an `impl Trait` parameter becomes the generic it
-        // already is, so the payload can be pinned by name, and a parameter that destructures is
-        // given a name with the pattern re-bound in the body.
+        // `impl Trait` params become generics; destructuring params get names.
         desugar_apit(func);
         desugar_param_patterns(func)?;
         methods.push(desugar_receiver(func, &group_names)?);
     }
 
-    // Decided as soon as receivers are out of the way, since everything below depends on it and
-    // one of the two shapes cannot hold every group.
     let lift = liftable(&funcs, self_ty.is_some());
-    // A shared driver that is generic is no home for a member declared in a body: such a function
-    // cannot name the parameters — a nested `fn` never sees the generics of the one hosting it — so
-    // it could only call the cycle at some concrete type, which is not what the driver is.
+    // A member declared in a body needs a lifted, non-generic driver: it can't hold its own copy
+    // of the machine, and can't name the host's generics.
     let generic = lift && shared_generics(&funcs).is_some_and(|(params, _)| !params.is_empty());
     if (!lift || generic)
         && let Some((f, _)) = funcs.iter().zip(inner).find(|&(_, &nested)| nested)
     {
-        // The unlifted shape gives each member its own copy of the machinery, and a member written
-        // inside the machinery cannot hold a copy containing itself.
         let name = &f.sig.ident;
         let why = if generic {
             "and the driver they share is generic, which a function declared in a body cannot \
@@ -1380,18 +1217,14 @@ pub(super) fn expand_group(
     let (items, main_arms) = member_arms(&ctx, &funcs)?;
     let entry = entry_ty();
 
-    // Resolve every payload — loop states and resume frames together, since they
-    // reference each other's markers.
     let mut ctx_inits: Vec<TokenStream> = ctx.context.iter().map(CtxEntry::init_expr).collect();
     let pin = pin_ty();
-    // A position whose pointee type cannot be named keeps a store of its own, left to inference.
+    // Positions with unnamable pointee types get their own store.
     for _ in 0..ctx.own_store_count() {
         ctx_inits.push(quote! { #pin::new() });
     }
-    // Everything else shares one store, holding one enum. Naming its element types here, rather
-    // than leaving them to the `push`es, is what lets one member's entry payload be inferred from
-    // another's arm — and what keeps a variant only a `#[cfg]`ed lowering constructs from having no
-    // type at all.
+    // The rest share one store of an enum with named element types, so inference works across
+    // members and `#[cfg]`ed variants.
     let shared_elements = ctx.shared_elements();
     let pinned_decl = if shared_elements.is_empty() {
         TokenStream::new()
@@ -1401,8 +1234,6 @@ pub(super) fn expand_group(
         let params: Vec<Ident> = (0..shared_elements.len()).map(pinned_param).collect();
         let variants: Vec<Ident> = (0..shared_elements.len()).map(pinned_variant).collect();
         quote! {
-            // A variant is constructed under one `#[cfg]` and not another, and a group's members
-            // need not all park something.
             #[allow(dead_code)]
             enum #en<#(#params),*> {
                 #(#variants(#params),)*
@@ -1417,7 +1248,7 @@ pub(super) fn expand_group(
         frames,
         derived,
     } = solve_payloads(&loops, &resumes);
-    // What an arm recomputes rather than receives, bound ahead of its code; see `walk::Derived`.
+    // See `walk::Derived`.
     let recompute = |n: usize| -> TokenStream {
         let binds = derived[n].iter().map(|d| {
             let (name, expr) = (&d.name, &d.expr);
@@ -1426,8 +1257,7 @@ pub(super) fn expand_group(
         quote! { #(#binds)* }
     };
 
-    // The seed lifetime only exists in the lifted path, and only when some member takes a
-    // reference: elsewhere an elided `&` in a slot annotation stays elided.
+    // Whether a seed lifetime exists (lifted, and some parameter is a reference).
     let seed_lt = lift
         && ctx
             .members
@@ -1457,10 +1287,7 @@ pub(super) fn expand_group(
         let recomputed = recompute(n);
         let prologue = ctx.ctx_prologue();
         let (gate, stand_in) = gating(&lp.gates);
-        // The stand-in exists only for a gated point: the variant is declared whether the predicate
-        // holds or not, so the match needs an arm either way. Nothing constructs it -- the code that
-        // would is gone -- so its pattern is what tells the compiler what the payload is: `()`,
-        // since nothing reachable travels in it.
+        // A gated variant still needs an arm when the gate is off; its payload is `()`.
         let stand_in = stand_in.map(|ungated| {
             quote! {
                 #ungated
@@ -1475,22 +1302,15 @@ pub(super) fn expand_group(
             #stand_in
         });
     }
-    // Every call site's continuation began by checking the carrier, so that check is done once,
-    // above the dispatch on the frame tag, and a residual leaves the loop instead of being handed
-    // down through the frames — `driver::resume`, which is where the two are measured. Only with
-    // one return type across the group: a union would have to be taken apart per callee first, and
-    // the check is on what is inside it.
+    // Shared `?` check before frame dispatch; see `checks_are_shareable` and `driver::resume`.
     let hoist = ctx.hoist.get() && !resumes.is_empty();
-    // A lifted check is not written per point, so if the decision held for some points and not for
-    // others their `?` would be gone with nothing standing in for it. `checks_are_shareable` is
-    // what rules that out, and this is where it would show.
     assert!(
         !hoist || resumes.iter().all(|r| r.checked.get()),
         "stack_safe: the shared carrier check was decided on but some resume point did not take it"
     );
-    // One arm per recursive call site: where the driver resumes with the result.
+    // One arm per recursive call site.
     let mut frame_arms: Vec<TokenStream> = Vec::new();
-    // The same dispatch for the path where the shared check fails; see `driver::resume`.
+    // Drops each frame when the shared check fails.
     let mut frame_drops: Vec<TokenStream> = Vec::new();
     for (r, res) in resumes.iter().enumerate() {
         let variant = frame_variant(r);
@@ -1521,9 +1341,7 @@ pub(super) fn expand_group(
             });
             continue;
         }
-        // Without the shared check the value used to be a pattern in the state, matched straight
-        // out of `Resume`. The state no longer has a slot for it, so it comes from the local the
-        // one `Resume` arm binds — see `driver::resume_direct`.
+        // See `driver::resume_direct`.
         let resumed = value_local();
         let stand_in = stand_in.map(|ungated| {
             quote! { #ungated #frame::#variant(()) => unreachable!("gated out"), }
@@ -1534,8 +1352,6 @@ pub(super) fn expand_group(
             #stand_in
         });
     }
-    // One continuation dispatch either way. The direct-unwind driver pops the frame and runs this
-    // separately from entry dispatch, keeping the completed value in a local between frames.
     let resume = match hoist {
         true => driver::resume(&frame_arms, &frame_drops),
         false => driver::resume_direct(&frame_arms),
@@ -1554,23 +1370,15 @@ pub(super) fn expand_group(
     let frame_variants: Vec<Ident> = (0..resumes.len()).map(frame_variant).collect();
     let ctxp = ctx_param();
 
-    // The dispatch builds only the member entries, so a loop state's or a frame's type parameter is
-    // still an inference variable when the closure's own type is settled -- and a closure's
-    // parameter types are settled before its body is checked, so no construction inside can pin
-    // them. Naming here, outside the closure, what the macro knows: `_` stands for a variant whose
-    // payload has a slot no annotation reached.
+    // Ascribe known entry payload types up front; inference alone can't pin loop states.
     let anchor = {
         let entry_args = (0..total_entries)
             .map(|n| variant_payload_type(&ctx, n, &loops, &states, self_ty, seed_lt));
         let entry_ty_name = entry_ty();
         quote! { let _: &#entry_ty_name<#(#entry_args),*> = &__ss_entry; }
     };
-    // Nothing the body builds is in scope outside it to hang an ascription on, so a frame's slots
-    // are named on the two locals the loop holds instead. Without this a slot whose only use
-    // constrains nothing -- `{x:?}` asks for `Debug` and no more -- stays ambiguous.
-    // A frame behind a `#[cfg]` is left to inference in this annotation: when the predicate holds
-    // the code that builds it says what it is, and when it does not the arm standing in for it
-    // matches `()`, which says so there. Naming it here could only name one of the two.
+    // Name frame slot types on the frame stack, else weakly constrained slots stay ambiguous.
+    // Gated frames are `_`: their type depends on the `#[cfg]`.
     let frame_named = {
         let frame_args: Vec<TokenStream> = frames
             .iter()
@@ -1585,21 +1393,17 @@ pub(super) fn expand_group(
             .collect();
         let frame_ty_name = frame_ty();
         match frame_args.is_empty() {
-            // With no recursive call the enum has no parameters, and `Frame<>` is not a type.
             true => quote! { #frame_ty_name },
             false => quote! { #frame_ty_name<#(#frame_args),*> },
         }
     };
-    // Entry dispatch carries only the entry itself. Completed answers move directly through the
-    // separate unwind phase and never share this control value.
     let input_ann = TokenStream::new();
     let frames_ann = {
         let frames_ty_name = frames_ty();
         quote! { : #frames_ty_name<#frame_named> }
     };
 
-    // Over everything the expansion writes that could name one of the borrowed items: entry arms,
-    // continuation dispatch, and the context tuple, which is where a `Pin` store is built.
+    // Import only the `defs` items the generated code uses.
     let defs_imports = defs_imports(&quote! { #(#arms)* #resume #(#ctx_inits)* });
     let ret_union_decl = match &ctx.ret_union {
         None => TokenStream::new(),
@@ -1629,10 +1433,7 @@ pub(super) fn expand_group(
             #(#frame_variants(#frame_params),)*
         }
     };
-    // The expansion legitimately produces `mut` bindings a given arm does not use,
-    // redundant parens, and arms after a `return`. `unused_assignments` fires falsely on
-    // a loop-carried local: the continuation assigns it and then moves it into the next
-    // iteration's payload, which the upvar analysis does not count as a read.
+    // Generated code trips these legitimately.
     let allows = quote! {
         #[allow(
             unused_mut,
@@ -1640,11 +1441,7 @@ pub(super) fn expand_group(
             unused_parens,
             unused_assignments,
             unreachable_code,
-            // `break` inside a lowered loop becomes a transition, which can land in a
-            // sub-expression position.
             clippy::diverging_sub_expression,
-            // A frame whose payload needs no drop is still named on the path that drops one;
-            // which frames those are is not something the transform can know.
             clippy::drop_non_drop
         )]
     };
@@ -1665,9 +1462,7 @@ pub(super) fn expand_group(
         return lifted(&funcs, &ctx, &pieces, self_ty, &methods, inner);
     }
 
-    // One rewritten function per member, each with its own copy of the machinery. See
-    // `liftable` for why a group sometimes has to be emitted this way, and the rejection above
-    // for why no member of such a group can have come out of a body.
+    // Not liftable: each member gets its own copy of the machine.
     let ret_ann = &ctx.ret_ann;
     let loop_expr = driver::machine(
         &quote! { __ss_entry },
@@ -1696,8 +1491,6 @@ pub(super) fn expand_group(
             })
             .collect();
 
-        // A method keeps its own signature in the wrapper, and the transformed body is
-        // emitted beside it under the wrapper's chosen name.
         let (wrapper, sig) = match &methods[i] {
             Some(m) => {
                 let outer = &m.outer;
@@ -1712,22 +1505,13 @@ pub(super) fn expand_group(
             #wrapper
 
             #(#attrs)*
-            // The expansion legitimately produces `mut` bindings a given arm does
-            // not use, redundant parens, and arms after a `return`. `unused_assignments`
-            // fires falsely on a loop-carried local: the continuation assigns it and
-            // then moves it into the next iteration's payload, which the upvar
-            // analysis does not count as a read.
             #[allow(
                 unused_mut,
                 unused_variables,
                 unused_parens,
                 unused_assignments,
                 unreachable_code,
-                // `break` inside a lowered loop becomes a transition, which can land in
-                // a sub-expression position.
                 clippy::diverging_sub_expression,
-                // A frame whose payload needs no drop is still named on the path that
-                // drops one; which frames those are is not something the transform can know.
                 clippy::drop_non_drop
             )]
             #vis #sig {
@@ -1756,10 +1540,8 @@ pub(super) fn expand_group(
     Ok((out, TokenStream::new()))
 }
 
-/// The attributes an arm generated under `#[cfg]` predicates needs: the gate itself, and the gate of
-/// the arm that stands in for it otherwise.
-///
-/// An ungated arm needs neither, and must not get a stand-in: it is the only arm for its variant.
+/// For `#[cfg]` gates: the arm's `cfg`, and the `cfg(not(..))` for its stand-in arm.
+/// Ungated arms get neither.
 fn gating(gates: &[TokenStream]) -> (TokenStream, Option<TokenStream>) {
     match gates {
         [] => (TokenStream::new(), None),
@@ -1770,12 +1552,7 @@ fn gating(gates: &[TokenStream]) -> (TokenStream, Option<TokenStream>) {
     }
 }
 
-/// A payload tuple's contents, each slot given its declared type where one is known.
-///
-/// The entry and frame enums are generic over one parameter per variant and are built only inside
-/// the driver's closure, whose parameter types settle before its body is checked. So a slot with
-/// nothing outside to pin it cannot be inferred, and rustc reports `type annotations needed` at
-/// some unrelated-looking use in the user's body.
+/// A payload tuple's contents, ascribing each slot's type where known (else inference fails).
 fn payload_expr(
     ctx: &Ctx,
     member: usize,
@@ -1784,8 +1561,6 @@ fn payload_expr(
     seed_lt: bool,
 ) -> TokenStream {
     let parts = ids.iter().map(|id| match ctx.slot_type(member, id) {
-        // An elided reference is given the seed lifetime where there is one: a slot holding a
-        // reborrow of a reference parameter has no other name for that lifetime.
         Some(ty) => {
             let ty = match (seed_lt, syn::parse2::<syn::Type>(ty.clone())) {
                 (true, Ok(parsed)) => {
@@ -1801,14 +1576,7 @@ fn payload_expr(
     quote! { #(#parts)* }
 }
 
-/// Record the type of each local annotated *everywhere* it is bound, so [`payload_expr`] can
-/// name its slot.
-///
-/// Every binding of a name must agree: one `let n: &str` beside a plain `let n = String::new()`
-/// would otherwise put the first type on the second's slot. So a `for` pattern, an `if let`, a
-/// match arm, a plain `let`, or a disagreeing annotation all rule the name out.
-/// The type of an initialiser that names itself, so a `let` without an annotation still tells the
-/// transform what its local holds.
+/// The type an initializer states itself: a cast, a suffixed literal, `bool` or `char`.
 fn self_typing(e: &syn::Expr) -> Option<TokenStream> {
     match e {
         syn::Expr::Cast(c) => {
@@ -1834,13 +1602,15 @@ fn self_typing(e: &syn::Expr) -> Option<TokenStream> {
     }
 }
 
+/// Record locals bound by `let`, and each local's type where all its annotated or self-typed
+/// bindings agree, so [`payload_expr`] can name its slot. A name bound by a pattern (`for`,
+/// `if let`, match arm, destructuring `let`) or by `let x;` is ruled out.
 fn note_annotated_lets(ctx: &Ctx, block: &syn::Block) {
     use std::collections::HashSet;
 
     #[derive(Default)]
     struct Found {
         annotated: HashMap<String, Vec<(String, TokenStream)>>,
-        /// Every name a plain `let` binds, which is what the store may have to take ownership of.
         bound: HashSet<String>,
         poisoned: HashSet<String>,
     }
@@ -1910,7 +1680,6 @@ fn note_annotated_lets(ctx: &Ctx, block: &syn::Block) {
             syn::visit::visit_arm(self, a);
         }
 
-        // A nested item has its own bindings and its own scope; it is not part of this body.
         fn visit_item(&mut self, _: &syn::Item) {}
     }
 
@@ -1940,10 +1709,7 @@ fn note_annotated_lets(ctx: &Ctx, block: &syn::Block) {
     }
 }
 
-/// The payload type of one entry variant, with `_` for any slot the macro cannot name.
-///
-/// A member's variant carries that member's payload parameters; a lowered loop's carries the
-/// locals its state threads.
+/// The payload type of one entry variant (member or loop), `_` for unknown slots.
 fn variant_payload_type(
     ctx: &Ctx,
     variant: usize,
@@ -1957,7 +1723,7 @@ fn variant_payload_type(
         let member = ctx.member(variant);
         let tys = (0..member.param_names.len()).map(|j| {
             let known = match member.pinned[j].get() {
-                // The slot holds a pointer into the driver's store, not the parameter's own type.
+                // Pointer into the pinned store.
                 true => member.param_pointees[j]
                     .clone()
                     .map(|elem| quote! { *const #elem }),
@@ -1972,8 +1738,7 @@ fn variant_payload_type(
         return quote! { (#(#tys,)*) };
     }
     let n = variant - members;
-    // A gated loop's state is left to inference for the same reason a gated frame's is: naming it
-    // here would name the live case only, and the stand-in arm says `()` in the other.
+    // Gated: left to inference.
     if !loops[n].gates.is_empty() {
         return quote! { _ };
     }
@@ -1990,14 +1755,12 @@ fn slots_payload_type(
 ) -> TokenStream {
     let tys = ids.iter().map(|id| match ctx.slot_type(member, id) {
         Some(ty) => named(ty, self_ty, seed_lt),
-        // A slot no annotation reached -- a generated loop iterator, say -- is left to inference;
-        // naming the others is what pins the rest of the tuple.
         None => quote! { _ },
     });
     quote! { (#(#tys,)*) }
 }
 
-/// A slot type with its elided references named, where there is a seed lifetime to name them with.
+/// A slot type with elided lifetimes set to the seed lifetime, if there is one.
 fn named(ty: TokenStream, self_ty: Option<&syn::Type>, seed_lt: bool) -> TokenStream {
     match (seed_lt, syn::parse2::<syn::Type>(ty.clone())) {
         (true, Ok(parsed)) => {

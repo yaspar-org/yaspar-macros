@@ -1,150 +1,39 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Implementation of `#[delegatable_trait]` and `#[delegate_trait]` — write the trait
-//! methods you want to override, and forward the rest to an inner field.
+//! `#[delegatable_trait]` and `#[delegate_trait]`: forward unwritten trait methods to a field.
 //!
-//! # Why two attributes
-//!
-//! An attribute on the impl block sees only the impl block. It cannot know which
-//! methods the trait requires, so it cannot know which ones are missing and need
-//! forwarding — the trait definition may not even be in this crate.
-//!
-//! The signatures therefore have to travel from the trait to the impl, and the only
-//! carrier a proc macro can emit that is visible to a *later* macro expansion is a
-//! `macro_rules!` macro. So `#[delegatable_trait]` emits the trait unchanged plus a
-//! hidden `__delegate_impl_<Trait>!` macro holding one arm per required method, and
-//! `#[delegate_trait]` expands to an impl block containing the user's methods and an
-//! invocation of that macro, which fills in the remainder.
-//!
-//! # How a generic trait's parameters travel
-//!
-//! Replaying a signature verbatim would emit `fn get(&self, k: K)` into
-//! `impl Store<u32> for Wrapper`, where `K` names nothing. The two sides again know
-//! half each: the trait knows the parameter *names*, the impl knows the actual
-//! *arguments*. So the helper macro carries the substitution — each of the trait's
-//! parameters becomes a metavariable in the recorded signatures, and
-//! `#[delegate_trait]` passes the impl's trait arguments positionally:
+//! An impl attribute cannot see the trait, so `#[delegatable_trait]` records the required method
+//! signatures in a hidden `macro_rules! __delegate_impl_<Trait>`, and `#[delegate_trait]` invokes it
+//! with the field, the names to skip (methods the impl wrote), the trait path, and the trait's
+//! generic arguments:
 //!
 //! ```text
-//! trait Store<K>            ->  macro_rules! __delegate_impl_Store {
-//!     fn get(&self, k: K);         ($self:path, [$($field:tt)*], .., $__dt_ty_K:ty) => {
-//!                                      fn get(&self, k: $__dt_ty_K) { .. } } }
-//!
-//! impl Store<u32> for W     ->  __delegate_impl_Store!(
-//!                                   __delegate_impl_Store, [inner], [], Store<u32>, u32);
+//! __delegate_impl_Store!(__delegate_impl_Store, [inner], [], Store<u32>, u32);
 //! ```
 //!
-//! The field travels as a bracketed *token list* rather than an `ident`, because it is not always
-//! one: a newtype's field is `0`. A `tt` list splices into `self.$($field)*` for a name, an index
-//! and a dotted path alike.
+//! - Each arm passes the macro's own path on instead of recursing by bare name, so the macro works
+//!   when reached by path.
+//! - The skip list is subtracted inside the macro (`@maybe` arms), the only place that knows both the
+//!   signatures and the names.
+//! - Trait generic parameters become metavariables (`$__dt_ty_K`, `$__dt_lt_a`, `$__dt_ct_N`),
+//!   matched positionally in declaration order. Const uses are braced (`{ $n }`). Omitted defaulted
+//!   parameters are filled in by extra arms.
+//! - A method's attributes, `#[cfg]` included, are copied to the forwarder. For a trait from another
+//!   crate, `#[cfg]` is then evaluated against the consumer's features.
+//! - Only required methods are delegated: not default methods, associated types, or consts. Methods
+//!   without a `self`/`&self`/`&mut self` receiver produce a `compile_error!`.
 //!
-//! Every arm takes the macro's own path as its first argument and passes it on, rather
-//! than recursing through the bare name. A bare name in a macro body resolves at the
-//! *call site*, so it only works while the macro lives at the crate root; a path works
-//! from anywhere, which is what the addressing below relies on.
+//! # Finding the helper
 //!
-//! A lifetime becomes a `lifetime` fragment. A const parameter becomes an `expr` —
-//! there is no `const` fragment — and every use of it is *braced*: `[u8; { $n }]`
-//! and `Holder<{ $n }>`. Braces are what let an expression stand where a const
-//! argument is expected, and they are accepted in both positions, so one rewrite
-//! serves them all.
+//! Beside the trait, `pub use __delegate_impl_Store as __delegate_path_Store;` gives the helper a
+//! path, so `impl libx::a::Store for W` invokes `libx::a::__delegate_path_Store!` with no import. A
+//! bare trait name falls back to the crate-root `__delegate_impl_Store`. The alias must be a
+//! relative `use`: macro-expanded `#[macro_export]` macros cannot be referred to by absolute path.
 //!
-//! The parameters travel in declaration order. Rust puts lifetimes first but lets
-//! types and consts interleave, so they are kept in one ordered list rather than
-//! grouped by kind — grouping would silently reorder the arguments.
-//!
-//! A defaulted parameter may be left out by the impl. Only the trait knows the
-//! default, so the trait emits an extra arm per omissible argument that forwards to
-//! the full form with its own defaults filled in.
-//!
-//! Nothing has to be excluded from that rewrite: a method cannot redeclare one of
-//! the trait's parameters (`fn get<K>(..)` inside `trait Store<K>` is E0403, and the
-//! lifetime form is E0496), so every mention is the trait's own.
-//!
-//! It does have to tell a mention from a coincidence, which is why the type and const
-//! substitutions walk the parsed signature rather than its tokens: an associated-type *binding*
-//! puts a bare identifier where a type argument would go, so a token walk turns
-//! `Iterator<Item = u8>` into `Iterator<$__dt_ty_Item = u8>` for any trait with a parameter called
-//! `Item`. Lifetimes stay a token walk, since a `syn::Lifetime` has nowhere to put a `$name`.
-//!
-//! # Why the skip list is matched inside `macro_rules!`
-//!
-//! `#[delegate_trait]` knows the names to skip (the methods the user wrote) but not
-//! the signatures; the helper macro knows the signatures but not the names to skip.
-//! Set subtraction has to happen where both are available, which is inside the helper
-//! macro — hence the `@maybe` arms, which walk the skip list one element at a time:
-//! a literal-ident arm per method name absorbs a match, a generic arm pops a
-//! non-match and recurses, and reaching the empty list emits the delegation.
-//!
-//! # What travels with a signature
-//!
-//! The method's attributes do, all of them: an attribute macro runs *before* `cfg` stripping, so a
-//! gated method is recorded here like any other, and dropping its `#[cfg]` would emit it into every
-//! impl unconditionally — where the trait, which *was* stripped, no longer has it. Note that a
-//! `#[cfg]` on a trait method from another crate is then evaluated against the **consumer's**
-//! features, since that is where the expansion happens.
-//!
-//! # Limitations
-//!
-//! Only required *methods* are delegated. A required associated type or associated
-//! const is not, so a trait that has one must have it supplied by the impl block as
-//! usual. Methods with a default body are left to their default.
-//!
-//! Forwarding needs a `self`, `&self` or `&mut self` receiver: without one there is no `self` to
-//! read the field out of, and a typed receiver (`self: Box<Self>`) is a type the field does not
-//! have. Either one is
-//! rejected by name, and writing the method in the impl block is the way through — the
-//! skip list honours it there like any other override.
-//!
-//! # How the impl finds the helper macro
-//!
-//! `#[macro_export]` puts the helper at the *root* of the defining crate, so its bare
-//! name resolves anywhere in that crate. It does not, however, put it in a dependent
-//! crate's scope: a consumer would have to import it by hand, and its name is hidden
-//! precisely so that nobody has to know it.
-//!
-//! So the trait also emits an alias beside itself, under a *second* name:
-//!
-//! ```text
-//! mod a {
-//!     pub trait Store { .. }
-//!     macro_rules! __delegate_impl_Store { .. }                    // the helper
-//!     pub use __delegate_impl_Store as __delegate_path_Store;      // and a path to it
-//! }
-//! ```
-//!
-//! An impl then addresses the helper exactly as it addresses the trait: the last segment
-//! of the trait path is swapped for the alias, so `impl libx::a::Store for W` invokes
-//! `libx::a::__delegate_path_Store!`. That works in this crate and from a dependent one,
-//! with nothing to import.
-//!
-//! A trait named *bare*, because it was imported, leaves nothing to qualify with, so
-//! that case falls back to the crate-root name. Within the defining crate this is
-//! equivalent; from another crate it is the one form that still needs an import, and
-//! writing the trait path instead is the easier fix.
-//!
-//! The alias has to be a *relative* `use`. Referring to the macro as
-//! `crate::__delegate_impl_Store` is rejected with "macro-expanded `macro_export` macros
-//! from the current crate cannot be referred to by absolute paths", since the
-//! `macro_rules!` is itself produced by this macro's expansion.
-//!
-//! # Two traits of the same name: `local`
-//!
-//! The exported helper lands at the crate root under a name derived from the trait's
-//! last path segment, so two `#[delegatable_trait]` traits of the same name in one crate
-//! collide with an `E0428` naming `__delegate_impl_<Trait>`.
-//!
-//! `#[delegatable_trait(local)]` drops the export, leaving only the module-local
-//! `macro_rules!` and a `pub(crate)` alias. Nothing reaches the crate root, so the two
-//! traits coexist, and the impl side is unchanged: it addresses the alias by path as
-//! always. The trade is that a macro which is not `#[macro_export]`ed is crate-private
-//! and cannot be re-exported out (`E0364`, and `pub use` of it does not compile), so a
-//! `local` trait cannot be delegated from another crate; the attempt is an `E0603`.
-//!
-//! That is also why the export cannot simply be dropped for everyone, and why the two
-//! forms are exclusive rather than both emitted: a second `macro_rules!` of the same
-//! name would be an `E0428` in its own right.
+//! By default the helper is `#[macro_export]`ed, so two same-named traits in one crate collide
+//! (`E0428`). `local` skips the export and makes the alias `pub(crate)`, at the cost of not being
+//! usable from other crates.
 
 use proc_macro2::{Span, TokenStream, TokenTree};
 use quote::{ToTokens, format_ident, quote, quote_spanned};
@@ -157,11 +46,7 @@ use syn::{
     ReceiverKind, Safety, Signature, Token, TraitItem, Type, parse_quote,
 };
 
-/// `target = <field>` — the field every missing method is forwarded to.
-///
-/// A dotted list of [`Member`]s rather than a bare name, so that a tuple index (`target = 0`) and a
-/// nested field (`target = inner.deep`) work too. A field *path*, not an expression: the tokens are
-/// spliced in after `self.` in the helper macro, where nothing else would mean anything.
+/// `target = <field>`: a dotted list of [`Member`]s (`inner`, `0`, `inner.deep`), spliced after `self.`.
 struct DelegateTraitArgs {
     target: Punctuated<Member, Token![.]>,
 }
@@ -185,8 +70,7 @@ impl Parse for DelegateTraitArgs {
             ));
         }
         input.parse::<Token![=]>()?;
-        // `self` is a keyword, so it would never reach the `Member` parse below —
-        // and it is the mistake the documentation specifically warns about.
+        // Catch the common `target = self.inner` mistake with a clear message.
         if input.peek(Token![self]) {
             return Err(input.error(
                 "`target` is a field name, not an expression: write `target = inner`, \
@@ -194,8 +78,6 @@ impl Parse for DelegateTraitArgs {
             ));
         }
         let target = Punctuated::parse_separated_nonempty(input)?;
-        // Anything left over is a mistake, and saying so beats the bare "unexpected
-        // token" that the caller would otherwise get from the attribute parser.
         if !input.is_empty() {
             return Err(input
                 .error("`#[delegate_trait]` takes only `target = <field>`, and nothing after it"));
@@ -204,10 +86,7 @@ impl Parse for DelegateTraitArgs {
     }
 }
 
-/// Entry point for the `#[delegatable_trait]` attribute.
-///
-/// Emits the trait unchanged, plus a hidden helper macro that knows all of the
-/// trait's required method signatures.
+/// `#[delegatable_trait]`: the trait unchanged, plus its helper macro and path alias.
 pub fn expand_trait_def(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> {
     let local = if attr.is_empty() {
         false
@@ -231,13 +110,8 @@ pub fn expand_trait_def(attr: TokenStream, item: TokenStream) -> syn::Result<Tok
     let helper_macro_name = helper_macro_name(trait_name);
     let params = TraitParams::collect(&trait_def.generics);
 
-    // Methods with a default body keep it: delegating them would silently override
-    // the trait author's intent for every wrapper.
-    //
-    // The *attributes* travel with the signature. A `#[cfg]`-gated method is recorded
-    // here — an attribute macro runs before `cfg` stripping — so dropping the attribute
-    // would emit the method into every impl unconditionally, where the trait no longer
-    // has it: `E0407 method never is not a member of trait`.
+    // Only required methods. Attributes are kept: `cfg` is not yet stripped here, so dropping a
+    // `#[cfg]` would emit a method the trait no longer has (`E0407`).
     let method_sigs: Vec<(&Vec<Attribute>, &Signature)> = trait_def
         .items
         .iter()
@@ -256,19 +130,16 @@ pub fn expand_trait_def(attr: TokenStream, item: TokenStream) -> syn::Result<Tok
         .map(|(attrs, sig)| delegating_method(attrs, sig, &params))
         .collect();
 
-    // Both are empty for a non-generic trait, leaving those expansions unchanged.
+    // Both are empty for a non-generic trait.
     let matcher = params.matcher_tail();
     let forward = params.forward_tail();
 
-    // Arms for impls that leave defaulted arguments out, and a last-resort arm for
-    // an argument count that matches nothing, which would otherwise fail with a
-    // wall of "no rules expected this token".
+    // Arms for omitted defaulted arguments, and a fallback arm reporting a wrong argument count.
     let defaulted_arms = params.defaulted_arms();
     let arity_guard = if params.is_empty() {
         TokenStream::new()
     } else {
-        // A defaulted parameter may be left out, so what the trait accepts is a *range*: saying
-        // "takes 2" of a `trait Pair<A, B = u8>` sends the reader after an argument they may omit.
+        // With defaults, the accepted count is a range.
         let most = params.0.len();
         let fewest = most - params.defaults();
         let expected = if fewest == most {
@@ -285,14 +156,8 @@ pub fn expand_trait_def(attr: TokenStream, item: TokenStream) -> syn::Result<Tok
         }
     };
 
-    // The helper is emitted once and then given a *path* beside the trait, under the
-    // second name so that the alias does not redefine the first one. An impl can then
-    // address it exactly as it addresses the trait — `libx::a::Store` pairs with
-    // `libx::a::__delegate_path_Store` — with nothing to import.
-    //
-    // `local` additionally keeps the macro out of the crate root, which is the only
-    // place two same-named traits can collide. It cannot be the default, since a macro
-    // that is not exported cannot leave its crate at all.
+    // The alias gives the helper a path beside the trait. `local` skips `#[macro_export]`, so
+    // same-named traits don't collide at the crate root, but the helper can't leave the crate.
     let path_alias = path_alias_name(trait_name);
     let (export, alias) = if local {
         (
@@ -306,8 +171,7 @@ pub fn expand_trait_def(attr: TokenStream, item: TokenStream) -> syn::Result<Tok
     } else {
         (
             quote! { #[macro_export] },
-            // `#[macro_export]` puts the macro at the crate root, so that is where the
-            // alias reads it from. `pub`, so a dependent crate can follow the path too.
+            // `pub`, so dependent crates can follow the path.
             quote! {
                 #[doc(hidden)]
                 pub use #helper_macro_name as #path_alias;
@@ -315,9 +179,7 @@ pub fn expand_trait_def(attr: TokenStream, item: TokenStream) -> syn::Result<Tok
         )
     };
 
-    // Every arm takes the macro's own path and passes it on, rather than recursing
-    // through the bare name: a bare name resolves at the *call site*, which only
-    // works while the macro lives at the crate root.
+    // Arms recurse through `$self` (the macro's path), not its bare name.
     Ok(quote! {
         #trait_def
 
@@ -356,10 +218,7 @@ pub fn expand_trait_def(attr: TokenStream, item: TokenStream) -> syn::Result<Tok
     })
 }
 
-/// Entry point for the `#[delegate_trait]` attribute.
-///
-/// Re-emits the impl block with the user's items kept and an invocation of the
-/// trait's helper macro appended, which supplies every method the user left out.
+/// `#[delegate_trait]`: the impl block plus a helper invocation supplying the missing methods.
 pub fn expand_trait_impl(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> {
     let args = syn::parse2::<DelegateTraitArgs>(attr)?;
     let impl_block = syn::parse2::<ItemImpl>(item)?;
@@ -377,7 +236,7 @@ pub fn expand_trait_impl(attr: TokenStream, item: TokenStream) -> syn::Result<To
     let unsafety = &impl_block.unsafety;
     let (impl_generics, _, where_clause) = impl_block.generics.split_for_impl();
 
-    // Names the helper macro must not emit: the user has written them already.
+    // Methods the user wrote; the helper skips them.
     let override_idents: Vec<Ident> = impl_block
         .items
         .iter()
@@ -395,8 +254,7 @@ pub fn expand_trait_impl(attr: TokenStream, item: TokenStream) -> syn::Result<To
         .expect("a parsed trait path has at least one segment");
     let helper_macro_name = helper_macro_name(&last.ident);
 
-    // The trait's generic arguments, positionally: the helper macro substitutes
-    // them for the trait's parameters in every recorded signature.
+    // The trait's generic arguments, passed positionally.
     let generic_args: Vec<TokenStream> = match &last.arguments {
         PathArguments::None => Vec::new(),
         PathArguments::AngleBracketed(ab) => ab.args.iter().map(|a| quote! { #a }).collect(),
@@ -413,11 +271,8 @@ pub fn expand_trait_impl(attr: TokenStream, item: TokenStream) -> syn::Result<To
         quote! { , #(#generic_args),* }
     };
 
-    // The helper is addressed the same way the trait is: `impl libx::a::Store for W`
-    // reaches it as `libx::a::__delegate_path_Store`, which works across crates and
-    // needs no import. A trait named bare — because it was imported — leaves nothing to
-    // qualify with, so that case falls back to the crate-root name, which is in scope
-    // anywhere in the defining crate.
+    // `libx::a::Store` -> `libx::a::__delegate_path_Store`; a bare name falls back to the
+    // crate-root helper, which only resolves in the defining crate.
     let helper_path = if trait_path.segments.len() > 1 {
         let prefix = trait_path.segments.iter().rev().skip(1).rev();
         let leading = trait_path.leading_colon;
@@ -443,16 +298,13 @@ struct Param {
     name: String,
     /// The metavariable it becomes in the recorded signatures.
     meta: Ident,
-    /// `trait Store<K = u32>`. Only the trait knows this, so only the trait can
-    /// fill it in for an impl that leaves the argument out.
+    /// `trait Store<K = u32>`: filled in when the impl omits the argument.
     default: Option<ParamDefault>,
 }
 
 impl Param {
-    /// The tokens this parameter is replaced by in a recorded signature.
-    ///
-    /// A const parameter travels as an `expr` fragment, so every use is *braced* — `[u8; { $n }]`,
-    /// `Holder<{ $n }>` — which is what lets an expression stand where a const argument goes.
+    /// The tokens replacing this parameter in a signature. Consts are braced (`{ $n }`) so the
+    /// `expr` fragment is accepted as an array length or const argument.
     fn substitution(&self) -> TokenStream {
         let m = &self.meta;
         match self.kind {
@@ -468,18 +320,15 @@ enum ParamKind {
     Const,
 }
 
-/// `trait Store<K = Vec<u8>>` / `trait Buf<const N: usize = 4>`. Kept as a syntax node rather than
-/// tokens because it needs the same substitution a signature does: `trait Pair<A, B = Vec<A>>` has
-/// to emit `Vec<$__dt_ty_A>`.
+/// A parameter default, kept as syntax so it gets the same substitution as a signature
+/// (`trait Pair<A, B = Vec<A>>` emits `Vec<$__dt_ty_A>`).
 enum ParamDefault {
     Type(Type),
     Const(Expr),
 }
 
-/// The trait's own generic parameters, in declaration order — which is the order an
-/// impl must write its arguments in, and they are matched positionally. Rust puts
-/// lifetimes first but lets types and consts interleave, so one ordered list is the
-/// only representation that cannot get them out of step.
+/// The trait's generic parameters in declaration order (types and consts may interleave), matching
+/// the impl's positional arguments.
 struct TraitParams(Vec<Param>);
 
 impl TraitParams {
@@ -522,8 +371,7 @@ impl TraitParams {
         self.0.is_empty()
     }
 
-    /// How many trailing parameters an impl may leave out. Rust requires defaults to
-    /// be trailing, so this is a count from the end.
+    /// How many trailing parameters have defaults.
     fn defaults(&self) -> usize {
         self.0
             .iter()
@@ -540,13 +388,7 @@ impl TraitParams {
             .find(|p| p.name == name && !matches!(p.kind, ParamKind::Lifetime))
     }
 
-    /// `, $__dt_lt_a:lifetime, $__dt_ty_K:ty, $__dt_ct_N:expr` — the matcher tail
-    /// every arm carries. Empty for a non-generic trait, so those expansions are
-    /// unchanged.
-    ///
-    /// A const parameter travels as an `expr`: there is no `const` fragment, and an
-    /// expression is what both of its uses — an array length and a const argument —
-    /// accept once braced.
+    /// `, $__dt_lt_a:lifetime, $__dt_ty_K:ty, $__dt_ct_N:expr`, or empty for a non-generic trait.
     fn matcher_tail(&self) -> TokenStream {
         self.tail(|p| {
             let m = &p.meta;
@@ -558,7 +400,7 @@ impl TraitParams {
         })
     }
 
-    /// `, $__dt_lt_a, $__dt_ty_K, $__dt_ct_N` — passing them on to a nested arm.
+    /// `, $__dt_lt_a, $__dt_ty_K, $__dt_ct_N`, forwarded to a nested arm.
     fn forward_tail(&self) -> TokenStream {
         self.tail(|p| {
             let m = &p.meta;
@@ -574,10 +416,8 @@ impl TraitParams {
         quote! { , #(#items),* }
     }
 
-    /// Extra top-level arms for an impl that leaves defaulted arguments out —
-    /// `impl Store for W` where the trait is `Store<K = u32>`. Rust requires
-    /// defaults to be trailing, so each arm drops one more from the end and
-    /// forwards to the full form with the trait's own defaults supplied.
+    /// One arm per number of omitted trailing defaults, forwarding to the full form with the
+    /// defaults filled in.
     fn defaulted_arms(&self) -> TokenStream {
         let arms = (1..=self.defaults()).map(|dropped| {
             let kept = self.0.len() - dropped;
@@ -600,9 +440,7 @@ impl TraitParams {
                     let m = &p.meta;
                     quote! { $#m }
                 } else {
-                    // A default may name an earlier parameter — `trait Pair<A, B = Vec<A>>` —
-                    // where `A` binds nothing at the impl site, so it needs the same rewrite a
-                    // signature gets, into the metavariables this arm has just bound.
+                    // A default may name earlier parameters, so rewrite it too.
                     self.rewrite_default(p.default.as_ref().expect("trailing params have defaults"))
                 }
             });
@@ -616,18 +454,15 @@ impl TraitParams {
         quote! { #(#arms)* }
     }
 
-    /// Rewrite a signature so the trait's parameters read as metavariables.
-    ///
-    /// Every mention of a parameter is the trait's own: a method cannot redeclare
-    /// one (`fn get<K>` inside `trait Store<K>` is E0403, and the lifetime form is
-    /// E0496), so there is no shadowing to work around.
+    /// Replace the trait's parameters in a signature with metavariables. Methods cannot shadow
+    /// them (E0403 / E0496), so every mention is the trait's.
     fn rewrite_signature(&self, sig: &Signature) -> TokenStream {
         let mut sig = sig.clone();
         Substitute(self).visit_signature_mut(&mut sig);
         self.rewrite_lifetimes(sig.to_token_stream())
     }
 
-    /// The same rewrite, for a defaulted parameter's default.
+    /// [`Self::rewrite_signature`] for a parameter default.
     fn rewrite_default(&self, default: &ParamDefault) -> TokenStream {
         match default {
             ParamDefault::Type(ty) => {
@@ -643,14 +478,8 @@ impl TraitParams {
         }
     }
 
-    /// Replace every mention of one of the trait's *lifetime* parameters with the
-    /// metavariable that stands for it.
-    ///
-    /// A token walk, where the type and const substitutions are not: a `syn::Lifetime` is an
-    /// identifier behind a tick and cannot hold a `$name`, so
-    /// there is nothing to put in its place at the syntax level. It is also the one
-    /// case where a token walk is safe, because a tick has exactly one meaning — a
-    /// lifetime — and nothing else in a signature is spelled that way.
+    /// Replace the trait's lifetime parameters with metavariables. A token walk, since a
+    /// `syn::Lifetime` cannot hold `$name`; safe because `'` only ever starts a lifetime here.
     fn rewrite_lifetimes(&self, tokens: TokenStream) -> TokenStream {
         let find = |name: &str| {
             self.0
@@ -662,7 +491,6 @@ impl TraitParams {
         let mut trees = tokens.into_iter().peekable();
         while let Some(tree) = trees.next() {
             match tree {
-                // A lifetime is two tokens: `'` joined to its identifier.
                 TokenTree::Punct(ref p) if p.as_char() == '\'' => {
                     let found = match trees.peek() {
                         Some(TokenTree::Ident(id)) => find(&id.to_string()),
@@ -691,28 +519,17 @@ impl TraitParams {
     }
 }
 
-/// Substitutes the trait's type and const parameters, in *type* and *expression*
-/// positions only.
-///
-/// A token walk cannot do this: replacing every identifier that reads like a parameter name also
-/// hits an associated-type *binding*, whose name sits exactly where a type argument would. A
-/// `trait Feed<Item>` then turns `Box<dyn Iterator<Item = u8>>` into `Iterator<$__dt_ty_Item = u8>`,
-/// an `E0220` blamed on the trait — and `Item`, `Output`, `Error` and `Key` are ordinary parameter
-/// names. Walking the parsed signature makes the distinction structural, since a binding name is an
-/// `Ident` field of `syn::AssocType` and never a [`Type`]. The gap left is a macro invocation, whose
-/// body syn keeps as opaque tokens.
+/// Substitutes type and const parameters in type and expression positions. A syntax walk, not a
+/// token walk, so an associated-type binding (`Iterator<Item = u8>` in `trait Feed<Item>`) is not
+/// rewritten. Macro invocations in a signature are not substituted.
 struct Substitute<'a>(&'a TraitParams);
 
 impl VisitMut for Substitute<'_> {
     fn visit_type_mut(&mut self, ty: &mut Type) {
-        // Children first: the arguments of `K::Assoc<L>` are rewritten before `K` is,
-        // and after the replacement there is nothing left to descend into.
         syn::visit_mut::visit_type_mut(self, ty);
 
-        // A single unqualified segment is all a type or const parameter can be written as. Longer
-        // — `K::Assoc`, shorthand for `<K as Bound>::Assoc` — is left alone on purpose: the bound
-        // does not survive the trip to the impl site, so substituting would trade `E0412 cannot find
-        // type K` for an `E0223 ambiguous associated type` about `<u8>::Assoc`.
+        // Only a bare single segment. `K::Assoc` is left alone: without the bound, `<u8>::Assoc`
+        // would be ambiguous (E0223).
         let Type::Path(path) = ty else { return };
         if path.qself.is_some() || path.path.leading_colon.is_some() {
             return;
@@ -731,9 +548,7 @@ impl VisitMut for Substitute<'_> {
     fn visit_expr_mut(&mut self, expr: &mut Expr) {
         syn::visit_mut::visit_expr_mut(self, expr);
 
-        // Only a const parameter can be named by an expression: an array length `[u8; N]` or a
-        // const argument `Holder<N>`. A type parameter's name in expression position is something
-        // else and must be left alone.
+        // In expression position only const parameters are substituted.
         let Expr::Path(path) = expr else { return };
         if path.qself.is_some() || path.path.leading_colon.is_some() {
             return;
@@ -757,32 +572,18 @@ fn helper_macro_name(trait_name: &Ident) -> Ident {
     format_ident!("__delegate_impl_{}", trait_name)
 }
 
-/// The alias that gives the helper a *path* beside the trait, under a second name so
-/// that it does not redefine the exported one. This is what lets an impl address the
-/// helper the same way it addresses the trait, in this crate or in a dependent one.
+/// The helper's alias beside the trait, so an impl can reach it by the trait's path.
 fn path_alias_name(trait_name: &Ident) -> Ident {
     format_ident!("__delegate_path_{}", trait_name)
 }
 
-/// One method body, forwarding to `self.$field`.
-///
-/// `$field` and `$trait_path` are left as `macro_rules!` metavariables: this token
-/// stream is emitted *inside* the helper macro, which is where they are bound.
-///
-/// The trait method's own attributes come first, ahead of the `#[inline]` — all of them, not a
-/// `cfg`-only subset, since they are valid on an impl method too and a filter would need an entry
-/// per attribute anyone ever wants. A `#[cfg]` on a *cross-crate* trait method therefore evaluates
-/// against the **consumer's** features, so a method the trait's crate compiled in can be absent from
-/// the wrapper. Gate on a feature the trait's crate re-exports if that matters.
+/// A method forwarding to `self.$field`, with the trait method's attributes. `$field` and
+/// `$trait_path` are metavariables bound by the helper macro this is emitted into.
 fn delegating_method(attrs: &[Attribute], sig: &Signature, params: &TraitParams) -> TokenStream {
     let method_name = &sig.ident;
 
-    // Without a receiver there is no `self` to read the field out of. Left alone, the emitted
-    // `<_ as Trait>::version(self.inner)` comes out as `E0424 expected value, found module self`
-    // against the trait's attribute, suggesting `fn version&self()`. A `compile_error!` rather than
-    // dropping the method from the recorded set, which would leave only `E0046` — true, but reading
-    // as though the delegation were broken. The answer is to write the method in the impl block,
-    // which the skip list honours, so this arm is only reached when it has not been.
+    // No receiver, or a typed one: nothing to forward to. Reached only if the impl didn't
+    // write the method itself.
     let unforwardable = match sig.receiver() {
         None => Some(format!(
             "`#[delegate_trait]`: `{method_name}` has no `self` receiver, so there is no field to \
@@ -796,17 +597,11 @@ fn delegating_method(attrs: &[Attribute], sig: &Signature, params: &TraitParams)
         Some(_) => None,
     };
     if let Some(msg) = unforwardable {
-        // Spanned at the trait's declaration, the line that has to change; the impl block that
-        // asked for it shows up as the macro backtrace.
+        // Spanned at the trait's method declaration.
         return quote_spanned! { sig.ident.span() => ::core::compile_error!(#msg); };
     }
 
-    // Argument *patterns* are not expressions, so they cannot be replayed as the call's arguments:
-    // `fn b(&self, _: u32)` is an ordinary trait method, and `_` in an argument is "in expressions,
-    // `_` can only be used on the left-hand side of an assignment". So each is renamed to a fresh
-    // binding. `_` is the only pattern a bodyless fn can carry today — `mut n: u32` is rustc's own
-    // future-incompatibility warning, anything richer is `E0642` — and the rename covers the rest
-    // if that ever loosens.
+    // Rename argument patterns (e.g. `_`) to fresh bindings so they can be passed on.
     let mut sig = sig.clone();
     let mut args: Vec<Ident> = Vec::new();
     for arg in sig.inputs.iter_mut() {
@@ -817,8 +612,6 @@ fn delegating_method(attrs: &[Attribute], sig: &Signature, params: &TraitParams)
         }
     }
 
-    // The trait's parameters have no binding at the impl site, so the recorded
-    // signature refers to them through metavariables the invocation fills in.
     let sig_tokens = params.rewrite_signature(&sig);
 
     let await_tok = if sig.asyncness.is_some() {
@@ -827,8 +620,7 @@ fn delegating_method(attrs: &[Attribute], sig: &Signature, params: &TraitParams)
         quote! {}
     };
 
-    // The receiver of the outer method decides how the field is passed on:
-    // `&self` -> `&self.field`, `&mut self` -> `&mut self.field`, `self` -> a move.
+    // `&self` -> `&self.field`, `&mut self` -> `&mut self.field`, `self` -> move.
     let reference = sig.receiver().and_then(|r| match &r.kind {
         ReceiverKind::Reference(_, _, mutability) => Some(mutability.is_some()),
         _ => None,
@@ -842,14 +634,11 @@ fn delegating_method(attrs: &[Attribute], sig: &Signature, params: &TraitParams)
         quote! { self.$($field)* }
     };
 
-    // `<_ as Trait>::method` rather than `self.field.method`: it resolves to the
-    // trait's method even when an inherent method of the same name exists.
+    // Fully qualified, so an inherent method of the same name is not picked.
     let call = quote! {
         <_ as $trait_path>::#method_name(#target_expr #(, #args)*) #await_tok
     };
-    // An `unsafe fn` body is not itself an unsafe block, so without this the forwarder warns under
-    // `unsafe_op_in_unsafe_fn` — unsilenceably, the span being the generated macro's — which is a
-    // hard error under `#![deny(warnings)]`.
+    // Avoids `unsafe_op_in_unsafe_fn` in the forwarder of an `unsafe fn`.
     let body = if matches!(sig.safety, Safety::Unsafe(_)) {
         quote! { unsafe { #call } }
     } else {

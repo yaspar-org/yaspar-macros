@@ -1,27 +1,14 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The names an expansion refers to.
-//!
-//! Two kinds. The identifiers it *generates* are all fixed and `__ss`-prefixed, so they
-//! cannot collide with anything the user wrote. The items it *borrows* live in the
-//! `yaspar-macros-defs` crate, since they are the same for every function, and are
-//! imported once at the top of the rewritten body by [`defs_imports`] — under the same
-//! `__ss` names, so the two kinds read alike and neither can shadow anything of the
-//! user's.
+//! Names used by expansions. Everything generated is `__ss` / `__Ss`-prefixed; items from
+//! `yaspar-macros-defs` are imported under such names by [`defs_imports`].
 
 use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, quote};
 
-/// Bring the fixed half of an expansion into the rewritten body.
-///
-/// One `use` rather than a fully qualified path at every mention: the expansion is what a reader
-/// debugging their own function has to read. The aliases are the `__ss` names, so nothing here can
-/// shadow an item the body already uses.
-///
-/// Only what `body` turns out to mention is imported: a function with no `?` has no business
-/// naming `Try`, and one that lends no value has none naming `Pin`. The frame stack is always
-/// there.
+/// The `use` of `yaspar-macros-defs` items for a rewritten body: `Frames` always, the rest only
+/// if `body` mentions them.
 pub(super) fn defs_imports(body: &TokenStream) -> TokenStream {
     let frames = frames_ty();
     let optional = [
@@ -50,13 +37,11 @@ pub(super) fn entry_ty() -> Ident {
 pub(super) fn entry_variant(n: usize) -> Ident {
     format_ident!("E{}", n)
 }
-/// Placeholder standing in for a lowered loop's state tuple. Substituted once
-/// the set of threaded locals is known.
+/// Placeholder for a lowered loop's state tuple, substituted once liveness is solved.
 pub(super) fn state_marker(n: usize) -> Ident {
     format_ident!("__ss_st{}", n)
 }
-/// The enum every value the driver holds travels in, so that one store serves them all: one
-/// variant per shape, generic over that shape like the entry and frame enums are.
+/// Enum of all values held in the pinned store: one generic variant per shape.
 pub(super) fn pinned_ty() -> Ident {
     format_ident!("__SsPinned")
 }
@@ -67,22 +52,19 @@ pub(super) fn pinned_param(n: usize) -> Ident {
     format_ident!("__SsP{}", n)
 }
 
-/// The frame enum: one variant per *resume point*, carrying the locals live across
-/// that call. This is what replaces a boxed continuation.
+/// The frame enum: one variant per resume point, carrying the locals live across that call.
 pub(super) fn frame_ty() -> Ident {
     format_ident!("__SsFrame")
 }
-/// The frame stack's type, so that the expansion need not name `Vec` in a crate that may be
-/// `no_std`.
+/// The frame stack's type (`Frames`), so expansions need not name `Vec`.
 pub(super) fn frames_ty() -> Ident {
     format_ident!("__SsFrames")
 }
-/// How a call site parks a frame: `Vec::push`, but the first push reserves a block at once.
+/// Parks a frame (`push`); the first push reserves `FIRST_FRAMES` at once.
 pub(super) fn push_fn() -> Ident {
     format_ident!("__ss_push")
 }
-/// The frame stack itself, which the body pushes to and pops from where it used to answer with
-/// a `Call` or a `Done`.
+/// The frame stack local.
 pub(super) fn frames_local() -> Ident {
     format_ident!("__ss_frames")
 }
@@ -90,35 +72,31 @@ pub(super) fn frames_local() -> Ident {
 pub(super) fn input_local() -> Ident {
     format_ident!("__ss_input")
 }
-/// The frame a `Done` popped, to be resumed with the value.
+/// The frame just popped, to be resumed with the value.
 pub(super) fn frame_local() -> Ident {
     format_ident!("__ss_frame")
 }
-/// The resumed value, where one resume arm serves every frame: the carrier the callee answered
-/// with, before the shared `?` check.
+/// The callee's answer being unwound; with a shared `?` check, the carrier before the check.
 pub(super) fn value_local() -> Ident {
     format_ident!("__ss_value")
 }
-/// That value once the check has passed, which every frame's arm reads.
+/// The value after the shared `?` check passed.
 pub(super) fn ok_local() -> Ident {
     format_ident!("__ss_ok")
 }
-/// The residual the check produced, on its way out of the loop.
+/// The residual from a failed shared `?` check.
 pub(super) fn res_local() -> Ident {
     format_ident!("__ss_res")
 }
-/// The value a `Done` hands down, bound so that the pop can be branched on without writing it
-/// twice.
+/// The finished value bound by `driver::done` before breaking out.
 pub(super) fn done_local() -> Ident {
     format_ident!("__ss_done")
 }
-/// The outer descend loop. A recursive call replaces [`input_local`] and continues this loop.
-/// A completed value with no frame left breaks it with the whole recursion's answer.
+/// The outer loop: a call sets [`input_local`] and continues it; the final value breaks it.
 pub(super) fn drive_label() -> syn::Lifetime {
     syn::Lifetime::new("'__ss_drive", proc_macro2::Span::call_site())
 }
-/// The labelled block around entry or continuation code. Finishing that code breaks this block
-/// with the value to feed directly into the unwind loop.
+/// The block around entry or continuation code, broken with the finished value.
 pub(super) fn done_label() -> syn::Lifetime {
     syn::Lifetime::new("'__ss_done", proc_macro2::Span::call_site())
 }
@@ -129,52 +107,47 @@ pub(super) fn frame_variant(r: usize) -> Ident {
 pub(super) fn frame_marker(r: usize) -> Ident {
     format_ident!("__ss_fr{}", r)
 }
-/// The context tuple, lent to the body and to every continuation by the driver.
+/// The context tuple the driver lends to the body and continuations.
 pub(super) fn ctx_param() -> Ident {
     format_ident!("__ss_ctx")
 }
-/// The stand-in for a method's `self`, since `self` cannot be rebound.
+/// Replacement for a method's `self`, which cannot be rebound.
 pub(super) fn self_binding() -> Ident {
     format_ident!("__ss_self")
 }
-/// Where a swapped context pointer is parked while the child subtree runs.
+/// Saved context pointer while a child subtree runs (`use_nonlinear_mut`).
 pub(super) fn saved_slot(n: usize) -> Ident {
     format_ident!("__ss_sv{}", n)
 }
 
-/// The driver's pinned store: values a call site built and lent to its callee, kept at
-/// a fixed address until the frame that built them is popped.
+/// The pinned store (`Pin`) for `data_in_frame` values, kept at a fixed address until the
+/// building frame is popped.
 pub(super) fn pin_ty() -> Ident {
     format_ident!("__SsPin")
 }
 
-/// The stand-in for `Try`, so that `?` works on a `Result` and on an `Option` alike.
+/// Stand-in for `Try` (see `try_shim`).
 pub(super) fn try_trait() -> Ident {
     format_ident!("__SsTry")
 }
 
-/// The stand-in for `FromResidual`, which builds the early-exit value.
+/// Stand-in for `FromResidual` (see `try_shim`).
 pub(super) fn from_residual_trait() -> Ident {
     format_ident!("__SsFromResidual")
 }
 
-/// The head of a `for` over `a..b` whose index the frames recompute: the next value, not yet
-/// stepped past. See `cps::lower_loop`.
+/// `range_peek`: the next value of a lowered `for i in a..b`, without stepping. See
+/// `cps::lower_loop`.
 pub(super) fn range_peek_fn() -> Ident {
     format_ident!("__ss_range_peek")
 }
 
-/// The index such a loop's frames recompute, from the iterator they carry in its place.
+/// `range_at`: the current `i` of such a loop, recomputed from the carried iterator.
 pub(super) fn range_at_fn() -> Ident {
     format_ident!("__ss_range_at")
 }
 
-/// A lifted group's name: every member it covers, joined.
-///
-/// One container may hold several groups, and these items are siblings of the members
-/// rather than nested inside them, so the name has to distinguish one group from another.
-/// Naming every member rather than just the first also says, in the expansion itself,
-/// which functions share the machine.
+/// A lifted group's name: its members joined with `_`, unique within the container.
 fn group_name(members: &[Ident]) -> String {
     members
         .iter()
@@ -183,31 +156,27 @@ fn group_name(members: &[Ident]) -> String {
         .join("_")
 }
 
-/// The seed enum of a lifted group: one variant per member, carrying that member's own
-/// parameters. Its types come from the signatures, so it can be named in a signature.
+/// A lifted group's seed enum: one variant per member, holding its parameters.
 pub(super) fn seed_ty(members: &[Ident]) -> Ident {
     format_ident!("__SsSeed_{}", group_name(members))
 }
 
-/// The one function a lifted group's members all call.
+/// The shared function a lifted group's members call.
 pub(super) fn machine_fn(members: &[Ident]) -> Ident {
     format_ident!("__ss_machine_{}", group_name(members))
 }
 
-/// The copy of a function kept beside it for the borrow checker to read, under an unsafe option.
-///
-/// Generated, hence `__ss`-prefixed like everything else this module mints: nothing the user wrote
-/// can collide with it, and a function of their own called `f_orig` stays theirs.
+/// The unmodified copy of a function kept for the borrow checker under a raw-pointer option.
 pub(super) fn original(name: &Ident) -> Ident {
     format_ident!("__ss_orig_{}", name)
 }
 
-/// The lifetime the seed enum gives every reference among a member's parameters.
+/// The lifetime the seed enum gives every reference parameter.
 pub(super) fn seed_lifetime() -> syn::Lifetime {
     syn::Lifetime::new("'__ss", proc_macro2::Span::call_site())
 }
 
-/// The union of a group's return types, when its members answer with different ones.
+/// Union of a group's return types, when members differ.
 pub(super) fn ret_union_ty() -> Ident {
     format_ident!("__SsRet")
 }

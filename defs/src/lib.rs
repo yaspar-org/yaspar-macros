@@ -1,28 +1,12 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The fixed half of what `#[stack_safe]` expands to.
+//! Runtime support for `#[stack_safe]` expansions.
 //!
-//! An expansion has two halves. One is particular to the function being rewritten: the
-//! entry enum has a variant per entry point and the frame enum a variant per call site,
-//! both carrying payloads whose types only that function's body implies. The other half
-//! is the same for every function, and lives here rather than being emitted again into
-//! each one:
-//!
-//! - [`In`], what the loop hands the body on each step, and [`Frames`], the stack it parks
-//!   frames on instead of using the native one, with [`push`], how a call site parks one;
-//! - [`Step`] and [`drive`], the same protocol and loop as a function the body is handed to,
-//!   which is what an expansion used to be written as and what its benchmarks compare against;
-//! - [`Pin`], the store for values a call site lends its callee, under
-//!   `#[stack_safe(data_in_frame)]`;
-//! - [`Try`] and [`FromResidual`], a stable stand-in for the unstable traits of the
-//!   same names, so that `?` works on a `Result`, an `Option` and a `ControlFlow` alike;
-//! - [`range_peek`] and [`range_at`], how a `for` over `a..b` reads its index back out of
-//!   its iterator instead of parking the index in every frame of its body.
-//!
-//! Nothing here is meant to be named by hand, except [`Try`] and [`FromResidual`]: those are
-//! how a carrier of your own joins `?`. It is all `pub` because the expansions refer to it by
-//! path, and documented because a reader of an expansion should be able to find out what it does.
+//! Expansions import [`Frames`], [`push`], [`Pin`], [`Try`], [`FromResidual`], [`range_peek`]
+//! and [`range_at`]. [`In`], [`Step`] and [`drive`] are the older loop-as-a-function encoding,
+//! kept as a benchmark baseline. Only [`Try`] and [`FromResidual`] are meant to be used by hand,
+//! to make `?` work on a custom type.
 
 #![no_std]
 
@@ -31,8 +15,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::ops::Range;
 
-/// What one turn of the loop hands the body, and what the body hands back to be the next
-/// turn's input.
+/// Input to one step of [`drive`].
 pub enum In<A, F, R> {
     /// Run the body from an entry point.
     Enter(A),
@@ -40,41 +23,24 @@ pub enum In<A, F, R> {
     Resume(F, R),
 }
 
-/// The loop's state with the frame left *on the stack* rather than carried.
-///
-/// `In` carries the frame the pop produced, so the state is as wide as a frame plus a return
-/// value and some of its bytes come out of the `Vec`'s heap buffer — which is what stops SROA
-/// promoting it. Here the resume transition names only the answer, and the resume arm does the
-/// pop itself; the state is then `max(entry, answer)` wide and every byte of it comes from a
-/// value the loop computed.
+/// Like [`In`], but `Resume` leaves the frame on the stack for the resume arm to pop, so the
+/// state stays small enough to live in registers. Currently unused.
 pub enum InSplit<A, R> {
     /// Run the body from an entry point.
     Enter(A),
-    /// A child answered with this; the top frame of the stack is whose answer it is.
+    /// A callee's result, for the frame on top of the stack.
     Resume(R),
 }
 
-/// Where a rewritten body parks its frames: the heap, instead of the native stack.
+/// The heap stack of parked frames. An alias so expansions work in `no_std` crates.
 ///
-/// A plain `Vec`, named because the expansion has to name it and cannot say `Vec` — the crate
-/// it lands in may be `no_std`, and an expansion that worked or not depending on that would be
-/// a poor bargain. One alias also gives any future change of stack one place to happen.
-///
-/// It starts out empty and unallocated — `Vec::new()` — so a call whose evaluation never
-/// recurses never touches the allocator. The first frame parked reserves room for
-/// [`FIRST_FRAMES`] at once, through [`push`], rather than walking `Vec`'s own 4, 8, 16, 32
-/// regrowths on the way to a typical depth; from there on it grows as a `Vec` does.
+/// Starts unallocated; the first [`push`] reserves [`FIRST_FRAMES`].
 pub type Frames<F> = Vec<F>;
 
 /// How many frames the first push onto an empty [`Frames`] makes room for.
 pub const FIRST_FRAMES: usize = 64;
 
-/// Park `frame` on `frames`: what a recursive call site does.
-///
-/// When there is room this is `Vec::push` and nothing else — the capacity check here is the
-/// one `Vec::push` makes, so the optimiser folds the two into one. When there is not, the push
-/// happens out of line in [`push_grow`], which is where the first push's [`FIRST_FRAMES`]
-/// reservation lives.
+/// Park `frame` on `frames`. Growth happens out of line in [`push_grow`].
 #[inline(always)]
 pub fn push<F>(frames: &mut Frames<F>, frame: F) {
     if frames.len() == frames.capacity() {
@@ -84,15 +50,12 @@ pub fn push<F>(frames: &mut Frames<F>, frame: F) {
     }
 }
 
-/// The full-stack half of [`push`]: make room, then park the frame.
-///
-/// An empty stack gets [`FIRST_FRAMES`] of room; a full one doubles, as `Vec` would have.
+/// Slow path of [`push`]: reserve [`FIRST_FRAMES`] if empty, else double, then push.
 #[cold]
 #[inline(never)]
 pub fn push_grow<F>(frames: &mut Frames<F>, frame: F) {
     if frames.capacity() == 0 {
-        // A fresh allocation of exactly the first block, rather than `reserve`'s general
-        // growth path, which a stack that never grows past it would pay for on every call.
+        // Cheaper than `reserve`'s general growth path.
         *frames = Frames::with_capacity(FIRST_FRAMES);
     } else {
         frames.reserve(frames.capacity());
@@ -104,28 +67,17 @@ pub fn push_grow<F>(frames: &mut Frames<F>, frame: F) {
 pub enum Step<A, F, R> {
     /// This computation is finished; hand the value to the frame below.
     Done(R),
-    /// Park `1` and enter `0`. The frame is a plain value in a `Vec`: one variant per
-    /// call site, carrying the locals live across it, with the types left to inference.
+    /// Park frame `1` and enter `0`.
     Call(A, F),
-    /// Re-enter the body *without* parking a frame: the result belongs to whichever
-    /// frame is already on top. This is what makes a loop iteration cost no stack.
+    /// Re-enter the body without parking a frame (used for loop iterations).
     Tail(A),
 }
 
-/// Run a body to completion, keeping its frames on the heap: the loop, as a function.
+/// Run `body` to completion with its frames on the heap, lending it `c` (the `&mut`
+/// parameters and receiver) on each step.
 ///
-/// `c` is the context the loop owns and lends out for the duration of each step: the
-/// `&mut` parameters and any receiver, which cannot travel in a payload because two live
-/// frames would then hold the same `&mut`. Lending it per step is what lets the body use
-/// it at every level of the recursion without anything capturing it.
-///
-/// `#[stack_safe]` no longer emits a call to this: the body is now inlined into the loop, so
-/// that the three transitions below are a push, a pop and a `break` written where the body
-/// reaches them, rather than a value handed back through [`Step`] for a second `match` to take
-/// apart. Measured on a three-call-site recursion, that is worth about 2x — `Step` is a real
-/// enum that has to be built and read back, and the closure's captures kept the loop's state
-/// out of registers. It is kept, unchanged, because the encoding it stands for is what
-/// `examples/perf_dispatch_width.rs` measures the emitted one against.
+/// Expansions no longer call this (they inline the loop, about 2x faster); it is kept as the
+/// baseline for `examples/perf_dispatch_width.rs`.
 pub fn drive<C, A, F, R>(
     c: &mut C,
     init: A,
@@ -148,13 +100,10 @@ pub fn drive<C, A, F, R>(
     }
 }
 
-/// The value a `for` over a `Range` binds next, without stepping past it.
+/// The next value of `r`, without advancing it.
 ///
-/// A lowered `for idx in a..b` parks its iterator in every frame of its body, since the next
-/// iteration needs it. Stepping the iterator at the *end* of an iteration instead of the start
-/// keeps this iteration's value in it for the whole body — as its `start` — so the frames need
-/// not park `idx` as well: [`range_at`] reads it back. The values bound are the `Range`'s own,
-/// by its own `Iterator::next`, run on a copy.
+/// A lowered `for` over a range advances at the end of each iteration, so frames can recover
+/// the current index with [`range_at`] instead of storing it.
 #[inline]
 pub fn range_peek<T: Clone>(r: &Range<T>) -> Option<T>
 where
@@ -163,29 +112,23 @@ where
     Iterator::next(&mut r.clone())
 }
 
-/// The value [`range_peek`] last answered for `r`, which has not been stepped since.
-///
-/// `Range::next` answers its `start` and moves `start` on, so an unstepped range still holds the
-/// value it would answer.
+/// The value [`range_peek`] last returned for `r` (its `start`).
 #[inline]
 pub fn range_at<T: Clone>(r: &Range<T>) -> T {
     r.start.clone()
 }
 
-/// Storage for values a call site builds and lends to its callee.
+/// Address-stable storage for values a call site lends its callee (`data_in_frame`).
 ///
-/// Element addresses have to be stable. A pointer to one is handed to the callee and
-/// stays live for that callee's whole subtree, during which further values are pushed,
-/// so the chunks are pre-sized and never regrown: the outer `Vec` may move the chunk
-/// *structs*, but never a chunk's buffer, and so never a value. That costs one
-/// allocation per [`Pin::CHUNK`] values rather than one per value.
+/// Values live in fixed-capacity chunks that are never regrown, so a value never moves
+/// until it is dropped.
 pub struct Pin<D> {
     chunks: Vec<Vec<D>>,
     len: usize,
 }
 
 impl<D> Pin<D> {
-    /// Values per chunk, i.e. how many pushes one allocation serves.
+    /// Values per chunk.
     pub const CHUNK: usize = 64;
 
     pub fn new() -> Self {
@@ -195,17 +138,12 @@ impl<D> Pin<D> {
         }
     }
 
-    /// How much is live now, so a frame can record what to drop when it resumes.
+    /// The current length, to pass to [`Pin::truncate`] later.
     pub fn mark(&self) -> usize {
         self.len
     }
 
-    /// Take ownership of `d` and hand back its address, which will not move until
-    /// [`Pin::truncate`] drops it.
-    ///
-    /// The returned pointer stays valid across *later* `push`es, which is the whole
-    /// point of the type: a caller lends a value to its callee's entire subtree, and
-    /// that subtree pushes more values of its own before reading this one back.
+    /// Store `d` and return its address, valid across later pushes until it is dropped.
     pub fn push(&mut self, d: D) -> *const D {
         if self.chunks.last().is_none_or(|c| c.len() == c.capacity()) {
             self.chunks.push(Vec::with_capacity(Self::CHUNK));
@@ -213,43 +151,22 @@ impl<D> Pin<D> {
         let chunk = self.chunks.last_mut().expect("just pushed one");
         chunk.push(d);
         self.len += 1;
-        // SAFETY: a later `push` re-takes `&mut self` and writes the same chunk, which
-        // would invalidate this pointer under either aliasing model *if* its provenance
-        // came from that borrow of `self`. It does not: the address belongs to the heap
-        // allocation the inner `Vec` owns, and the borrow of `self` only reads that
-        // buffer pointer out. A later push therefore writes a different element of the
-        // same allocation and leaves this one alone. The buffer never moves either, as
-        // chunks are pre-sized and never regrown and `truncate` keeps their capacity;
-        // the outer `Vec` may move the chunk *headers* when its spine grows, which does
-        // not move the buffers they own. Checked, not just argued: this interleaving and
-        // the macro-expanded tests report no UB under both `-Zmiri-stacked-borrows` and
-        // `-Zmiri-tree-borrows` with `-Zmiri-strict-provenance` (see the README), so
-        // keep those tests in step with any change to the chunking above.
+        // SAFETY: the pointer's provenance is the chunk's heap buffer, not the borrow of
+        // `self`, so later pushes (which write other elements) do not invalidate it. The
+        // buffer never moves: chunks are never regrown and `truncate` keeps capacity.
+        // Verified under Miri with stacked and tree borrows; keep those tests in sync.
         &chunk[chunk.len() - 1] as *const D
     }
 
-    /// Push `d` and hand back the address of a place inside it, which `project` reaches.
-    ///
-    /// One store serves values of several shapes by holding an enum, so a caller that wants a
-    /// pointer to what is *inside* a variant would have to dereference the pushed pointer itself.
-    /// It happens here instead, where the safety argument for that dereference is one line: the
-    /// value was just pushed and [`Pin`] never moves what it holds.
+    /// Push `d` and return the address of the part of it selected by `project`.
     pub fn push_projected<E: ?Sized>(&mut self, d: D, project: impl FnOnce(&D) -> &E) -> *const E {
         let at = self.push(d);
-        // SAFETY: `at` is the value pushed on the line above, and nothing has run since; `Pin`
-        // never moves a value it holds, so the address is live. The reference `project` receives
-        // does not outlive this call — only the address it returns does, and that address is the
-        // pushed value's, which lives until `truncate` or `take_last` reaches it.
+        // SAFETY: `at` was just pushed and `Pin` never moves its values, so it is live. The
+        // reference does not escape this call; only the address does.
         core::ptr::from_ref(project(unsafe { &*at }))
     }
 
-    /// Take the value at `at` back out, dropping everything pushed after it.
-    ///
-    /// One store holds every shape a descent parks, so a frame that parked a value and then lent
-    /// another one to the same call cannot ask for "the last": the lend sits on top of it. It knows
-    /// where its own value went, though — the store's length before the call, plus its position
-    /// among that call's pushes — and what is above it belongs to the call that has just returned,
-    /// so dropping it here is what [`Pin::truncate`] would have done a moment later.
+    /// Remove and return the value at index `at`, dropping everything pushed after it.
     pub fn take_at(&mut self, at: usize) -> Option<D> {
         if at >= self.len {
             return None;
@@ -258,14 +175,9 @@ impl<D> Pin<D> {
         self.take_last()
     }
 
-    /// Take the value pushed last back out, without dropping it.
-    ///
-    /// A frame that parked a value to lend a place inside it owns that value again once the callee
-    /// has returned, so the resume arm takes it back rather than letting [`Pin::truncate`] drop it.
-    /// The slot's chunk keeps its capacity, exactly as `truncate` leaves it.
+    /// Remove and return the last value pushed.
     pub fn take_last(&mut self) -> Option<D> {
-        // Taking the last value of a chunk leaves it empty, and `push` only ever appends to the
-        // last one, so an empty chunk on top is dropped rather than searched past.
+        // Drop empty chunks on top.
         while self.chunks.last().is_some_and(Vec::is_empty) {
             self.chunks.pop();
         }
@@ -275,13 +187,7 @@ impl<D> Pin<D> {
         Some(d)
     }
 
-    /// Drop everything pushed since `mark`.
-    ///
-    /// A chunk that lies entirely above the mark is dropped whole, so unwinding a deep
-    /// recursion costs one step per chunk rather than one per value. Only the chunk the
-    /// mark falls inside is trimmed, and that too in one `Vec::truncate` rather than a
-    /// pop per element. The trimmed chunk keeps its capacity, so the next push reuses it
-    /// and the addresses of the values still live do not move.
+    /// Drop everything pushed since `mark`, a whole chunk at a time where possible.
     pub fn truncate(&mut self, mark: usize) {
         while self.len > mark {
             let chunk_len = self.chunks.last().map_or(0, Vec::len);
@@ -313,18 +219,10 @@ pub struct OptionNone;
 /// The residual of a `ControlFlow`: the value it broke with.
 pub struct ControlFlowBreak<B>(pub B);
 
-/// `core::ops::Try::branch`, on stable.
+/// Stable stand-in for `core::ops::Try`, used to desugar `?` in rewritten bodies.
 ///
-/// `?` has to be desugared by hand, because it returns early and every early exit has to
-/// become `Step::Done` instead. The obvious desugaring hardcodes `Ok` / `Err` /
-/// `From::from`, which is wrong for an `Option`; the real one goes through `Try` and
-/// `FromResidual`, which are unstable. This pair stands in for them, with one impl per
-/// carrier: `Result`, `Option` and `ControlFlow`, as in `core`.
-///
-/// # A carrier of your own
-///
-/// Neither trait is sealed, so implementing both for your own carrier makes `?` work on it
-/// inside a `#[stack_safe]` body:
+/// Implemented for `Result`, `Option` and `ControlFlow`. Implement it and [`FromResidual`]
+/// to use `?` on your own type inside `#[stack_safe]`:
 ///
 /// ```
 /// use yaspar_macros_defs::{FromResidual, Try};
@@ -347,9 +245,6 @@ pub struct ControlFlowBreak<B>(pub B);
 ///     fn from_residual(_: NothingLeft) -> Self { Maybe::Nothing }
 /// }
 /// ```
-///
-/// An existing `core::ops::Try` impl cannot be reused: a blanket impl over it would need that
-/// unstable trait. Without the pair above, the error is a missing-impl one naming this trait.
 pub trait Try {
     type Output;
     type Residual;
@@ -395,10 +290,7 @@ impl<B, C> Try for core::ops::ControlFlow<B, C> {
     }
 }
 
-/// `core::ops::FromResidual::from_residual`, on stable.
-///
-/// `Self` is the *function's* return type, which the driver's annotated `let` pins, so
-/// inference has both ends.
+/// Stable stand-in for `core::ops::FromResidual`.
 pub trait FromResidual<R> {
     fn from_residual(r: R) -> Self;
 }
@@ -431,8 +323,7 @@ impl<B, C> FromResidual<ControlFlowBreak<B>> for core::ops::ControlFlow<B, C> {
 mod frames_tests {
     use super::{FIRST_FRAMES, Frames, push};
 
-    /// An empty stack has not allocated, the first push makes room for `FIRST_FRAMES` at
-    /// once, and a full one doubles.
+    /// Starts unallocated, first push reserves `FIRST_FRAMES`, then doubles.
     #[test]
     fn first_push_reserves_a_block_then_doubles() {
         let mut frames: Frames<u64> = Frames::new();
@@ -511,7 +402,7 @@ mod pin_tests {
         assert_eq!(pin.take_at(mark), None, "nothing at that index any more");
     }
 
-    /// It reaches past a chunk boundary, so the index is the store's own and not a chunk's.
+    /// `take_at` indexes across chunk boundaries.
     #[test]
     fn take_at_crosses_chunks() {
         let mut pin: Pin<u64> = Pin::new();
@@ -524,7 +415,7 @@ mod pin_tests {
         pin.truncate(mark);
     }
 
-    /// Taking one back does not move the values still parked, which is what the pointers rely on.
+    /// `take_last` does not move the remaining values.
     #[test]
     fn take_last_leaves_other_addresses_alone() {
         let mut pin: Pin<u64> = Pin::new();

@@ -1,11 +1,8 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The two-phase loop, and the transitions the body reaches it by.
-//!
-//! Entry dispatch and continuation dispatch are separate phases. A completed answer is carried in
-//! a local through as many continuation frames as can finish immediately. Only a continuation that
-//! makes another recursive call jumps back to entry dispatch.
+//! The inlined driver loop and the transitions into it. The outer loop dispatches entries; the
+//! inner loop pops frames and resumes them until one makes another call.
 //!
 //! ```text
 //! let mut __ss_frames = __SsFrames::new(); // allocates on the first `__ss_push`
@@ -30,10 +27,7 @@ use super::names::{
 };
 use super::try_shim;
 
-/// This body is finished: break the surrounding entry/continuation block with its value.
-///
-/// The driver feeds that value directly to the unwind loop. No completed-value slot is written or
-/// read between continuation frames.
+/// Finish the current body: break `'__ss_done` with `v`.
 pub(super) fn done(v: TokenStream) -> TokenStream {
     let val = done_local();
     let done = done_label();
@@ -45,16 +39,14 @@ pub(super) fn done(v: TokenStream) -> TokenStream {
     }
 }
 
-/// One arm per frame, each doing its own carrier check, for a group the shared one does not fit.
+/// Resume dispatch with a per-frame `?` check, when the shared one in [`resume`] does not fit.
 pub(super) fn resume_direct(arms: &[TokenStream]) -> TokenStream {
     let frame = frame_local();
     quote! { match #frame { #(#arms)* } }
 }
 
-/// Park `frame` and enter `entry`: a recursive call.
-///
-/// Arguments are bound before the frame is moved so their source evaluation order and coercion
-/// sites remain the same as in the recursive function.
+/// A recursive call: bind `args`, park `frame`, enter `entry`. Binding first keeps the original
+/// evaluation order and coercion sites.
 pub(super) fn call(args: TokenStream, entry: TokenStream, frame: TokenStream) -> TokenStream {
     let (frames, input, drive) = (frames_local(), input_local(), drive_label());
     let push = push_fn();
@@ -68,7 +60,7 @@ pub(super) fn call(args: TokenStream, entry: TokenStream, frame: TokenStream) ->
     }
 }
 
-/// Enter `entry` with `args` bound first, parking nothing: a call in tail position.
+/// A tail call: bind `args` and enter `entry` without parking a frame.
 pub(super) fn enter(args: TokenStream, entry: TokenStream) -> TokenStream {
     let (input, drive) = (input_local(), drive_label());
     quote! {
@@ -80,9 +72,8 @@ pub(super) fn enter(args: TokenStream, entry: TokenStream) -> TokenStream {
     }
 }
 
-/// One continuation dispatch with a shared leading `?` carrier check.
-///
-/// A residual is turned back into the group's return carrier and continues unwinding directly.
+/// Resume dispatch with one shared `?` check. On a residual, drop the frame and finish with
+/// `from_residual`.
 pub(super) fn resume(inner: &[TokenStream], drops: &[TokenStream]) -> TokenStream {
     let (frame, ok, res) = (frame_local(), ok_local(), res_local());
     let value = value_local();
@@ -110,13 +101,13 @@ pub(super) fn tail(entry: TokenStream) -> TokenStream {
     }
 }
 
-/// A direct transition already diverges through a generated label, so no intermediate carrier is
-/// needed when it appears inside a `?`, `return`, or lowered-loop `break`.
+/// Wrap a transition used inside `?`, `return`, or a lowered `break`. It already diverges, so it
+/// is only parenthesized.
 pub(super) fn escape(next: TokenStream) -> TokenStream {
     quote! { (#next) }
 }
 
-/// The two-phase machine around one group's entry and continuation bodies.
+/// The driver loop around a group's entry arms and resume dispatch.
 pub(super) fn machine(
     entry: &TokenStream,
     input_ann: &TokenStream,

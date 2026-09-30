@@ -1,23 +1,11 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! `?` for `Result`, `Option`, `ControlFlow`, and any carrier the caller adds.
+//! Desugaring of `?` so early exits finish the current body instead of returning.
 //!
-//! `?` has to be desugared by hand, because it returns early and every early exit
-//! must become `return Done(..)` instead. The obvious desugaring hardcodes `Ok` /
-//! `Err` / `From::from`, which is wrong for an `Option`.
-//!
-//! What `?` really does is `Try::branch` followed by `FromResidual::from_residual`
-//! on the break path, but both traits are unstable (`try_trait_v2`), so a macro that
-//! aims at stable cannot name them. `yaspar-macros-defs` carries a two-trait stand-in
-//! with one impl per supported carrier, and this module desugars `?` through it. The
-//! residual is what distinguishes the carriers: an `Err(e)` carries `e` so `From::from`
-//! can widen it, whereas a `None` carries nothing.
-//!
-//! The desugaring only names those traits by path, so a carrier the stand-in has never heard of
-//! works as soon as its author implements the pair — see `tests/carrier.rs`. One that implements
-//! only the unstable `core::ops::Try` does not, and the error names
-//! `yaspar_macros_defs::Try`.
+//! Goes through `yaspar_macros_defs::{Try, FromResidual}`, a stable stand-in for the unstable
+//! `try_trait_v2`, implemented for `Result`, `Option`, and `ControlFlow`. Other carriers work
+//! once they implement both (see `tests/carrier.rs`).
 
 use proc_macro2::TokenStream;
 use quote::quote;
