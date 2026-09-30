@@ -42,13 +42,13 @@ pub(super) fn collect(roots: &mut [ItemFn], opts: Opts) -> syn::Result<Vec<Def>>
             owner,
             path: Vec::new(),
             name: root.sig.ident.clone(),
-            opts: own.unwrap_or(opts),
             marked: own.is_some(),
+            opts: own.unwrap_or_else(|| opts.clone()),
         });
     }
     let mut next = 0;
     while next < defs.len() {
-        let (owner, opts) = (defs[next].owner, defs[next].opts);
+        let (owner, opts) = (defs[next].owner, defs[next].opts.clone());
         // Cloned so `defs` can grow below.
         let path = defs[next].path.clone();
         let mut found: Vec<(usize, Ident, Option<Opts>)> = Vec::new();
@@ -71,8 +71,8 @@ pub(super) fn collect(roots: &mut [ItemFn], opts: Opts) -> syn::Result<Vec<Def>>
                 owner,
                 name,
                 path,
-                opts: own.unwrap_or(opts),
                 marked: own.is_some(),
+                opts: own.unwrap_or_else(|| opts.clone()),
             });
         }
         next += 1;

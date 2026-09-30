@@ -1470,3 +1470,33 @@ fn lazy_frame_stack_across_growth_boundaries() {
         (1..=100_000).fold(7, |acc, n| acc * 31 % 1_000_003 + n * 3 + 1)
     );
 }
+
+// ---------------------------------------------------------------------------
+// The copy as written, kept beside the rewrite as `<name>_orig` (or another
+// `original_suffix`), still recursing on the native stack.
+// ---------------------------------------------------------------------------
+
+#[stack_safe]
+fn triangle(n: u64) -> u64 {
+    if n == 0 { 0 } else { n + triangle(n - 1) }
+}
+
+#[stack_safe(original_suffix = "_native")]
+mod parity {
+    pub fn is_even(n: u64) -> bool {
+        if n == 0 { true } else { is_odd(n - 1) }
+    }
+    pub fn is_odd(n: u64) -> bool {
+        if n == 0 { false } else { is_even(n - 1) }
+    }
+}
+
+#[test]
+fn the_original_is_kept_under_its_suffix() {
+    for n in 0..50 {
+        assert_eq!(triangle(n), triangle_orig(n), "n = {n}");
+        assert_eq!(parity::is_even(n), parity::is_even_native(n), "n = {n}");
+        // Re-exported beside the module, as the rewritten functions are.
+        assert_eq!(is_odd(n), is_odd_native(n), "n = {n}");
+    }
+}

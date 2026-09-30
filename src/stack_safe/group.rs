@@ -14,7 +14,8 @@
 //! entry. For methods, the seed goes beside the impl with `Self` replaced. `emit::liftable`
 //! decides when a group instead gets a copy per member.
 //!
-//! An annotated module's reachable top-level functions are re-exported beside it with `use`.
+//! An annotated module's reachable top-level functions, and their copies as written, are
+//! re-exported beside it with `use`.
 //!
 //! Calls between groups are ordinary calls, so native depth is bounded by the longest path
 //! between groups.
@@ -98,37 +99,43 @@ pub(super) fn rebuild_mod(
     // One answer per function, in item order.
     let mut answers = scanned.rewritten.into_iter().zip(scanned.originals);
     let mut out_items: Vec<TokenStream> = Vec::with_capacity(items.len());
+    // Per function, in item order, the name of its copy as written, if it has one.
+    let mut copies: Vec<Option<syn::Ident>> = Vec::new();
     let mut transformed = false;
     for item in &items {
         out_items.push(match item {
-            Item::Fn(f) => match answers.next().expect("one answer per function") {
-                (Some(tokens), original) => {
-                    transformed = true;
-                    quote! { #tokens #original }
+            Item::Fn(f) => {
+                let answer = answers.next().expect("one answer per function");
+                copies.push(answer.1.as_ref().map(|copy| copy.sig.ident.clone()));
+                match answer {
+                    (Some(tokens), original) => {
+                        transformed = true;
+                        quote! { #tokens #original }
+                    }
+                    (None, Some(original)) => {
+                        // A cycle in its body was rewritten.
+                        let mut f = f.clone();
+                        f.attrs.retain(|a| !Opts::is_marker(a));
+                        quote! { #f #original }
+                    }
+                    // Drop the marker so the compiler doesn't expand it again.
+                    (None, None) => {
+                        let mut f = f.clone();
+                        f.attrs.retain(|a| !Opts::is_marker(a));
+                        f.to_token_stream()
+                    }
                 }
-                (None, Some(original)) => {
-                    // A cycle in its body was rewritten.
-                    let mut f = f.clone();
-                    f.attrs.retain(|a| !Opts::is_marker(a));
-                    quote! { #f #original }
-                }
-                // Drop the marker so the compiler doesn't expand it again.
-                (None, None) => {
-                    let mut f = f.clone();
-                    f.attrs.retain(|a| !Opts::is_marker(a));
-                    f.to_token_stream()
-                }
-            },
+            }
             // Nested containers are grouped separately and never thread out.
             Item::Mod(inner) if inner.content.is_some() => {
                 let (tokens, inner_transformed) =
-                    Scope::of_mod(inner.clone())?.expand_reporting(opts, false)?;
+                    Scope::of_mod(inner.clone())?.expand_reporting(opts.clone(), false)?;
                 transformed |= inner_transformed;
                 tokens
             }
             Item::Impl(inner) => {
                 let (tokens, inner_transformed) =
-                    Scope::of_impl(inner.clone())?.expand_reporting(opts, false)?;
+                    Scope::of_impl(inner.clone())?.expand_reporting(opts.clone(), false)?;
                 transformed |= inner_transformed;
                 tokens
             }
@@ -137,24 +144,36 @@ pub(super) fn rebuild_mod(
     }
 
     // Re-export with `use` rather than a forwarder, so no signature has to be reproduced.
+    // A function's copy as written shares its visibility, so goes out beside it.
     let reexports = items
         .iter()
         .filter_map(|item| match item {
-            Item::Fn(f) if thread_out && reaches_outside(&f.vis) => Some(f),
+            Item::Fn(f) => Some(f),
             _ => None,
         })
-        .map(|f| {
-            let vis = threaded_visibility(&f.vis, &vis);
+        .zip(copies)
+        .filter(|(f, _)| thread_out && reaches_outside(&f.vis))
+        .map(|(f, copy)| {
+            let vis = threaded_visibility(&f.vis);
             let name = &f.sig.ident;
             // Copy `#[cfg]`s, or a configured-out function leaves a dangling `use` (E0432).
-            let gates = f
+            let gates: Vec<_> = f
                 .attrs
                 .iter()
-                .filter(|a| a.path().is_ident("cfg") || a.path().is_ident("cfg_attr"));
+                .filter(|a| a.path().is_ident("cfg") || a.path().is_ident("cfg_attr"))
+                .collect();
+            let copy = copy.map(|copy| {
+                quote! {
+                    #(#gates)*
+                    #[allow(unused_imports)]
+                    #vis use #ident::#copy;
+                }
+            });
             quote! {
                 #(#gates)*
                 #[allow(unused_imports)]
                 #vis use #ident::#name;
+                #copy
             }
         });
 
@@ -239,29 +258,12 @@ fn reaches_outside(vis: &syn::Visibility) -> bool {
     }
 }
 
-/// Visibility of a re-export in the module's parent: the narrower of the function's and the
-/// module's, with the function's `pub(super)` becoming private.
-fn threaded_visibility(func: &syn::Visibility, module: &syn::Visibility) -> TokenStream {
-    /// Reach from the module's parent: 3 anywhere, 2 crate, 1 grandparent, 0 here.
-    fn reach(vis: &syn::Visibility, shift_super: bool) -> u8 {
-        match vis {
-            syn::Visibility::Public(_) => 3,
-            syn::Visibility::Restricted(r) if r.path.is_ident("crate") => 2,
-            syn::Visibility::Restricted(r) if r.path.is_ident("super") => {
-                if shift_super {
-                    0
-                } else {
-                    1
-                }
-            }
-            _ => 0,
-        }
-    }
-
-    match reach(func, true).min(reach(module, false)) {
-        3 => quote! { pub },
-        2 => quote! { pub(crate) },
-        1 => quote! { pub(super) },
+/// Visibility of a re-export in the module's parent: the function's own, with `pub(super)`
+/// (which already meant the parent) becoming private.
+fn threaded_visibility(func: &syn::Visibility) -> TokenStream {
+    match func {
+        syn::Visibility::Public(_) => quote! { pub },
+        syn::Visibility::Restricted(r) if r.path.is_ident("crate") => quote! { pub(crate) },
         _ => TokenStream::new(),
     }
 }

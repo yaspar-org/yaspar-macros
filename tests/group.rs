@@ -493,8 +493,7 @@ fn encoding_module_reaches_private_items() {
 // ---------------------------------------------------------------------------
 // Threading a name out moves it up one level, so its visibility has to be
 // re-expressed rather than copied: `pub(super)` on a function meant "the module's
-// parent", which is where the copy lands, and no copy may out-reach the module it
-// came from.
+// parent", which is where the copy lands. `pub` and `pub(crate)` carry over as is.
 // ---------------------------------------------------------------------------
 
 mod visibility {
@@ -536,14 +535,18 @@ mod visibility {
     }
 }
 
-/// A `pub fn` inside a *private* module was never reachable from outside it, and
-/// threading it out must not change that: the copy is capped at the module's own
-/// visibility.
+/// A `pub fn` is re-exported with `pub use` even from a *private* module: the re-export
+/// follows the function's visibility, not the module's.
 #[stack_safe]
-mod capped {
+mod uncapped {
     pub fn inner(n: u64) -> u64 {
         if n == 0 { 0 } else { inner(n - 1) + 1 }
     }
+}
+
+/// Re-exporting `inner` (and its copy) as `pub` again only compiles if they are `pub` here.
+mod reexported {
+    pub use super::{inner, inner_orig};
 }
 
 #[test]
@@ -555,8 +558,9 @@ fn threaded_visibility_is_re_expressed() {
     assert_eq!(visibility::api::crate_wide(3), 3);
     assert_eq!(visibility::api::via_own(3), 3);
 
-    // `capped` is private, so its copy is private here — usable in this file.
-    assert_eq!(inner(3), 3);
+    // `uncapped` is private, but `inner` is `pub`, so its re-export is too.
+    assert_eq!(reexported::inner(3), 3);
+    assert_eq!(reexported::inner_orig(3), 3);
     assert_eq!(on_tiny_stack(|| inner(200_000)), 200_000);
 }
 

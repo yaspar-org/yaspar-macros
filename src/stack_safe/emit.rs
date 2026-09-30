@@ -1068,7 +1068,7 @@ fn checks_are_shareable(ctx: &Ctx, funcs: &[ItemFn]) -> bool {
         fn visit_item(&mut self, _: &'ast Item) {}
     }
 
-    if ctx.ret_union.is_some() || ctx.opts != Opts::default() {
+    if ctx.ret_union.is_some() || !ctx.opts.same_rewrite(&Opts::default()) {
         return false;
     }
     let mut v = V {
