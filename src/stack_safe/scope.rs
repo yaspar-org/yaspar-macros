@@ -1,26 +1,14 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The functions in scope, and which of them recurse.
+//! Finds every function in scope (the roots plus functions nested in their bodies, at any
+//! depth) and which of them recurse.
 //!
-//! A body is a scope of item definitions like any other, so a `fn` nested in one can recurse:
-//! alone, through the function that hosts it, or through its siblings. Everything in scope is
-//! therefore scanned at once — one or more *roots*, being the annotated function or the
-//! functions of an annotated container, and whatever their bodies declare — so that a cycle is
-//! found wherever it runs.
+//! A nested function is addressed by its root and a path of *ordinals*: its position among the
+//! functions its host body declares, counting ones inside nested blocks. [`take`] leaves a
+//! placeholder so later ordinals stay valid.
 //!
-//! A definition is addressed by its root and the *ordinals* leading to it, so that a member of a
-//! cycle can be taken back out of the body that declares it. An ordinal is a definition's position
-//! among the ones its body declares, in visit order, not descending into any of them since each is
-//! its own scope. Blocks *are* descended into, so a `fn` inside an `if` or a `match` arm is found
-//! like one at the top of the body — it has to be, or a cycle through it stays on the native stack.
-//!
-//! Ordinals have to survive a member being [`take`]n, since the definitions after it keep their
-//! addresses, so what is left behind is counted too: see [`addressable`].
-//!
-//! A `fn` in a block counts as in scope throughout the body, which is one step more generous than
-//! Rust. It costs nothing: the extra candidates are same-named functions in one body, and a call to
-//! one of them is a call to some function of that name in that body either way.
+//! A nested `fn` counts as in scope throughout its host body, not just its block.
 
 use proc_macro2::{Ident, Span, TokenStream, TokenTree};
 use syn::spanned::Spanned;
@@ -34,26 +22,18 @@ use super::Opts;
 pub(super) struct Def {
     /// Which root it belongs to.
     pub(super) owner: usize,
-    /// The ordinals leading to it from that root's body down. Empty for the root.
+    /// Ordinals from the root's body down; empty for the root.
     pub(super) path: Vec<usize>,
     pub(super) name: Ident,
-    /// The options in force where it is declared: its own `#[stack_safe]` marker if it carries
-    /// one, and otherwise the ones in force around it. A marker therefore *shadows* rather than
-    /// adds — it says what this function and its body want, in full, exactly as an inner binding
-    /// of a name says what that name means from there down.
+    /// Its own marker's options if it has one (replacing, not merging), else its host's.
     pub(super) opts: Opts,
-    /// Did it carry a marker of its own? Only its own makes a function that turns out not to
-    /// recurse *this* function's mistake.
+    /// Whether it carried its own `#[stack_safe]` marker.
     pub(super) marked: bool,
 }
 
-/// Every function in the roots' scope: the roots themselves, then what their bodies declare,
-/// shallowest first — so a definition always comes before the ones nested in it.
+/// Every function in scope, shallowest first, so a host precedes what it declares.
 ///
-/// This is the walk that visits a scope in declaration order, so it is also where each
-/// `#[stack_safe]` marker is read and taken off, and where the options in force are handed down: a
-/// definition inherits its host's unless it carries a marker of its own, which then shadows them
-/// outright.
+/// Also strips each `#[stack_safe]` marker and resolves the options in force.
 pub(super) fn collect(roots: &mut [ItemFn], opts: Opts) -> syn::Result<Vec<Def>> {
     let mut defs: Vec<Def> = Vec::with_capacity(roots.len());
     for (owner, root) in roots.iter_mut().enumerate() {
@@ -62,7 +42,6 @@ pub(super) fn collect(roots: &mut [ItemFn], opts: Opts) -> syn::Result<Vec<Def>>
             owner,
             path: Vec::new(),
             name: root.sig.ident.clone(),
-            // Its own marker if it has one, and otherwise what the attribute itself was given.
             opts: own.unwrap_or(opts),
             marked: own.is_some(),
         });
@@ -70,9 +49,8 @@ pub(super) fn collect(roots: &mut [ItemFn], opts: Opts) -> syn::Result<Vec<Def>>
     let mut next = 0;
     while next < defs.len() {
         let (owner, opts) = (defs[next].owner, defs[next].opts);
-        // Owned, so that `defs` can grow while the body it addresses is being read.
+        // Cloned so `defs` can grow below.
         let path = defs[next].path.clone();
-        // One walk down to the body, not one per function it declares.
         let mut found: Vec<(usize, Ident, Option<Opts>)> = Vec::new();
         let mut failed: Option<syn::Error> = None;
         with_def_mut(
@@ -93,7 +71,6 @@ pub(super) fn collect(roots: &mut [ItemFn], opts: Opts) -> syn::Result<Vec<Def>>
                 owner,
                 name,
                 path,
-                // Its own marker shadows the body's; without one it wants what the body wants.
                 opts: own.unwrap_or(opts),
                 marked: own.is_some(),
             });
@@ -103,9 +80,8 @@ pub(super) fn collect(roots: &mut [ItemFn], opts: Opts) -> syn::Result<Vec<Def>>
     Ok(defs)
 }
 
-/// The functions this body declares — anywhere in it, not just at the top — with their ordinals,
-/// names and own options, taken off as they are read since the walk is what hands options down.
-/// Not descended into: each is its own scope and gets its turn.
+/// The functions declared anywhere in this body (not inside them), with ordinal, name, and
+/// own options (stripped from the attributes).
 fn nested_mut(func: &mut ItemFn) -> syn::Result<Vec<(usize, Ident, Option<Opts>)>> {
     struct V {
         found: Vec<(usize, Ident, Option<Opts>)>,
@@ -116,15 +92,14 @@ fn nested_mut(func: &mut ItemFn) -> syn::Result<Vec<(usize, Ident, Option<Opts>)
     impl VisitMut for V {
         fn visit_item_mut(&mut self, item: &mut Item) {
             if !addressable(item) {
-                // Not a definition this addresses, and not descended into either: a `mod` or an
-                // `impl` block in a body is a scope of its own, expanded on its own.
+                // Other items (e.g. `mod`, `impl`) are separate scopes; skip them.
                 return;
             }
             let ordinal = self.next;
             self.next += 1;
             let Item::Fn(func) = item else { return };
             match Opts::take_from(&mut func.attrs) {
-                // The first failure wins, as it would if this returned a `Result`.
+                // Keep the first error.
                 Err(e) => self.failed = self.failed.take().or(Some(e)),
                 Ok(own) => self.found.push((ordinal, func.sig.ident.clone(), own)),
             }
@@ -143,10 +118,7 @@ fn nested_mut(func: &mut ItemFn) -> syn::Result<Vec<(usize, Ident, Option<Opts>)
     }
 }
 
-/// Does this item take up an ordinal in the body that holds it?
-///
-/// A `fn` does, being what a path addresses — and so does the placeholder [`take`] leaves behind,
-/// since the definitions after it keep the addresses they were given.
+/// Whether this item takes an ordinal: a `fn`, or the placeholder [`take`] leaves.
 fn addressable(item: &Item) -> bool {
     matches!(item, Item::Fn(_) | Item::Verbatim(_))
 }
@@ -160,7 +132,7 @@ pub(super) fn at<'a>(func: &'a ItemFn, path: &[usize]) -> &'a ItemFn {
     func
 }
 
-/// The function at this ordinal among the ones the body declares.
+/// The function at `ordinal` in this body.
 fn nth(block: &Block, ordinal: usize) -> Option<&ItemFn> {
     struct V<'a> {
         want: usize,
@@ -192,10 +164,9 @@ fn nth(block: &Block, ordinal: usize) -> Option<&ItemFn> {
     v.found
 }
 
-/// Run `act` on the definition this path addresses, the root itself for an empty one.
+/// Run `act` on the definition at `path` (the root if empty).
 ///
-/// `&mut dyn` rather than a generic, since the walk down a path is recursive and a generic closure
-/// would ask the compiler to instantiate the recursion once per level, without end.
+/// `&mut dyn`, not generic, to avoid unbounded monomorphization of the recursion.
 fn with_def_mut(root: &mut ItemFn, path: &[usize], act: &mut dyn FnMut(&mut ItemFn)) {
     match path.is_empty() {
         true => act(root),
@@ -206,13 +177,13 @@ fn with_def_mut(root: &mut ItemFn, path: &[usize], act: &mut dyn FnMut(&mut Item
     }
 }
 
-/// Run `act` on the *item* a non-empty path addresses, so that it can be replaced as well as read.
+/// Run `act` on the item at a non-empty `path`, so it can be replaced.
 fn with_item_mut(root: &mut ItemFn, path: &[usize], act: &mut dyn FnMut(&mut Item)) {
     struct V<'a> {
         /// The ordinals still to follow; never empty.
         path: &'a [usize],
         next: usize,
-        /// Taken when it runs, so nothing can run it twice.
+        /// Taken when run, so it runs at most once.
         act: Option<&'a mut dyn FnMut(&mut Item)>,
     }
 
@@ -253,16 +224,9 @@ fn with_item_mut(root: &mut ItemFn, path: &[usize], act: &mut dyn FnMut(&mut Ite
     .visit_block_mut(&mut root.block);
 }
 
-/// Take a nested definition out of the body that declares it.
+/// Remove a nested definition, leaving a placeholder so other paths stay valid.
 ///
-/// A member of a cycle is rewritten into a call into the shared driver, and the driver has to
-/// be written beside the outermost member rather than inside a body that has itself become
-/// one of its arms. A definition nested in another has to be taken before the one holding it,
-/// so the caller works from the deepest one up.
-///
-/// What is left behind is an empty item rather than nothing at all, so that every other
-/// path stays valid: a definition is addressed by its ordinal among the ones its body declares,
-/// and removing one would shift the definitions after it.
+/// Take deeper definitions before the ones holding them.
 pub(super) fn take(func: &mut ItemFn, path: &[usize]) -> ItemFn {
     let mut taken: Option<ItemFn> = None;
     with_item_mut(func, path, &mut |item| {
@@ -274,8 +238,7 @@ pub(super) fn take(func: &mut ItemFn, path: &[usize]) -> ItemFn {
     taken.expect("a path addresses a nested function")
 }
 
-/// Write tokens where a definition was taken from: the rewritten cycle — the shared driver, with
-/// the members that came from deeper in written inside it and the outermost one beside it.
+/// Replace the placeholder at `path` with `tokens` (the rewritten cycle).
 pub(super) fn put_back(func: &mut ItemFn, path: &[usize], tokens: TokenStream) {
     with_item_mut(func, path, &mut |item| *item = placeholder(tokens.clone()));
 }
@@ -284,21 +247,13 @@ fn placeholder(tokens: TokenStream) -> Item {
     Item::Verbatim(tokens)
 }
 
-/// One edge per call from one definition in scope to another.
+/// The call graph: `edges[i][j]` is set when `i`'s body mentions `j` in a rewritable call or
+/// inside a macro. Names resolve to the innermost definition in scope (see [`resolve`]).
 ///
-/// The name is resolved the way Rust resolves it: to the innermost definition in scope
-/// that carries it, so a nested function shadowing an outer one takes the edge.
-/// `edges[i][j]` is set when `i`'s body mentions `j`: a call the transform can rewrite, or a
-/// name inside a macro it cannot — see [`mentioned`].
+/// `assoc` means the roots are impl items; `host` is the impl's type or the module's name.
 ///
-/// `assoc` says the roots are associated items of an impl block, which changes what a name can
-/// mean: `self.g(..)` and `Self::g(..)` reach them and a bare `g(..)` does not. `host` is the name
-/// the scope goes by where it is written — the impl block's own type, or the annotated module's
-/// ident — since a call may spell that out instead of saying `Self` or `self`.
-///
-/// Beside the edges come the calls that name a definition through a path the *rewriter* cannot
-/// follow. They are not edges — an edge says the call becomes an entry into the driver — and
-/// reporting them is [`scan`](super::scan)'s job.
+/// Also returns calls through paths the rewriter cannot follow ([`Blocked`], reported by
+/// [`scan`](super::scan)) and names that resolve ambiguously.
 pub(super) fn edges(
     roots: &[ItemFn],
     defs: &[Def],
@@ -345,21 +300,11 @@ pub(super) struct Blocked {
     pub(super) span: Span,
 }
 
-/// Which definition a mention, written inside definition `from`, refers to.
+/// Which definition a mention inside `from` refers to, if any.
 ///
-/// Two questions, and a candidate has to pass both. *Is it in scope here?* One declared in a
-/// body is, from there down, and only inside the body that declares it; a root is, throughout,
-/// being a sibling of every root. *Can it be named this way?* A bare `g(..)` reaches a function
-/// declared in a body, or a free one, but never an associated item, which is not in scope under
-/// a bare name — such a call is the free `g`, not the method beside it. `self.g(..)`,
-/// `Self::g(..)` and `other.g(..)` are the other way round: an associated item only. `self::g(..)`
-/// names a module's own item, so it reaches a free root and nothing declared in a body.
-///
-/// Where several candidates remain, the innermost wins, exactly as Rust resolves it — unless two
-/// are equally innermost, which a path of ordinals cannot break, and then the mention is reported
-/// as ambiguous rather than guessed at. That is conservative: two same-named definitions in sibling
-/// blocks are refused even where the tie would not have changed which cycles there are, because
-/// deciding *that* would mean resolving the tie first.
+/// A candidate must be in scope (a root, or declared in a body enclosing `from`) and nameable as
+/// written (see [`Written`]). The innermost wins; a tie (e.g. same name in sibling blocks) is
+/// returned as `Err` rather than guessed.
 fn resolve(defs: &[Def], from: usize, m: &Mention, assoc: bool) -> Result<Option<usize>, Ident> {
     let here = &defs[from];
     let nameable = |d: &Def| {
@@ -385,19 +330,15 @@ fn resolve(defs: &[Def], from: usize, m: &Mention, assoc: bool) -> Result<Option
     };
     let mut innermost = candidates.iter().filter(|(_, d)| d.path.len() == depth);
     let (winner, _) = *innermost.next().expect("the maximum is one of them");
-    // A path records which *body* a definition sits in, not which block of it, so two definitions
-    // declared in sibling blocks of one body are equally deep and equally in scope here. Rust
-    // resolves that by block, which is exactly the distinction the path does not carry: picking
-    // either would be a guess, and picking the last one is what silently called the wrong `step`.
+    // Paths don't record blocks, so sibling-block definitions tie and can't be told apart.
     match innermost.next() {
         None => Ok(Some(winner)),
         Some(_) => Err(m.name.clone()),
     }
 }
 
-/// One entry per cycle, its members in `defs` order — so the shallowest member comes first —
-/// and innermost cycle first, since a cycle has to be rewritten before the one that holds its
-/// members can take them out.
+/// The cycles in `reaches`, each with members in `defs` order (shallowest first), deepest cycle
+/// first so inner cycles are rewritten before the ones holding them.
 pub(super) fn cycles(defs: &[Def], reaches: &[Vec<bool>]) -> Vec<Vec<usize>> {
     let mut grouped = vec![false; defs.len()];
     let mut out: Vec<Vec<usize>> = Vec::new();
@@ -405,8 +346,7 @@ pub(super) fn cycles(defs: &[Def], reaches: &[Vec<bool>]) -> Vec<Vec<usize>> {
         if grouped[i] || !reaches[i][i] {
             continue;
         }
-        // Anything earlier is either already in a cycle or in none, so a member of this one
-        // cannot be behind `i`.
+        // Earlier defs are already grouped or in no cycle.
         let members: Vec<usize> = (i..defs.len())
             .filter(|&j| reaches[i][j] && reaches[j][i])
             .collect();
@@ -415,49 +355,40 @@ pub(super) fn cycles(defs: &[Def], reaches: &[Vec<bool>]) -> Vec<Vec<usize>> {
         }
         out.push(members);
     }
-    // `defs` is shallowest first, so the cycles come out outermost first.
+    // Found outermost first; reverse to deepest first.
     out.reverse();
     out
 }
 
-/// A name this body might be calling, and how it was written — which is what says what the
-/// name can possibly mean.
+/// A name this body might be calling, and how it was written.
 struct Mention {
     name: Ident,
     written: Written,
-    /// A path plain enough to resolve but not one the transform rewrites — `T::g(..)` inside
-    /// `impl T`, `<Self>::g(..)`, `crate::m::g(..)` inside `#[stack_safe] mod m`. Reported rather
-    /// than made an edge, since a half-flattened function still grows the stack. Carries the span.
+    /// Set (path text, span) for a resolvable call the transform can't rewrite, e.g. `T::g(..)`
+    /// inside `impl T`, `<Self>::g(..)`, or `crate::m::g(..)` inside `mod m`.
     unrewritable: Option<(String, Span)>,
 }
 
-/// The ways a call can name what it calls, as far as resolution is concerned.
+/// How a call names its target, which limits what it can resolve to.
 #[derive(PartialEq)]
 enum Written {
-    /// `g(..)`: a path of one segment. It reaches a function declared in a body, or a free
-    /// function — never an associated item, which is not in scope under a bare name.
+    /// `g(..)`: a nested or free function, never an associated item.
     Bare,
-    /// `self::g(..)`, or `super::m::g(..)` / `crate::a::m::g(..)` inside `#[stack_safe] mod m`:
-    /// this module's `g`, from whichever body. It reaches a free root, never a function declared in
-    /// a body, which no module path names. A bare `crate::g` is *not* this — a macro does not know
-    /// its own module path, so unless the path names the annotated module it cannot tell.
+    /// `self::g(..)`, or `m::g(..)` / `self::m::g(..)` / `super::..::m::g(..)` /
+    /// `crate::..::m::g(..)` inside `mod m`: a free root only. (`crate::g` is not recognised; the
+    /// macro doesn't know its module path.)
     InThisModule,
-    /// `self.g(..)`, `Self::g(self, ..)`, `other.g(..)`, `T::g(..)` inside `impl T`, or any
-    /// `<..>::g(..)`: only an associated item.
+    /// `x.g(..)` (any receiver), `Self::g(..)`, `T::g(..)` inside `impl T`, or `<Self>::g(..)` /
+    /// `<T ..>::g(..)`: an associated item only.
     OnAValue,
-    /// A name inside a macro invocation, where nothing says how it is used. It reaches
-    /// anything, which is what lets a cycle running through a macro be reported as such
-    /// rather than quietly recursing on the native stack.
+    /// Any identifier inside a macro invocation. Matches anything, so recursion through a macro
+    /// is detected and reported.
     InAMacro,
 }
 
-/// The names this body might be calling.
+/// The names this body might be calling, not looking inside nested items.
 ///
-/// Not descended into: a nested function, which is a scope of its own and gets its own row.
-///
-/// `host` is what the scope is called where it is written — the impl block's type, or the annotated
-/// module's ident. A call may name a member through it (`T::g(..)`, `crate::m::g(..)`) rather than
-/// through `Self` or `self`, and missing those leaves the cycle unfound and the recursion native.
+/// `host` lets calls like `T::g(..)` or `crate::m::g(..)` be recognised as naming this scope.
 fn mentioned(func: &ItemFn, assoc: bool, host: Option<&Ident>) -> Vec<Mention> {
     struct V<'a> {
         found: Vec<Mention>,
@@ -474,8 +405,7 @@ fn mentioned(func: &ItemFn, assoc: bool, host: Option<&Ident>) -> Vec<Mention> {
             });
         }
 
-        /// A call the scan can resolve and the rewriter cannot follow. See
-        /// [`Mention::unrewritable`].
+        /// Record a call the rewriter can't follow; see [`Mention::unrewritable`].
         fn blocked(&mut self, name: Ident, written: Written, path: &syn::ExprPath) {
             self.found.push(Mention {
                 name,
@@ -484,9 +414,8 @@ fn mentioned(func: &ItemFn, assoc: bool, host: Option<&Ident>) -> Vec<Mention> {
             });
         }
 
-        /// How a call names what it calls, for a path with several segments or a qself. Only the
-        /// shapes that plainly name *this* scope: anything else may name anything, and reading it
-        /// as a member would put a function that never recurses into a cycle.
+        /// Classify a multi-segment or qualified path. Only paths that clearly name this scope
+        /// are recorded; anything else is ignored.
         fn qualified(&mut self, name: Ident, p: &syn::ExprPath) {
             let segments = &p.path.segments;
             let last = segments.len() - 1;
@@ -494,8 +423,7 @@ fn mentioned(func: &ItemFn, assoc: bool, host: Option<&Ident>) -> Vec<Mention> {
                 syn::Type::Path(tp) => tp.path.segments.first().map(|s| s.ident.clone()),
                 _ => None,
             };
-            // A qself is always an associated item: `<Self>::g`, `<T as Tr>::g`. Only one naming
-            // the type this block is for can be a member of it.
+            // `<Self>::g` or `<T ..>::g` in `impl T`: a member, but not rewritable.
             if let Some(qself) = &p.qself {
                 let names_host = leading(&qself.ty)
                     .is_some_and(|id| id == "Self" || self.host.is_some_and(|h| *h == id));
@@ -516,13 +444,12 @@ fn mentioned(func: &ItemFn, assoc: bool, host: Option<&Ident>) -> Vec<Mention> {
             if segments[last - 1].ident != *host {
                 return;
             }
-            // `T::g(..)` inside `impl T`, however the path reached `T`.
+            // `..::T::g(..)` inside `impl T`.
             if self.assoc {
                 self.blocked(name, Written::OnAValue, p);
                 return;
             }
-            // `m::g(..)` inside `mod m`, but only where the path is rooted somewhere that could
-            // lead back to this very module: another `m` elsewhere in the crate is not this one.
+            // `m::g(..)` inside `mod m`, only if rooted at `self`/`super`/`crate` or just `m::g`.
             let rooted = last == 1
                 || matches!(
                     segments[0].ident.to_string().as_str(),
@@ -558,8 +485,7 @@ fn mentioned(func: &ItemFn, assoc: bool, host: Option<&Ident>) -> Vec<Mention> {
                         }
                     }
                 }
-                // Any receiver, not just `self`: a method can recurse on another value of the
-                // same type, as `tail.len()` does.
+                // Any receiver: a method may recurse on another value, like `tail.len()`.
                 Expr::MethodCall(m) => self.mention(m.method.clone(), Written::OnAValue),
                 Expr::Macro(m) => self.scan_tokens(m.mac.tokens.clone()),
                 _ => {}
@@ -586,8 +512,7 @@ fn mentioned(func: &ItemFn, assoc: bool, host: Option<&Ident>) -> Vec<Mention> {
     v.found
 }
 
-/// A path as the user wrote it, for a message that quotes it back: `to_token_stream` would render
-/// `crate::m::g` as `crate :: m :: g`.
+/// A path rendered without token spacing (`crate::m::g`, not `crate :: m :: g`).
 fn pretty_path(p: &syn::ExprPath) -> String {
     let mut out = quote::ToTokens::to_token_stream(p).to_string();
     for (from, to) in [
@@ -603,13 +528,12 @@ fn pretty_path(p: &syn::ExprPath) -> String {
     out
 }
 
-/// Transitive closure, so `reaches[i][j]` means "`i` can reach `j`".
+/// Transitive closure: `reaches[i][j]` means `i` can reach `j`.
 pub(super) fn closure(edges: &[Vec<bool>]) -> Vec<Vec<bool>> {
     let n = edges.len();
     let mut reaches = edges.to_vec();
     for k in 0..n {
-        // Cloned so row `i` can be updated while row `k` is read; `n` is the number of
-        // functions in one scope, so this costs nothing.
+        // Cloned so rows can be updated while row `k` is read.
         let through_k = reaches[k].clone();
         for row in reaches.iter_mut() {
             if row[k] {

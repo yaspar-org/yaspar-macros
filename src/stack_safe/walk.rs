@@ -1,8 +1,8 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! What the transform carries as it walks: the per-function [`Ctx`], the
-//! per-position [`Env`], and the macro-level continuation type.
+//! State carried by the transform: the per-group [`Ctx`], the per-position [`Env`], and
+//! the continuation type [`Cont`].
 
 use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, quote};
@@ -15,35 +15,27 @@ use syn::Expr;
 use super::Opts;
 use super::context::CtxEntry;
 
-/// A place the driver can arrive at, whose payload is solved to a fixed point: a
-/// lowered loop's entry point, or a resume point after a recursive call.
+/// A point the driver can arrive at: a lowered loop's entry, or a resume point after a
+/// recursive call. Its payload is solved to a fixed point.
 pub(super) struct PayloadPoint {
-    /// Which member's body this point came out of; one name can mean different types in two of
-    /// them.
+    /// Member whose body this point is in (one name can have different types in two bodies).
     pub(super) member: usize,
-    /// Bindings in scope there, in declaration order. Threading state through a
-    /// payload is a move, so the order must be stable.
+    /// Bindings in scope, in declaration order; payload order must be stable.
     pub(super) scope: Vec<Ident>,
-    /// Threaded first and unconditionally: a `for` loop's iterator, and the parked
-    /// context pointers of a `use_nonlinear_mut` call.
+    /// Always threaded, first: a `for` iterator, and parked `use_nonlinear_mut` context pointers.
     pub(super) forced: Vec<Ident>,
     /// The code, still containing payload markers.
     pub(super) code: TokenStream,
-    /// The `#[cfg]` predicates this point was written under, outermost first. The arm generated
-    /// for it exists only when they all hold; see `Ctx::gates`.
+    /// `#[cfg]` predicates enclosing this point, outermost first; its arm is gated on them.
     pub(super) gates: Vec<TokenStream>,
-    /// Bindings in scope here that the arm recomputes instead of carrying; see [`Derived`].
+    /// Bindings in scope that the arm recomputes instead of carrying.
     pub(super) derived: Vec<Derived>,
 }
 
-/// A binding whose value, wherever it is in scope, can be recomputed from another binding that
-/// is threaded anyway: a payload then carries the source and not the binding, and the arm the
-/// payload arrives at rebinds the name from it before running its code.
+/// A binding recomputed from another threaded binding instead of being carried.
 ///
-/// The one kind there is is the index of a `for` over `a..b`. Its iterator has to travel to every
-/// point in the body regardless, since the next iteration needs it, and a `Range` that has not
-/// yet been stepped past this iteration's value holds that value as its `start`. See
-/// `cps::lower_loop`.
+/// The only case is the index of a `for` over `a..b`, read back from the range's `start`.
+/// See `cps::lower_loop`.
 #[derive(Clone)]
 pub(super) struct Derived {
     /// The binding, as the user's pattern spells it.
@@ -59,118 +51,77 @@ pub(super) struct ResumePoint {
     pub(super) point: PayloadPoint,
     /// The binding the callee's result arrives in.
     pub(super) value: Ident,
-    /// Could this point's carrier check be shared with the others? Set while the call that
-    /// creates the point is being lowered: nothing it has to tear down first (`Ctx::hoistable`),
-    /// and then a `?` as the first thing the continuation does (`Ctx::mark_checked`).
+    /// Whether this point's `?` could share one hoisted check. See `Ctx::mark_checked`.
     pub(super) hoistable: Cell<bool>,
-    /// The `?` was lifted out, so [`ResumePoint::value`] holds the value *already* checked, and
-    /// the check belongs to whoever writes the resume arm. See `driver::resume`.
+    /// The `?` was hoisted: [`ResumePoint::value`] is already checked. See `driver::resume`.
     pub(super) checked: Cell<bool>,
 }
 
-/// One function the driver can enter. A self-recursive function is a group of
-/// one; a mutually recursive cycle is a group of several, sharing one driver.
+/// A function the driver can enter. A group of one or more members shares one driver.
 #[derive(Clone)]
 pub(super) struct Member {
     pub(super) name: Ident,
-    /// How many arguments a call to it passes. A receiver has been desugared into an
-    /// ordinary parameter by this point, so it is counted like any other.
+    /// Number of arguments, receiver included (it is desugared into a parameter).
     pub(super) arity: usize,
-    /// Which of those argument positions are context slots, and which slot each
-    /// one fills. Members of a group agree on the *slots* but not necessarily on
-    /// the positions, so this is per member.
+    /// Argument position -> context slot. Per member: members agree on slots, not positions.
     pub(super) context_at: HashMap<usize, usize>,
     /// Payload parameters, as patterns (`mut n`) and as names (`n`).
     pub(super) param_pats: Vec<TokenStream>,
     pub(super) param_names: Vec<Ident>,
-    /// `let mut n: u64 = n;` per payload parameter, emitted at the top of this
-    /// member's arm.
+    /// `let mut n: u64 = n;` per payload parameter, at the top of the member's arm.
     ///
-    /// Without it the payload's type is whatever the arm's own code implies, and a
-    /// body that matches straight on a reference parameter (`match e { E::V(v) =>
-    /// .. }`) implies the *by-value* type: match ergonomics only apply once the
-    /// scrutinee is known to be a reference. A lone function survives that because
-    /// its seed is checked before the closure, but in a group the seed for one
-    /// member sits inside another member's arm, so the pattern gets there first.
+    /// Pins the payload type: in a group, match ergonomics on a reference parameter could
+    /// otherwise infer the by-value type.
     pub(super) param_anns: Vec<TokenStream>,
-    /// The same rebinding for a parameter that travels as a raw pointer, because
-    /// some call site passes a reference to a value built there: the pointee lives in
-    /// the driver's pinned store, so the reference is taken back with `unsafe`.
+    /// Same, for a parameter passed as a raw pointer into the pinned store.
     pub(super) param_anns_pinned: Vec<TokenStream>,
-    /// Which payload positions travel that way. Set by `analyze::scan_pinned_args`
-    /// after the `Ctx` exists, like `CtxEntry::raw`.
+    /// Which payload positions are pinned. Set later by `analyze::scan_pinned_args`.
     pub(super) pinned: Vec<std::cell::Cell<bool>>,
-    /// For a reference parameter, its pointee type, which is what a store for that
-    /// position holds. Naming it at the store's creation is what keeps inference from
-    /// having to chase the element type through a `push` in another arm.
+    /// Pointee type of a reference parameter: the element type of its store.
     pub(super) param_pointees: Vec<Option<TokenStream>>,
-    /// `: u64` per payload parameter, empty for an `impl Trait` one. Used to pin a
-    /// payload argument hoisted to a temporary at the call site.
+    /// `: u64` per payload parameter, empty for `impl Trait`.
     pub(super) param_types: Vec<TokenStream>,
-    /// The same types without the colon, where the type is needed on its own.
+    /// The same types without the colon.
     pub(super) param_bare_types: Vec<TokenStream>,
 }
 
 pub(super) struct Ctx {
-    /// Every function that shares this driver, in entry-variant order: the entry
-    /// point for member `i` is `E{i}`, and lowered loops are numbered after
-    /// all of them.
+    /// Every function sharing this driver. Member `i` enters at `E{i}`; loops come after.
     pub(super) members: Vec<Member>,
     pub(super) counter: Cell<usize>,
     pub(super) loops: RefCell<Vec<PayloadPoint>>,
-    /// One per recursive call site. Each becomes a variant of the frame enum and an
-    /// arm of the body's `match` — which is what lets the driver keep frames in a
-    /// plain `Vec` instead of boxing a closure per call.
+    /// One per recursive call site: a frame variant plus a `match` arm.
     pub(super) resumes: RefCell<Vec<ResumePoint>>,
-    /// The result bindings of the recursive calls we are currently *inside* the
-    /// continuation of. They are in scope, but no `Env` knows that: they are bound
-    /// by a closure the transform generates, not by the user's code. A loop needs
-    /// them threaded all the same. The walk is depth-first and `k` is called
-    /// synchronously, so this stack mirrors lexical scope exactly.
+    /// Result bindings of the continuations being generated: in scope, but not in any `Env`.
     pub(super) results: RefCell<Vec<Ident>>,
-    /// Parameters lent out by the driver instead of travelling in the payload,
-    /// in slot order. Shared by the whole group.
+    /// Parameters lent out by the driver instead of carried in the payload, in slot order.
     pub(super) context: Vec<CtxEntry>,
-    /// Are the members associated items? A module path then names something else, so
-    /// `self::g(..)` in one of their bodies is not a call to a member. See `scope::edges`.
+    /// Members are associated items, so `self::g(..)` is not a member call. See `scope::edges`.
     pub(super) assoc: bool,
-    /// `: R` for the driver's own result, naming the union when the members disagree.
+    /// `: R` for the driver's result: the union, when the members' return types differ.
     pub(super) ret_ann: TokenStream,
-    /// Each member's return type as `: R`, empty for an `impl Trait` return. Used to annotate a
-    /// resumed value once it has been taken out of the union — which is what lets method
-    /// resolution inside a continuation see its receiver's type; left to inference,
-    /// `f(n - 1).wrapping_add(1)` is E0689.
+    /// Each member's return type as `: R` (empty for `impl Trait`), used to annotate resumed
+    /// values so method calls on them resolve.
     pub(super) rets: Vec<TokenStream>,
-    /// The same as a bare type, for slots rather than bindings. A resumed value's type is the
-    /// callee's return type, and saying so is what lets a payload carrying that value be named --
-    /// which matters when the only code that would have constructed it is `#[cfg]`-ed out and
-    /// inference has nothing else to go on.
+    /// The same, as bare types, to name payload slots that inference cannot see (e.g. when
+    /// the only construction is `#[cfg]`-ed out).
     pub(super) ret_types: Vec<TokenStream>,
-    /// The union of the members' return types, when they differ. The driver has one
-    /// result type, so a group whose members answer with different types answers with
-    /// this instead, and each member's entry takes its own variant back out.
+    /// Union of the members' return types, when they differ.
     pub(super) ret_union: Option<Ident>,
     pub(super) opts: Opts,
-    /// Which member's body is being lowered; one at a time, so one slot suffices.
+    /// Member whose body is being lowered.
     pub(super) current: Cell<usize>,
-    /// The `#[cfg]` predicates enclosing the code being lowered, outermost first. A recursive call
-    /// under one is cut across the driver's arms, so each arm it produces has to carry the same
-    /// gate -- and the frame variant it uses needs an arm for the other case, since the enum is
-    /// declared whatever the predicate says.
+    /// `#[cfg]` predicates around the code being lowered, outermost first.
     pub(super) gates: RefCell<Vec<TokenStream>>,
-    /// Declared type of each annotated `let`, by `(member, name)`; `None` if bound
-    /// inconsistently. Re-applied where a payload slot carries that local.
+    /// Declared type of each annotated `let`, by `(member, name)`; `None` if inconsistent.
     pub(super) local_types: RefCell<HashMap<(usize, String), Option<TokenStream>>>,
     /// Every name a member binds with a plain `let`, whether or not that `let` said a type.
     pub(super) locals: RefCell<HashSet<(usize, String)>>,
-    /// The shared store's variants a lowering asks for, in the order it asks: one per borrowing
-    /// `for` loop, whose collection moves into the store so that the iterator borrows that rather
-    /// than a local the frame owns, and one per local a call site parks to lend a place inside it.
-    /// Kept in one list so that a variant index settles when it is handed out.
+    /// Shared-store variants requested during lowering, in request order: one per borrowing
+    /// `for` collection, one per parked local.
     pub(super) asked_stores: RefCell<Vec<(StoreKey, TokenStream)>>,
-    /// May the `?` at the front of every resume point be lifted into one check above the frame
-    /// dispatch? Decided before a line is lowered, by `emit::checks_are_shareable`, because it has
-    /// to be all or nothing: a point whose check is lifted out no longer carries one of its own.
+    /// Hoist every resume point's `?` into one check above the frame dispatch? All or
+    /// nothing; decided up front by `emit::checks_are_shareable`.
     pub(super) hoist: Cell<bool>,
 }
 
@@ -192,8 +143,7 @@ impl Ctx {
         out
     }
 
-    /// Everything in scope at this point: the user's bindings, then the result
-    /// bindings of the continuations we are nested in.
+    /// User bindings in scope, plus result bindings of the enclosing continuations.
     pub(super) fn scope_with_results(&self, scope: &[Ident]) -> Vec<Ident> {
         let mut out = scope.to_vec();
         for v in self.results.borrow().iter() {
@@ -223,12 +173,12 @@ impl Ctx {
         out
     }
 
-    /// The element type a store holds, i.e. the pointee of that position's parameter.
+    /// Element type of a store: the pointee of that position's parameter.
     fn pin_element(&self, member: usize, position: usize) -> Option<TokenStream> {
         self.members[member].param_pointees[position].clone()
     }
 
-    /// The pinned positions whose element type the macro can name, in variant order.
+    /// Pinned positions whose element type is known, in variant order.
     fn named_positions(&self) -> Vec<(usize, usize)> {
         self.pinned_positions()
             .into_iter()
@@ -236,8 +186,7 @@ impl Ctx {
             .collect()
     }
 
-    /// The pinned positions whose element type it cannot: an enum variant needs a type, so each of
-    /// these keeps a store of its own, whose element type the `push` settles as it always did.
+    /// Pinned positions whose element type is unknown; each gets its own store.
     fn unnamed_positions(&self) -> Vec<(usize, usize)> {
         self.pinned_positions()
             .into_iter()
@@ -245,21 +194,18 @@ impl Ctx {
             .collect()
     }
 
-    /// The context-tuple index of the shared store, which sits after those own stores.
-    ///
-    /// Their number is known from the analysis, before any lowering asks for a store, which is what
-    /// keeps this index fixed.
+    /// Context-tuple index of the shared store, after the own stores.
     fn shared_slot(&self) -> syn::Index {
         syn::Index::from(self.context.len() + self.unnamed_positions().len())
     }
 
-    /// How many stores of their own the unnameable positions need, each initialised untyped.
+    /// Number of own stores.
     pub(super) fn own_store_count(&self) -> usize {
         self.unnamed_positions().len()
     }
 
-    /// The shared store's element types in variant order: the nameable pinned positions, then the
-    /// stores a lowering asked for. Empty when nothing is held, in which case no store is emitted.
+    /// Shared store element types in variant order: known pinned positions, then requested
+    /// stores. Empty means no shared store is emitted.
     pub(super) fn shared_elements(&self) -> Vec<TokenStream> {
         let mut out: Vec<TokenStream> = self
             .named_positions()
@@ -270,8 +216,7 @@ impl Ctx {
         out
     }
 
-    /// Where a value lent to a call travels: which variant of the shared store, or a store of this
-    /// position's own.
+    /// Where a value lent to a call is stored.
     pub(super) fn held_pin(&self, member: usize, position: usize) -> Held {
         match self.pin_element(member, position) {
             Some(_) => Held::Shared {
@@ -295,19 +240,15 @@ impl Ctx {
         }
     }
 
-    /// Reserve the shared store's variant for a borrowing loop's collection. The element type is
-    /// named here because `C` in `&mut C` settles before the closure body is checked.
+    /// Reserve a shared-store variant for a borrowing loop's collection.
     pub(super) fn held_loop(&self, loop_idx: usize, elem: TokenStream) -> Held {
         self.held_asked(StoreKey::Loop(loop_idx), elem)
     }
 
-    /// Reserve the variant a call site parks `root` in, so that it can lend a place inside it.
+    /// Reserve the shared-store variant a call site parks `root` in.
     ///
-    /// Keyed by the local, not by the call site: one site can be lowered more than once — the code
-    /// after a `#[cfg]`ed statement is lowered under the gate and again under its negation — and a
-    /// variant only one of those lowerings constructs is dead in the other configuration. Sharing
-    /// is safe: the store is a stack, so parking the same local again, in another branch or deeper
-    /// in the descent, stacks rather than clashes.
+    /// Keyed by local, not call site: a site may be lowered twice (under a `#[cfg]` and its
+    /// negation). Sharing is safe because the store is a stack.
     pub(super) fn held_root(&self, root: &Ident) -> Held {
         let member = self.current.get();
         let elem = self
@@ -347,7 +288,7 @@ impl Ctx {
         let rendered = ty.to_string();
         let mut map = self.local_types.borrow_mut();
         match map.get(&key) {
-            // Shadowed with a different type: neither annotation describes the slot on its own.
+            // Shadowed with a different type: no single annotation fits.
             Some(Some(seen)) if seen.to_string() != rendered => {
                 map.insert(key, None);
             }
@@ -358,12 +299,10 @@ impl Ctx {
         }
     }
 
-    /// Does this member own the value named by `e`, and say so with an annotation?
+    /// Whether `e` names an annotated, non-reference local of `member`.
     ///
-    /// Lending a place *inside* a local parks the local, so getting this wrong would park something
-    /// the code only borrows: `let args = &node.args; f(&args[i])` projects through a reference and
-    /// must stay a plain borrow. A whole-local lend has no such trap — a wrong guess there cannot
-    /// typecheck — so only this one asks for the annotation.
+    /// Required before lending a place inside a local (which parks it), so that e.g.
+    /// `let args = &node.args; f(&args[i])` stays a plain borrow.
     pub(super) fn owns_annotated_local(&self, member: usize, e: &syn::Expr) -> bool {
         let syn::Expr::Path(p) = e else { return false };
         let Some(name) = p.path.get_ident() else {
@@ -384,18 +323,14 @@ impl Ctx {
         }
     }
 
-    /// Does this member own the value named by `e`, as far as the macro can tell?
-    ///
-    /// A `let` of this body owns what it binds, so lending it needs the store. A reference is rooted
-    /// outside the driver and can be lent as it is, and so can a name this body does not bind — a
-    /// parameter, a `static`, an outer binding.
+    /// Whether `e` names a `let` binding of `member` that is not an annotated reference, so
+    /// lending it needs the store.
     pub(super) fn owns_named_local(&self, member: usize, e: &syn::Expr) -> bool {
         let syn::Expr::Path(p) = e else { return false };
         let Some(name) = p.path.get_ident() else {
             return false;
         };
         if self.param_type_of(member, name).is_some() {
-            // A parameter already travels in the payload; lend it as it is.
             return false;
         }
         let annotated_reference = self
@@ -419,11 +354,8 @@ impl Ctx {
         })
     }
 
-    /// The type the body binds a payload parameter to, if it is writable at all — not `impl Trait`.
-    ///
-    /// A pinned position has two types and this is the reference, not the `*const T`: the entry
-    /// payload holds the pointer and the arm rebinds the name, so a loop state or frame carrying the
-    /// name carries the rebinding. `emit::variant_payload_type` reads `pinned` for the pointer.
+    /// Declared type of a payload parameter, unless `impl Trait`. For a pinned position this
+    /// is the reference type, not the pointer.
     pub(super) fn param_type_of(&self, member: usize, name: &Ident) -> Option<TokenStream> {
         let member = &self.members[member];
         let j = member.param_names.iter().position(|p| p == name)?;
@@ -436,17 +368,14 @@ impl Ctx {
         self.param_type_of(self.current.get(), name)
     }
 
-    /// The context rebindings, in slot order. Emitted at the top of the body closure and of
-    /// every continuation: a continuation must re-derive its bindings from its *own* lent
-    /// context, never capture the enclosing one.
+    /// Context rebindings in slot order, emitted at the top of the body and every continuation.
     pub(super) fn ctx_prologue(&self) -> TokenStream {
         let binds = self.context.iter().enumerate().map(|(i, e)| e.rebind(i));
         quote! { #(#binds)* }
     }
 
-    /// Whether [`Self::ctx_prologue`] only rebinds names, with no slot reached through a raw
-    /// pointer. Such a prologue has no effect of its own, so a continuation that reads none of
-    /// the names can leave it out.
+    /// True if [`Self::ctx_prologue`] only rebinds names (no raw pointers), so an unused one can
+    /// be dropped.
     pub(super) fn ctx_prologue_only_rebinds(&self) -> bool {
         self.context.iter().all(|e| !e.raw.get())
     }
@@ -475,8 +404,7 @@ impl Ctx {
         self.loops.borrow_mut()[idx].code = body;
     }
 
-    /// How a resumed value is taken out of the union, if there is one. The callee is
-    /// known at the call site, so the variant is too.
+    /// Bind a resumed value, taking it out of the union if there is one.
     pub(super) fn unwrap_result(&self, callee: usize, v: &Ident) -> TokenStream {
         let bare = &self.ret_types[callee];
         if !bare.is_empty() {
@@ -525,10 +453,7 @@ impl Ctx {
         }
     }
 
-    /// The type of an expression the transform is about to bind to a temporary, where it can say:
-    /// a bare binding has the type its parameter or its annotated `let` gave it. Nothing else is
-    /// guessed. Used to keep a temporary's payload slot nameable, which is what a gated frame needs
-    /// -- there, inference has no construction to work from.
+    /// Type of `e` if it is a bare binding with a known type; nothing else is guessed.
     pub(super) fn type_of(&self, e: &syn::Expr) -> Option<TokenStream> {
         let syn::Expr::Path(p) = e else { return None };
         let name = p.path.get_ident()?;
@@ -547,13 +472,9 @@ impl Ctx {
         out
     }
 
-    /// Reserve a resume point for a recursive call; the code is filled in once the
-    /// continuation has been generated.
+    /// Reserve a resume point; its code is filled in later.
     ///
-    /// `hoistable` says the point has nothing to run before its code — no parked value to take
-    /// back, no store to release, no context pointer to restore — so a `?` at the front of it may
-    /// be lifted out. Anything that has to be torn down first must be reached on the error path
-    /// too, and a lifted check leaves before reaching it.
+    /// `hoistable`: nothing needs tearing down before its code, so its `?` may be hoisted.
     pub(super) fn reserve_resume(
         &self,
         scope: Vec<Ident>,
@@ -579,8 +500,8 @@ impl Ctx {
         resumes.len() - 1
     }
 
-    /// `v` is a resume point's value and that point may share its check: take the `?` off it, and
-    /// answer `true`. The point is the one still being generated, which its value names uniquely.
+    /// If the resume point still being generated for `v` is hoistable, mark its `?` hoisted
+    /// and return `true`.
     pub(super) fn mark_checked(&self, v: &TokenStream) -> bool {
         let name = v.to_string();
         let resumes = self.resumes.borrow();
@@ -596,9 +517,7 @@ impl Ctx {
         }
     }
 
-    /// The resumed value of a point whose check was lifted out holds the carrier's `Output`, not
-    /// the carrier. Recorded under the only name there is for it, since a payload slot carrying
-    /// that value onward may have to be named.
+    /// Record a hoisted point's value as the carrier's `Output` type.
     pub(super) fn note_unwrapped(&self, callee: usize, v: &Ident) {
         let bare = &self.ret_types[callee];
         if bare.is_empty() {
@@ -616,12 +535,8 @@ impl Ctx {
         self.resumes.borrow_mut()[idx].point.code = code;
     }
 
-    /// Give back the point reserved last, so a call in tail position leaves no trace of it.
-    ///
-    /// Answers whether it went, which the caller reads as "the tail form applies". It only does
-    /// when `idx` is still the last point — true exactly when the continuation reserved none of
-    /// its own, which is the case the caller has already established — and when nothing has been
-    /// written into it yet, so that no emitted code can be naming its marker.
+    /// Drop the last reserved resume point, for a tail call. Returns `false` unless `idx` is
+    /// last and has no code yet.
     pub(super) fn drop_last_resume(&self, idx: usize) -> bool {
         let mut resumes = self.resumes.borrow_mut();
         if resumes.len() != idx + 1 || !resumes[idx].point.code.is_empty() {
@@ -631,17 +546,15 @@ impl Ctx {
         true
     }
 
-    /// Which member this expression calls, if it is a call to one of them.
-    /// After `desugar_receiver`, a method's `self.walk(a)` has already become
-    /// `walk(a)`, so one shape covers both.
+    /// Callee index if `e` calls a member. Receivers are already desugared, so
+    /// `self.walk(a)` is `walk(a)` here.
     pub(super) fn rec_call<'e>(&self, e: &'e Expr) -> Option<(usize, &'e syn::ExprCall)> {
         let Expr::Call(call) = e else { return None };
         let Expr::Path(p) = &*call.func else {
             return None;
         };
         let segments = &p.path.segments;
-        // `self::g(..)` names this module's `g`, which is a member when the members are a module's
-        // functions. Where they are an impl block's, that path names a free function instead.
+        // `self::g(..)` names a member only when the members are module functions.
         let named = match segments.len() {
             1 => true,
             2 => !self.assoc && segments[0].ident == "self",
@@ -668,53 +581,42 @@ impl Ctx {
     }
 }
 
-/// A macro-level continuation: given tokens for the *value* produced at this
-/// point, produce tokens for a `__SsStep` expression.
+/// A macro-level continuation: given tokens for the value produced at this point, produce
+/// the tokens for the rest of the body.
 pub(super) type Cont<'a> = &'a dyn Fn(TokenStream) -> syn::Result<TokenStream>;
 
 /// The innermost lowered loop, for rewriting `break` / `continue`.
 pub(super) struct LoopCtx<'a> {
-    /// Index among the lowered loops, which names its state placeholder.
+    /// Index among lowered loops; names its state placeholder.
     pub(super) idx: usize,
-    /// Index of its entry *variant*: the members occupy the first ones, so
-    /// this is not `idx`. `continue` becomes a `Tail` to it.
+    /// Entry variant index (members come first); `continue` tail-enters it.
     pub(super) variant: usize,
     /// `break` runs the code that follows the loop.
     pub(super) brk: Cont<'a>,
-    /// What moves the iterator past the iteration just finished, run before re-entering the loop
-    /// at the end of the body and at every `continue`. Empty for a loop whose head does that
-    /// itself; see `cps::lower_loop` for the one whose head does not.
+    /// Advances the iterator before re-entering; empty if the loop head does it.
     pub(super) advance: TokenStream,
 }
 
 /// What the transform needs to know at each point in the walk.
 #[derive(Clone)]
 pub(super) struct Env<'a> {
-    /// Bindings in scope, in declaration order. Threading state through a loop
-    /// entry point is a move, so order must be stable.
+    /// Bindings in scope, in declaration order.
     pub(super) scope: Vec<Ident>,
     pub(super) lp: Option<&'a LoopCtx<'a>>,
-    /// Assignments that must run before any escape from here — `?`, `return`,
-    /// `break`, `continue`. Non-empty only while evaluating the arguments that
-    /// follow a swapped context slot: leaving without putting the parent's pointer
-    /// back would strand the slot pointing at the child.
+    /// Restores to run before any escape (`?`, `return`, `break`, `continue`), so a swapped
+    /// context slot gets the parent's pointer back.
     pub(super) restores: TokenStream,
-    /// Stores to truncate before `?` or `return` abandons the member. Not `continue`, which stays
-    /// in the loop; `break` releases through the continuation instead.
+    /// Store truncations to run before `?` or `return` (not `continue`; `break` releases via
+    /// the continuation).
     pub(super) teardown: TokenStream,
-    /// How this member's own result enters the union, when the group has one: the union
-    /// type and this member's variant. `return` and `?` finish the member from wherever
-    /// they stand, so they have to wrap the value just as a normal exit does.
+    /// Union type and this member's variant, for wrapping `return` / `?` values.
     pub(super) wrap: Option<(Ident, Ident)>,
-    /// Bindings in `scope` a payload need not carry, because the arm it arrives at can recompute
-    /// them. A binding that shadows one drops it: the name then means something else.
+    /// Bindings recomputable at the arrival arm; shadowing drops them.
     pub(super) derived: Vec<Derived>,
 }
 
 impl Env<'_> {
-    /// A value as this member's result: wrapped into the union if there is one. `return`
-    /// and `?` finish the member from wherever they stand, so they wrap just as a tail
-    /// expression does.
+    /// Wrap `v` into the union, if there is one.
     pub(super) fn wrapped(&self, v: TokenStream) -> TokenStream {
         match &self.wrap {
             None => v,
@@ -755,8 +657,7 @@ impl<'a> Env<'a> {
         }
     }
 
-    /// Evaluating an argument after a swap: an escape has to undo it first.
-    /// Add a truncation to run before `?` or `return` leaves the member.
+    /// Add a truncation to run before `?` or `return`.
     pub(super) fn with_teardown(&self, extra: TokenStream) -> Env<'a> {
         let mut teardown = self.teardown.clone();
         teardown.extend(extra);
@@ -774,11 +675,8 @@ impl<'a> Env<'a> {
     }
 }
 
-/// Where a value the driver holds travels.
-///
-/// One store holds them all, as variants of one enum, so that a descent allocates one chunked
-/// buffer however many shapes it parks. A position whose type cannot be named cannot be a variant,
-/// so it falls back to a store of its own.
+/// Where a driver-held value lives: a variant of the shared store, or its own store when
+/// its type cannot be named.
 #[derive(Clone)]
 pub(super) enum Held {
     Shared { slot: syn::Index, variant: usize },
@@ -802,12 +700,11 @@ impl Held {
     }
 }
 
-/// What a store or variant was reserved for, so that asking twice hands back the same one.
+/// What a store variant was reserved for, so repeated requests get the same one.
 #[derive(Clone, PartialEq, Eq)]
 pub(super) enum StoreKey {
     /// The collection a `for` loop borrows.
     Loop(usize),
-    /// The local a call site parks to lend a place inside it, as `(member, name)`. See
-    /// [`Ctx::held_root`] for why it is keyed by the local.
+    /// A local parked to lend a place inside it, as `(member, name)`. See [`Ctx::held_root`].
     Root(usize, String),
 }

@@ -1,8 +1,9 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Context parameters: references the driver owns and lends out, instead of
-//! letting them travel in the argument payload.
+//! Context parameters: references the driver owns and reborrows for each step instead of
+//! carrying them in the payload. Needed for `&mut` (two frames holding one `&mut` is E0505);
+//! `emit` also promotes shared references that every recursive call passes unchanged.
 
 use proc_macro2::{Ident, TokenStream};
 use quote::quote;
@@ -11,45 +12,24 @@ use syn::Expr;
 
 use super::names::ctx_param;
 
-// Context parameters
-//
-// A `&mut` parameter cannot travel in the argument payload: the payload is moved
-// into a continuation, so two live frames would hold the same `&mut` and
-// borrowck rejects it (E0505). Such a parameter instead becomes part of a
-// *context* tuple that the driver owns and lends out — one reborrow per body
-// invocation and per continuation resume, so nothing captures it.
-//
-// Shared (`&`) parameters are safe in the payload because they are `Copy`.
-// `emit` may nevertheless promote one to context when it proves that every
-// recursive edge passes the same binding, avoiding a repeated pointer in every
-// entry and continuation.
-// ---------------------------------------------------------------------------
-
 /// One parameter threaded through the driver rather than the payload.
 pub(super) struct CtxEntry {
-    /// What the body calls it. `__ss_self` for a receiver.
+    /// Name in the body (`__ss_self` for a receiver).
     pub(super) name: Ident,
     /// `&mut T` rather than `&T`.
     pub(super) mutable: bool,
-    /// The expression that fills this slot at the outer call site (`out`, `self`).
+    /// Initial value at the outer call (`out`, `self`).
     pub(super) init: TokenStream,
-    /// The slot's declared reference type, `&mut Tree` or `&Self`. The rebinding
-    /// names it rather than leaving it to inference: a raw slot is reached through
-    /// `&mut *ptr`, whose pointee inference can fail to resolve in an arm that
-    /// diverges — and then the user sees `type annotations needed` pointing at their
-    /// own code with no way to act on it.
+    /// Declared reference type (`&mut Tree`, `&Self`). Spelled out in [`Self::rebind`] because
+    /// inference can fail on `&mut *ptr` in a diverging arm.
     pub(super) ty: TokenStream,
-    /// Some recursive call passes a reference *derived* from a context parameter
-    /// here, so the slot holds a raw pointer: the derived pointer is swapped in
-    /// for the child subtree and the parent's is restored by its continuation.
-    /// Only reachable with `use_nonlinear_mut`; set by `scan_context_args`.
+    /// The slot holds a raw pointer, because a call passes a derived place here
+    /// (`use_nonlinear_mut`). Set by `analyze::scan_context_args`.
     pub(super) raw: Cell<bool>,
 }
 
 impl CtxEntry {
-    /// The expression that fills this slot, wrapped for a raw slot: that slot
-    /// holds a pointer, so it is initialised *from* the reference rather than
-    /// storing the reference itself.
+    /// Initial value, converted to a pointer for a raw slot.
     pub(super) fn init_expr(&self) -> TokenStream {
         let init = &self.init;
         match (self.raw.get(), self.mutable) {
@@ -59,25 +39,17 @@ impl CtxEntry {
         }
     }
 
-    /// `let name: &mut T = <reborrow of slot i>;` — emitted at the top of every arm,
-    /// so that no reborrow is ever carried in a frame.
+    /// `let name: T = <reborrow of slot i>;`, emitted at the top of every arm so no frame carries
+    /// a reborrow.
     pub(super) fn rebind(&self, i: usize) -> TokenStream {
         let (name, ctx, idx) = (&self.name, ctx_param(), syn::Index::from(i));
         let ty = &self.ty;
         match (self.raw.get(), self.mutable) {
-            // The deref of a raw pointer detaches the borrow, which is what lets
-            // a swap assign to the slot while this reborrow is still live.
-            //
-            // SAFETY: emitted into the caller's crate, so the invariant is ours. A raw
-            // slot is written only by `init_expr`, from a reference the original was
-            // already given, and by a recursive call swapping in a pointer derived from
-            // that same reference — which `analyze::scan_context_args` has checked is
-            // rooted at this context parameter. The continuation restores the parent's
-            // pointer before the parent's frame resumes, so the slot always names a
-            // place inside a borrow the outermost call still holds, and only one
-            // reborrow is live at a time, since no frame carries one. Gated behind
-            // `use_nonlinear_mut`; `tests/context.rs` covers it under both of Miri's
-            // aliasing models.
+            // SAFETY: a raw slot holds either the outer call's reference or a pointer derived
+            // from it (checked by `analyze::scan_context_args`), and the parent's pointer is
+            // restored before its frame resumes. So it always points into a borrow the outermost
+            // call holds, and only one reborrow is live at a time. Tested under Miri in
+            // `tests/context.rs`.
             (true, true) => quote! { let #name: #ty = unsafe { &mut *#ctx.#idx }; },
             (true, false) => quote! { let #name: #ty = unsafe { &*#ctx.#idx }; },
             (false, true) => quote! { let #name: #ty = &mut *#ctx.#idx; },
@@ -88,15 +60,13 @@ impl CtxEntry {
 
 /// What a recursive call passes for a context position.
 pub(super) enum CtxArg {
-    /// The context binding itself (`out`, `&mut *out`): the child shares the slot.
+    /// The binding itself (`out`, `&mut *out`): the child shares the slot.
     Same,
-    /// A place rooted at a context binding (`&mut t.kids[i]`): the slot has to be
-    /// swapped for the child and restored afterwards.
+    /// A place rooted at the binding (`&mut t.kids[i]`): swapped in for the child, then restored.
     Derived(Expr),
 }
 
-/// Classify the argument at a context position, or `None` if the transform
-/// cannot account for it.
+/// Classify an argument at a context position; `None` if unsupported.
 pub(super) fn classify_ctx_arg(arg: &Expr, entries: &[CtxEntry]) -> Option<CtxArg> {
     let is_ctx_name = |id: &Ident| entries.iter().any(|e| &e.name == id);
     match strip_parens(arg) {
@@ -104,9 +74,8 @@ pub(super) fn classify_ctx_arg(arg: &Expr, entries: &[CtxEntry]) -> Option<CtxAr
             is_ctx_name(&p.path.segments[0].ident).then_some(CtxArg::Same)
         }
         Expr::Reference(r) => {
-            // `&mut *out` is the same slot; anything else must be a place rooted
-            // at a context binding, whose target therefore outlives the call and
-            // does not move when frames move.
+            // `&mut *out` is the same slot; otherwise it must be a place rooted at a context
+            // binding.
             if let Expr::Unary(u) = strip_parens(&r.expr)
                 && matches!(u.op, syn::UnOp::Deref(_))
                 && let Expr::Path(p) = strip_parens(&u.expr)
@@ -124,9 +93,7 @@ pub(super) fn classify_ctx_arg(arg: &Expr, entries: &[CtxEntry]) -> Option<CtxAr
     }
 }
 
-/// A type with its parentheses and invisible groups stripped, so that `(&mut Vec<u64>)` is the
-/// `&mut` parameter it plainly is. One that slipped past the test below travelled in the payload
-/// instead of becoming a slot, and came out as an `E0505` blamed on the attribute.
+/// Strip parentheses and invisible groups from a type.
 pub(super) fn peel_type(ty: &syn::Type) -> &syn::Type {
     match ty {
         syn::Type::Paren(p) => peel_type(&p.elem),
@@ -135,23 +102,14 @@ pub(super) fn peel_type(ty: &syn::Type) -> &syn::Type {
     }
 }
 
-/// Does a parameter of this type become a context slot rather than payload?
-///
-/// Only a `&mut` does: a shared reference is `Copy` and an owned value moves, so the payload suits
-/// both. Asked of the peeled type, so parentheses do not change the answer.
-///
-/// A `&mut` behind a type alias (`type Out<'a> = &'a mut Vec<u64>`) cannot be seen in the tokens
-/// and is missed. Treating every unrecognised type as a slot would be far worse, so an alias has to
-/// be written out.
+/// Whether a parameter type is a syntactic `&mut` and so always a context slot. A `&mut` hidden
+/// behind a type alias is not detected.
 pub(super) fn is_context_slot(ty: &syn::Type) -> bool {
     matches!(peel_type(ty), syn::Type::Reference(r) if r.mutability.is_some())
 }
 
-/// A slot's type as the driver names it: parentheses peeled, named lifetimes erased.
-///
-/// It annotates a `let` in the driver, where the lifetime is inferred, and one spelling has to
-/// serve the whole group — so it must not name a lifetime only one member declares. `'static`
-/// stays: it is a requirement, not a name.
+/// A slot's type as the driver spells it: parentheses peeled and named lifetimes other than
+/// `'static` erased, so one spelling works for the whole group.
 pub(super) fn slot_type(ty: &syn::Type) -> syn::Type {
     struct V;
 
@@ -180,9 +138,7 @@ pub(super) fn slot_type(ty: &syn::Type) -> syn::Type {
     ty
 }
 
-/// What two members' slots are compared by: [`slot_type`], plus `Self` resolved where the caller
-/// knows the impl's type. So `&'a mut Vec<u64>` and `&mut Vec<u64>`, or `&mut Self` and `&mut S` in
-/// one impl, are not reported to the user as their own mistake.
+/// Key for comparing members' slots: [`slot_type`] with `Self` replaced by `self_ty`.
 pub(super) fn slot_key(ty: &syn::Type, self_ty: Option<&syn::Type>) -> syn::Type {
     struct V<'a> {
         self_ty: &'a syn::Type,
@@ -216,7 +172,7 @@ pub(super) fn strip_parens(e: &Expr) -> &Expr {
     }
 }
 
-/// The identifier a place expression is rooted at, if it is a place at all.
+/// The local a place expression is rooted at, if it is a place.
 pub(super) fn place_root(e: &Expr) -> Option<&Ident> {
     match strip_parens(e) {
         Expr::Path(p) if p.qself.is_none() && p.path.segments.len() == 1 => {

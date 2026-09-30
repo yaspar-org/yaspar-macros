@@ -1,89 +1,32 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Implementation of `#[stack_safe]` — rewrite a recursive function, or a whole cycle of
-//! mutually recursive ones, into an iterative state machine that keeps its frames on the
-//! heap, so recursion depth is bounded by available memory rather than by the native stack.
+//! Implementation of `#[stack_safe]`: rewrite recursive functions (or cycles of them) into
+//! an iterative state machine whose frames live on the heap.
 //!
-//! # The idea
+//! # Design
 //!
-//! CPS conversion. Every recursive call is split into
+//! - **CPS.** Each recursive call becomes a request to run the body on new arguments plus a
+//!   continuation for the rest. An inlined driver loop (see `driver`) keeps parked
+//!   continuations in a `Vec`.
+//! - **Frame enum.** Continuations are defunctionalized: one variant per call site, carrying
+//!   the locals live across the call (see [`loop_state::solve_payloads`]). Payload types are
+//!   left generic and inferred.
+//! - **Entry enum.** One variant for the function (`E0`) and one per loop that recurses. A loop
+//!   iteration re-enters the body at that entry without parking a frame, threading the
+//!   iterator by value.
+//!   `for i in a..b` steps the iterator at the end of each iteration, so `i` can be read back
+//!   out of it (see `walk::Derived`).
+//! - **Context.** `&mut` parameters (including `&mut self`, after
+//!   [`analyze::desugar_receiver`]) live in a tuple the driver owns and reborrows per step.
+//!   `use_nonlinear_mut` turns a slot into a raw pointer so derived places can be passed.
+//! - **Runtime.** The fixed parts (`Frames`, `push`, `Pin`, `Try` / `FromResidual`, range
+//!   helpers) live in `yaspar-macros-defs` and are imported under `__ss` names
+//!   (see [`names::defs_imports`]).
 //!
-//! 1. a *request* to evaluate the body on new arguments, and
-//! 2. a *continuation*: the rest of the body, as a closure taking the result.
-//!
-//! A driver loop keeps a `Vec` of parked frames and alternates between entering the
-//! body and resuming a frame. No native frame is pushed per level of recursion.
-//!
-//! # What is generated and what is not
-//!
-//! Only the parts that vary are generated: the entry enum, with a variant per entry
-//! point, and the frame enum, with a variant per call site. The rest is the same for
-//! every function and lives in `yaspar-macros-defs`, which the rewritten body imports
-//! once at its top: `Step` and `In` for the protocol, `drive` for the loop, `Pin` for the
-//! store behind `data_in_frame`, and `Try` / `FromResidual` for `?`. They are imported
-//! under `__ss` names, so an expansion reads the same as it did when they were emitted
-//! into it.
-//!
-//! # The frame enum
-//!
-//! The continuation is *defunctionalized*: each call site gets a variant of a frame
-//! enum carrying the locals live across that call, and the code after the call
-//! becomes an arm of the same `match`. The driver's stack is a plain `Vec` of those
-//! frames — no allocation per call, no dynamic dispatch.
-//!
-//! A proc macro cannot write the payload types down, but it does not have to: the
-//! enum is generic over them and inference fills them in from the construction
-//! sites, exactly as the entry enum has always done. What it *does* have to compute
-//! is liveness, which a boxed closure got for free from capture inference — see
-//! [`loop_state::solve_payloads`], which is the price of this encoding and where its
-//! sharp edges are.
-//!
-//! # Loops
-//!
-//! A loop body that recurses cannot be expressed as a single `FnOnce`
-//! continuation — resuming a loop needs a continuation that can run more than
-//! once. Making the frame `FnMut` and mutating a stored iterator in place is the
-//! obvious fix, but it does not work: an `FnMut` closure cannot move its captures
-//! out, so the loop's exhaustion branch could never hand the accumulator to the
-//! code after the loop.
-//!
-//! Instead, the driver's argument type becomes an enum of *entry points*: one for
-//! the function itself (`E0`) and one per lowered loop. A loop's state — its
-//! iterator plus the locals live across it — travels in that entry's payload, and
-//! one iteration is a `Tail` step: re-enter the body at the loop's entry point
-//! without pushing a frame. So the iterator does live in the frame, as intended;
-//! it is threaded by value instead of mutated in place, which needs no `unsafe`.
-//!
-//! The locals to thread are found syntactically: the transform tracks which
-//! bindings are in scope, and intersects that with the identifiers appearing in
-//! the generated entry-point code (see [`loop_state::solve_payloads`]).
-//!
-//! A `for i in a..b` is the common case and gets one refinement: its iterator is
-//! stepped at the end of each iteration rather than the start, so for the whole
-//! body it still holds `i` as its `start`, and a frame pushed from the body
-//! carries the iterator alone and reads `i` back out of it (see `walk::Derived`).
-//!
-//! # `&mut` parameters and methods
-//!
-//! A `&mut` parameter cannot ride in the argument payload: the payload is moved
-//! into a continuation, so two live frames would hold the same `&mut` (E0505).
-//! Such a parameter becomes part of a *context* tuple that the driver owns and
-//! lends out, one reborrow per body invocation and per continuation resume. Nothing
-//! captures it, so nothing has to be unsafe. Shared references stay in the payload;
-//! they are `Copy`.
-//!
-//! A method needs no rule of its own. `self` is desugared away first: the receiver
-//! becomes an ordinary first parameter of a generated associated function and the
-//! method forwards to it, so `&mut self` is simply a `&mut` parameter and `&self` a
-//! shared one (see [`analyze::desugar_receiver`]).
-//!
-//! The context is shared down the whole recursion, so a recursive call must pass
-//! the same reference. Recursing into a place *derived* from it
-//! (`walk(&mut t.kids[i])`) needs the slot swapped for the child's subtree and
-//! restored afterwards, which a `&mut` cannot express — hence
-//! `#[stack_safe(use_nonlinear_mut)]`, under which such a slot holds a raw
-//! pointer. See `README.md` for the invariant that opt-in asks of the caller.
+//! Modules: `scan` / `scope` parse the annotated item, `group` finds cycles, `analyze` checks
+//! and classifies, `walk` / `cps` / `loop_state` transform bodies, `emit` / `driver` / `leaf` /
+//! `context` / `names` / `try_shim` generate output.
 
 use proc_macro2::{Ident, TokenStream, TokenTree};
 use syn::spanned::Spanned;
@@ -102,28 +45,15 @@ mod scope;
 mod try_shim;
 mod walk;
 
-/// Entry point for the one attribute, whichever kind of item it is on.
-///
-/// A function is rewritten on its own. A module or an impl block is a *container*: every
-/// function inside that recurses, alone or through the others, is rewritten, and the rest
-/// pass through. One attribute serves both because the container case is what mutual
-/// recursion needs — expanding `f` requires `g`'s body — and a single function is just a
+/// Expand `#[stack_safe]` on a function, module, or impl block. A function is treated as a
 /// container of one.
 pub fn expand_attr(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> {
     already_expanded(&item)?;
     scan::Scope::parse(item)?.expand_annotated(Opts::parse(attr)?)
 }
 
-/// Refuse an item this attribute has already rewritten.
-///
-/// A marker under a renaming import (`use yaspar_macros::stack_safe as ss;` then `#[ss]`) is not
-/// recognised as ours, so it is left in place and the compiler runs us again on the rewritten body.
-/// Everything we generate is `__ss`-prefixed, which the user's own names may not be, so such a name
-/// in the input means exactly that.
-///
-/// The prefix is looked for in the name Rust *resolves*, not in the spelling: `r#__ss_v0` is the
-/// same identifier as `__ss_v0`, so a raw spelling that slipped past this check used to collide
-/// silently with the first temporary the transform mints, and the body read the wrong binding.
+/// Reject input containing a reserved `__ss` / `__Ss` name (raw spellings included). This
+/// catches re-expansion through an aliased marker (`#[ss]`) and user names that would clash.
 fn already_expanded(item: &TokenStream) -> syn::Result<()> {
     fn generated(tokens: TokenStream) -> Option<Ident> {
         fn reserved(id: &Ident) -> bool {
@@ -169,21 +99,19 @@ fn already_expanded(item: &TokenStream) -> syn::Result<()> {
 /// `#[stack_safe(..)]` flags.
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Opts {
-    /// Allow a recursive call to pass a reference *derived* from a context
-    /// parameter (`walk(&mut t.kids[i])`). `analyze::scan_context_args` decides
-    /// which slots that forces onto a raw pointer, by setting `CtxEntry::raw`.
+    /// Allow passing a place derived from a context parameter (`walk(&mut t.kids[i])`).
+    /// `analyze::scan_context_args` sets `CtxEntry::raw` on the affected slots.
     pub(super) use_nonlinear_mut: bool,
-    /// Allow a recursive call to pass a reference to a value built *at the call
-    /// site* (`rec(n, &Node::Cons(v, rest))`). The value is boxed and owned by the
-    /// frame, and the callee reaches it through a raw pointer, since the caller's
-    /// frame no longer exists by the time the callee runs.
+    /// Allow passing a reference to a value built at the call site
+    /// (`rec(n, &Node::Cons(v, rest))`). The value is stored by the driver and reached through
+    /// a raw pointer.
     pub(super) data_in_frame: bool,
 }
 
-/// Every option there is, in the order an error message lists them.
+/// All options, in error-message order.
 const FLAGS: [&str; 2] = ["use_nonlinear_mut", "data_in_frame"];
 
-/// An option we do not have, naming the nearest one we do — a typo is the usual reason to be here.
+/// Error for an unknown option, suggesting the nearest valid one.
 fn unknown_flag(path: &syn::Path) -> syn::Error {
     let written = path
         .get_ident()
@@ -202,12 +130,11 @@ fn unknown_flag(path: &syn::Path) -> syn::Error {
     )
 }
 
-/// The option this was most likely meant to be. Levenshtein distance bounded at a third of the
-/// option's length, so `data_in_fram` gets a suggestion and `keep_frames` does not.
+/// Closest option by Levenshtein distance, within a third of its length.
 fn nearest(written: &str) -> Option<&'static str> {
     fn distance(a: &str, b: &str) -> usize {
         let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
-        // One row of the matrix at a time: `row[j]` is the distance from `a[..i]` to `b[..j]`.
+        // `row[j]` is the distance from `a[..i]` to `b[..j]`.
         let mut row: Vec<usize> = (0..=b.len()).collect();
         for (i, ca) in a.iter().enumerate() {
             let mut prev = row[0];
@@ -231,11 +158,7 @@ fn nearest(written: &str) -> Option<&'static str> {
 }
 
 impl Opts {
-    /// The options as written between the parentheses.
-    ///
-    /// Parsed as `Meta` rather than as bare identifiers so that a value given to a flag is parsed
-    /// and then rejected by name; otherwise `#[stack_safe(data_in_frame = true)]` gets `expected ,`
-    /// pointing at the `=`, which mentions neither the option nor the attribute.
+    /// Parse the attribute arguments. Parsed as `Meta` so `flag = value` gets a named error.
     pub(super) fn parse(attr: TokenStream) -> syn::Result<Self> {
         let mut opts = Opts::default();
         if attr.is_empty() {
@@ -272,14 +195,8 @@ impl Opts {
         Ok(opts)
     }
 
-    /// Is this attribute this very one?
-    ///
-    /// Recognised by its *last* segment, since a macro resolves no paths: `#[stack_safe]`,
-    /// `#[yaspar_macros::stack_safe]`, `#[ym::stack_safe]` and `#[crate::stack_safe]` all lead here,
-    /// and demanding a particular prefix only leaves the rest in the output to expand a second time.
-    /// The price is reading somebody else's attribute of the same name as ours, which the name is
-    /// specific enough to make the better trade. An *alias* (`#[ss]`) ties back to nothing and is
-    /// caught after the fact, by [`already_expanded`].
+    /// Whether `attr` is `#[stack_safe]`, matched by last path segment. Aliases are caught later
+    /// by [`already_expanded`].
     pub(super) fn is_marker(attr: &syn::Attribute) -> bool {
         attr.path()
             .segments
@@ -287,16 +204,8 @@ impl Opts {
             .is_some_and(|last| last.ident == "stack_safe")
     }
 
-    /// Take an item's own `#[stack_safe]`, leaving its other attributes, and read what it
-    /// asked for. `Some` therefore means the marker was written by hand — which is worth
-    /// knowing, since one that turns out to cover no recursion is a mistake.
-    ///
-    /// A marker inside a scope the attribute already covers asks for options rather than for an
-    /// expansion of its own, so it is removed: left in place it would expand a second time, on a
-    /// function with nothing left to rewrite.
-    ///
-    /// Over the attributes rather than a function, since a nested `mod` or `impl` carries a marker
-    /// for its own subtree exactly as a `fn` does.
+    /// Remove any `#[stack_safe]` markers from `attrs` and return their merged options, or
+    /// `None` if there were none.
     pub(super) fn take_from(attrs: &mut Vec<syn::Attribute>) -> syn::Result<Option<Self>> {
         let mut found: Option<Self> = None;
         let prev_attrs = std::mem::take(attrs);
@@ -327,7 +236,7 @@ impl Opts {
         Ok(found)
     }
 
-    /// The options as written, for an error message that has to name them.
+    /// The enabled options, for error messages.
     pub(super) fn flags(self) -> String {
         let mut names = Vec::new();
         if self.use_nonlinear_mut {
@@ -343,7 +252,7 @@ impl Opts {
         }
     }
 
-    /// Both sets of options, since a group obeys every option any member asked for.
+    /// Union of both option sets.
     pub(super) fn merge(self, other: Self) -> Self {
         Opts {
             use_nonlinear_mut: self.use_nonlinear_mut || other.use_nonlinear_mut,

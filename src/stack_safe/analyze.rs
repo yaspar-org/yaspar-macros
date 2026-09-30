@@ -1,9 +1,8 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The passes that run before any code is generated: normalising a method's
-//! `self`, deciding which context slots need a raw pointer, and rejecting what
-//! the transform cannot rewrite.
+//! Pre-generation passes: normalise methods and parameters, mark pinned payloads and raw
+//! context slots, and reject what the transform cannot rewrite.
 
 use proc_macro2::{Ident, Span, TokenStream, TokenTree};
 use quote::format_ident;
@@ -21,44 +20,16 @@ use super::walk::Ctx;
 // Method normalisation
 // ---------------------------------------------------------------------------
 
-/// What a method is split into, so that the transform never sees a receiver.
+/// A method split into a forwarding wrapper and a receiver-free function.
 pub(super) struct MethodSplit {
-    /// The method as the caller still sees it, its body reduced to one call.
+    /// The original method, now forwarding to `inner`.
     pub(super) outer: ItemFn,
-    /// The name to emit the transformed body under, beside the method.
+    /// Name of the associated function holding the transformed body.
     pub(super) inner: Ident,
 }
 
-/// Turn a method into a plain function of its receiver, plus a wrapper.
-///
-/// `self` is not special to the transform; it is special only to Rust's syntax. So a
-/// method is rewritten into an associated function whose first parameter is an
-/// ordinary `&Self` or `&mut Self`, and the method itself keeps its signature and
-/// forwards to it:
-///
-/// ```text
-/// fn len(&self) -> usize { .. tail.len() .. }
-///
-///   ->  fn len(&self) -> usize { Self::__ss_impl_len(self) }          // the wrapper
-///       fn __ss_impl_len(__ss_self: &Self) -> usize { .. len(&tail) .. } // transformed
-/// ```
-///
-/// Everything downstream then applies its usual rules: a `&Self` parameter is `Copy`
-/// and may travel in the payload, so the callee may be a *different* value of the same
-/// type, as in `tail.len()`. When every recursive edge passes the same shared receiver,
-/// `emit` can instead promote it to driver context. A `&mut Self` parameter always
-/// becomes a context slot, exactly as a `&mut` parameter of a free function does, so
-/// recursing into a place derived from it needs `use_nonlinear_mut` — the same rule,
-/// stated once.
-///
-/// The inner function must be an associated one rather than nested in the wrapper,
-/// because a nested `fn` cannot name `Self` (`E0401`).
-/// Rewrite each `impl Trait` parameter into a generic parameter with the same bounds.
-///
-/// Argument-position `impl Trait` *is* a generic parameter, so naming it turns a type the
-/// transform could not write down — and therefore could not use to pin a payload slot — into one
-/// it can. Callers are unaffected: the two forms differ only in that a named parameter can be
-/// given by turbofish.
+/// Turn each `impl Trait` parameter into a named generic with the same bounds, so its type can be
+/// written down.
 pub(super) fn desugar_apit(func: &mut ItemFn) {
     let mut fresh = 0usize;
     for arg in func.sig.inputs.iter_mut() {
@@ -83,6 +54,17 @@ pub(super) fn desugar_apit(func: &mut ItemFn) {
     }
 }
 
+/// Turn a `&self` / `&mut self` method into an associated function taking `__ss_self`,
+/// returning the wrapper that forwards to it (`None` for a non-method). Also runs
+/// `rewrite_self_calls`.
+///
+/// ```text
+/// fn len(&self) -> usize { .. tail.len() .. }
+///   ->  fn len(&self) -> usize { Self::__ss_impl_len(self) }
+///       fn __ss_impl_len(__ss_self: &Self) -> usize { .. len(&tail) .. }
+/// ```
+///
+/// The inner function is associated, not nested, because a nested `fn` cannot name `Self`.
 pub(super) fn desugar_receiver(
     func: &mut ItemFn,
     group: &[Ident],
@@ -115,7 +97,7 @@ pub(super) fn desugar_receiver(
         return Ok(None);
     };
 
-    // The wrapper forwards every parameter by name, so each one has to have a name.
+    // The wrapper forwards by name.
     let mut forwarded: Vec<Ident> = Vec::new();
     for arg in func.sig.inputs.iter().skip(1) {
         let syn::FnArg::Typed(pt) = arg else { continue };
@@ -133,8 +115,6 @@ pub(super) fn desugar_receiver(
     let receiver_ty: syn::Type = parse_quote! { & #lifetime #mutability Self };
     let inner = format_ident!("__ss_impl_{}", func.sig.ident);
 
-    // The wrapper keeps the method's own attributes and visibility: it is the item the
-    // outside world still sees.
     let mut outer = ItemFn {
         attrs: std::mem::take(&mut func.attrs),
         vis: func.vis.clone(),
@@ -143,10 +123,7 @@ pub(super) fn desugar_receiver(
         block: parse_quote! { { Self::#inner(self #(, #forwarded)*) } },
     };
     outer.attrs.push(parse_quote! { #[inline] });
-    // `#[track_caller]` has to hold all the way down, not just on the item the caller sees:
-    // `Location::caller()` runs in the transformed body, and an untracked frame anywhere between
-    // reports *that* frame instead of the caller's. So the wrapper keeps it and the body gets its
-    // own copy; `emit` puts one on a shared machine for the same reason.
+    // `#[track_caller]` must cover every frame down to the body.
     if outer
         .attrs
         .iter()
@@ -156,31 +133,18 @@ pub(super) fn desugar_receiver(
     }
     func.vis = syn::Visibility::Inherited;
 
-    // The receiver is now the first ordinary parameter.
     let rest: Vec<syn::FnArg> = func.sig.inputs.iter().skip(1).cloned().collect();
     func.sig.inputs = parse_quote! { #receiver: #receiver_ty #(, #rest)* };
 
     Ok(Some(MethodSplit { outer, inner }))
 }
 
-/// Put method-form recursion into the plain-call form the rest of the transform
-/// understands, and rename every `self` to a binding that can be re-bound.
-///
-/// `tail.len()` becomes `len(&tail)` and `Self::len(tail)` becomes `len(tail)`, so the
-/// receiver is simply the first argument. These names are only ever *recognised*: a
-/// call the transform recognises turns into an entry into the driver, so nothing is
-/// emitted that would have to resolve.
-///
-/// The reference is added because method syntax auto-refs and plain-call syntax does
-/// not: `self.kids[i].bump()` has to become `bump(&mut self.kids[i])`. A receiver that
-/// is already a reference simply gains a layer, which coerces away at the argument.
-/// `self` itself is passed as it stands, so that a `&mut` receiver still reads as the
-/// *same* slot rather than one derived from it.
+/// Rewrite group calls to plain-call form (`x.f(..)` -> `f(&x, ..)`, `Self::f(..)` -> `f(..)`)
+/// and rename `self` to `__ss_self`. `self` itself is passed unchanged, so a `&mut` receiver
+/// stays the same context slot rather than a derived one.
 fn rewrite_self_calls(func: &mut ItemFn, group: &[Ident], receiver_is_mut: bool) {
     struct V<'a> {
-        /// Every member of the group, not just this function: a method's body calls
-        /// its partners through `self` too, and those are entries into the same
-        /// driver.
+        /// Every member of the group.
         group: &'a [Ident],
         receiver_is_mut: bool,
     }
@@ -191,8 +155,7 @@ fn rewrite_self_calls(func: &mut ItemFn, group: &[Ident], receiver_is_mut: bool)
     }
 
     impl VisitMut for V<'_> {
-        // Top-down: the recursive call is recognised before its `self` receiver
-        // is renamed out from under the check.
+        // Top-down, so a call is matched before its `self` receiver is renamed.
         fn visit_expr_mut(&mut self, e: &mut Expr) {
             match e {
                 Expr::MethodCall(m) if self.group.contains(&m.method) => {
@@ -209,7 +172,6 @@ fn rewrite_self_calls(func: &mut ItemFn, group: &[Ident], receiver_is_mut: bool)
                     *e = parse_quote! { #name(#recv #(, #args)*) };
                 }
                 Expr::Call(c) => {
-                    // `Self::walk(x, ..)`, the explicit form of the above.
                     if let Expr::Path(p) = &*c.func {
                         let segs = &p.path.segments;
                         let name = segs.last().map(|s| s.ident.clone());
@@ -250,17 +212,8 @@ fn rewrite_self_calls(func: &mut ItemFn, group: &[Ident], receiver_is_mut: bool)
 // Which payload positions carry pinned data
 // ---------------------------------------------------------------------------
 
-/// Is this argument a reference to a value built right here?
-///
-/// Only shapes that plainly construct at run time. A `&` of a literal or a constant is
-/// promoted to `'static` and needs nothing.
-/// Rewrite every call to one of these functions into a call to its renamed twin.
-///
-/// Used to keep a checked-only copy of a body self-consistent: inside `f_orig`, a call to `g`
-/// becomes a call to `g_orig`, so what the borrow checker sees is the original program throughout
-/// rather than a mixture. Every shape a recursive call can take is covered — `g(..)`,
-/// `self::g(..)`, `Self::g(..)` and `x.g(..)` — and unlike the scan this *does* descend into
-/// nested items, since a function declared in the body is part of the same original.
+/// Rename calls (`g(..)`, `self::g(..)`, `Self::g(..)`, `x.g(..)`) per `renames`, including in
+/// nested items. Used to keep a checked-only copy of the original calling other originals.
 pub(super) fn rename_calls(func: &mut ItemFn, renames: &HashMap<String, Ident>) {
     struct V<'a> {
         renames: &'a HashMap<String, Ident>,
@@ -301,22 +254,13 @@ pub(super) fn rename_calls(func: &mut ItemFn, renames: &HashMap<String, Ident>) 
     V { renames }.visit_item_fn_mut(func);
 }
 
-/// What a call lends the callee, when the argument is `&<something the caller owns>`.
-///
-/// Either way the value has to outlive a call that becomes a `return`, so it goes into the driver's
-/// store. What differs is what the store takes: a value the caller owns outright is moved in, while a
-/// place inside a local means the *local* is parked and handed back when the frame resumes, since the
-/// code after the call usually still wants the rest of it.
+/// A reference argument whose target must outlive the call (which becomes a `return`) and so
+/// goes into the driver's store.
 pub(super) enum Lend<'e> {
-    /// `&Node::Cons(..)`, `&t.child(i)`, `&case`: the value itself moves into the store.
+    /// `&Node::Cons(..)`, `&t.child(i)`, `&local`: the value moves into the store.
     Whole(&'e Expr),
-    /// `&def.body`, `&xs[i]`: the local is parked, and the pointer is to the place inside it.
-    Place {
-        /// The local to park.
-        root: Ident,
-        /// The place to point at, rooted at that local.
-        place: &'e Expr,
-    },
+    /// `&local.f`, `&local[i]`: `root` is parked and the pointer targets `place` inside it.
+    Place { root: Ident, place: &'e Expr },
 }
 
 /// The value a call lends the callee, if it lends one.
@@ -342,13 +286,8 @@ pub(super) fn borrows_a_built_value<'e>(
     })
 }
 
-/// The local a lent *place* is rooted at, when a call passes `&<local>.f`, `&<local>[i]` and the
-/// like and that local is one this member owns.
-///
-/// Only a whole local can move into the driver's store, so a place inside one is a rejection rather
-/// than a case to handle: moving the local would take the rest of it away from the code after the
-/// call, which is usually why the place was written in the first place. A place rooted at a
-/// parameter, or at a local holding a reference, is rooted outside the driver and needs no store.
+/// For `&<local>.f`, `&<local>[i]`, `&*<local>` and the like, where `<local>` is owned by this
+/// member: the borrowed place and its root local.
 fn lent_place_root<'e>(ctx: &Ctx, member: usize, arg: &'e Expr) -> Option<(&'e Expr, &'e Ident)> {
     let Expr::Reference(r) = strip_parens(arg) else {
         return None;
@@ -379,17 +318,8 @@ fn lent_place_root<'e>(ctx: &Ctx, member: usize, arg: &'e Expr) -> Option<(&'e E
     }
 }
 
-/// Mark every payload position some call passes a freshly built value's reference to.
-///
-/// Natively the temporary in `rec(n, &Node::Cons(v, rest))` lives to the end of the
-/// enclosing statement, which spans the call. The transform turns that call into a
-/// *return*, so the temporary would be gone before the callee ran. Under
-/// `data_in_frame` the value is moved into the driver's pinned store instead, which
-/// keeps it at a fixed address until the frame that owns it is popped, and the callee
-/// reaches it through a raw pointer.
-///
-/// Without the flag this is a hard error rather than an `E0515` blamed on the
-/// attribute.
+/// Mark payload positions that some call passes a [`Lend`] to, so `emit` moves the value into
+/// the pinned store. Without `data_in_frame` this is an error.
 pub(super) fn scan_pinned_args(ctx: &Ctx, block: &Block) -> syn::Result<()> {
     struct V<'a> {
         ctx: &'a Ctx,
@@ -444,13 +374,9 @@ pub(super) fn scan_pinned_args(ctx: &Ctx, block: &Block) -> syn::Result<()> {
 // Which context slots need a raw pointer
 // ---------------------------------------------------------------------------
 
-/// Check every recursive call's arguments at context positions, and mark the
-/// slots that a call passes a *derived* reference to.
-///
-/// A derived reference (`walk(&mut t.kids[i])`) means the child works on a
-/// different place than its parent, so the slot cannot simply be shared: the
-/// pointer has to be swapped for the child's subtree and restored afterwards.
-/// A `&mut` cannot be parked like that — hence a raw pointer, hence the opt-in.
+/// Check context-slot arguments of recursive calls. A derived reference such as
+/// `walk(&mut t.kids[i])` marks the slot raw (a pointer parked for the child's subtree); it
+/// requires `use_nonlinear_mut`.
 pub(super) fn scan_context_args(ctx: &Ctx, block: &Block) -> syn::Result<()> {
     struct V<'a> {
         ctx: &'a Ctx,
@@ -469,9 +395,7 @@ pub(super) fn scan_context_args(ctx: &Ctx, block: &Block) -> syn::Result<()> {
         fn visit_expr(&mut self, e: &'ast Expr) {
             if let Some((callee, call)) = self.ctx.rec_call(e) {
                 let callee = self.ctx.member(callee);
-                // A mismatched arity has already been reported by `validate`, which
-                // runs first; the slot-to-position mapping is meaningless here, so
-                // there is nothing more worth saying about such a call.
+                // Wrong arity was already reported by `validate`.
                 if call.args.len() == callee.arity {
                     for (i, arg) in call.args.iter().enumerate() {
                         let Some(&slot) = callee.context_at.get(&i) else {
@@ -481,10 +405,8 @@ pub(super) fn scan_context_args(ctx: &Ctx, block: &Block) -> syn::Result<()> {
                         match classify_ctx_arg(arg, &self.ctx.context) {
                             Some(CtxArg::Same) => {}
                             Some(CtxArg::Derived(place)) => {
-                                // The place is spliced into `ptr::from_mut(..)`
-                                // verbatim, so a recursive call inside it would be
-                                // left to recurse on the native stack — silently
-                                // defeating the whole transform.
+                                // The place is spliced verbatim, so a call inside
+                                // it would recurse natively.
                                 if contains_rec(self.ctx, &place) {
                                     self.fail(
                                         place.span(),
@@ -547,31 +469,7 @@ pub(super) fn scan_context_args(ctx: &Ctx, block: &Block) -> syn::Result<()> {
     }
 }
 
-/// A binding that shadows an outer one which is read again *after* the shadow.
-///
-/// A frame's payload is chosen and rebuilt by *name*: the transform records the names in scope at a
-/// call and carries the ones the continuation mentions. Two bindings of one name are therefore one
-/// slot, and the slot holds the inner one — so where the source left the inner scope and went back
-/// to the outer binding, the resumed code would still read the inner value.
-///
-/// Three things have to hold, and the third is what keeps this from refusing ordinary code.
-/// Shadowing has to be *inside* a nested block: a `let x` at the top of the body shadows for the
-/// rest of it, which is what the payload does too. The block has to *recurse*, or the code after is
-/// not cut into another arm at all. And the outer binding has to be read *after* that block, since
-/// only then do the two ever have to be told apart — which is the whole of `let item = item + 1`
-/// inside a loop, the idiom that must keep working.
-///
-/// "After the block" is found by walking the body in order and counting only what follows the
-/// shadowing block, wherever it sits. That covers both the later statements and the rest of the
-/// *same* statement — `{ let x = ..; rec(); x } + x` diverges as plainly as the statement-level
-/// shape does — while a mention *before* the block, or the pattern that binds the outer name in the
-/// first place, is not a read the inner slot could answer and does not count.
-/// Is `name` mentioned anywhere in `body` *after* the block `at`, without descending into it?
-///
-/// The walk is in source order, so "after" is what follows once `at` has been passed — later
-/// statements of any enclosing block, and the rest of the statement `at` sits in. Mentions inside
-/// `at` are the inner binding's own and are skipped with it; mentions before it read the outer
-/// binding at a point no payload has reached yet.
+/// Whether `name` appears in `body` after block `at` (not inside it), in source order.
 fn read_after_block(body: &Block, at: &Block, name: &Ident) -> bool {
     struct V<'a> {
         at: *const Block,
@@ -606,13 +504,13 @@ fn read_after_block(body: &Block, at: &Block, name: &Ident) -> bool {
     v.found
 }
 
+/// Reject a `let` in a nested, recursing block that shadows an outer binding read after that
+/// block. Payload slots are keyed by name, so the resumed code would read the inner value.
 pub(super) fn reject_shadowed_across_a_call(ctx: &Ctx, func: &ItemFn) -> syn::Result<()> {
     struct W<'a> {
         ctx: &'a Ctx,
-        /// One set of names per scope: the parameters, then the body, then each block inside it.
+        /// Bindings per scope: parameters, body, then nested blocks.
         scopes: Vec<Vec<Ident>>,
-        /// The body being walked, so that a candidate can be checked against everything that
-        /// follows the block it was found in.
         body: &'a Block,
         err: Option<syn::Error>,
     }
@@ -662,8 +560,7 @@ pub(super) fn reject_shadowed_across_a_call(ctx: &Ctx, func: &ItemFn) -> syn::Re
             self.scopes.pop();
         }
 
-        /// Down into whatever blocks a statement holds, keeping the scope stack honest for the
-        /// bindings a `for`, a `match` arm or a closure introduces around one.
+        /// Recurse into blocks, scoping `for`, `match` arm, and closure bindings.
         fn walk_stmt(&mut self, stmt: &Stmt) {
             struct V<'a, 'b>(&'a mut W<'b>);
 
@@ -732,11 +629,11 @@ pub(super) fn reject_shadowed_across_a_call(ctx: &Ctx, func: &ItemFn) -> syn::Re
 // Validation
 // ---------------------------------------------------------------------------
 
+/// Reject calls and bindings the transform would silently get wrong.
 pub(super) fn validate(ctx: &Ctx, func: &ItemFn) -> syn::Result<()> {
     struct V<'a> {
         ctx: &'a Ctx,
-        /// The enclosing function's own generic parameters, by name. A turbofish on a recursive
-        /// call may restate these and nothing else; see `check_generic_args`.
+        /// Type and const generics of the enclosing function.
         own_generics: Vec<String>,
         err: Option<syn::Error>,
     }
@@ -748,13 +645,8 @@ pub(super) fn validate(ctx: &Ctx, func: &ItemFn) -> syn::Result<()> {
             }
         }
 
-        /// Explicit generic arguments on a recursive call.
-        ///
-        /// The rewritten body is one loop, compiled for the instantiation it was entered at, and a
-        /// transition re-enters *that* body. So `f::<A>` calling `f::<B>` is a call to a different
-        /// function, which the transform cannot make: it would silently run the caller's
-        /// instantiation instead. A turbofish that merely restates the enclosing function's own
-        /// parameters names the same instantiation and is fine.
+        /// Reject a turbofish other than the function's own parameters: every recursive call
+        /// re-enters the same instantiation.
         fn check_generic_args(&mut self, call: &syn::ExprCall) {
             let Expr::Path(p) = &*call.func else { return };
             let Some(seg) = p.path.segments.last() else {
@@ -764,7 +656,6 @@ pub(super) fn validate(ctx: &Ctx, func: &ItemFn) -> syn::Result<()> {
                 return;
             };
             let restates_own = args.args.iter().all(|a| match a {
-                // A lifetime argument cannot change which instantiation runs.
                 syn::GenericArgument::Lifetime(_) => true,
                 syn::GenericArgument::Type(syn::Type::Path(t)) => t
                     .path
@@ -794,11 +685,7 @@ pub(super) fn validate(ctx: &Ctx, func: &ItemFn) -> syn::Result<()> {
             }
         }
 
-        /// A binding whose name is a member's.
-        ///
-        /// A call is recognised by name — a macro resolves no paths — so a value binding that
-        /// shadows the function cannot be told apart from a call to it. Left alone, the shadowed
-        /// call is rewritten into a recursion, which is a wrong answer with no diagnostic.
+        /// Reject a binding named like a member: calls are matched by name.
         fn check_shadowing(&mut self, pat: &Pat) {
             for bound in pat_bindings(pat) {
                 if self.ctx.index_of(&bound).is_some() {
@@ -816,22 +703,13 @@ pub(super) fn validate(ctx: &Ctx, func: &ItemFn) -> syn::Result<()> {
             }
         }
 
-        /// An item declared in a block that goes on to recurse.
-        ///
-        /// The code after a recursive call becomes a separate arm of the driver's `match`, and an
-        /// item declared in a *block* cannot travel there: continuation state carries values, not
-        /// declarations. The name would resolve to whatever the enclosing scope has instead — an
-        /// outer `const` of the same name, say. A body's own top-level items are fine: those are
-        /// moved out to one place that encloses every arm.
+        /// Reject an item declared in a block before a recursive call: the continuation is a
+        /// separate `match` arm, where the item is out of scope.
         fn check_block_items(&mut self, block: &Block) {
             let mut seen: Option<Span> = None;
             for stmt in &block.stmts {
                 if let Stmt::Item(item) = stmt {
-                    // A member declared in a block is not at risk: it is moved into the driver,
-                    // where every arm can reach it. Nor is anything the transform itself put
-                    // there — a member already lifted out leaves tokens behind, which is what
-                    // `Verbatim` is here. Anything else stays where it was emitted, and the code
-                    // after a call is emitted somewhere else.
+                    // Members are moved into the driver; `Verbatim` and macro items are exempt.
                     let ours = match item {
                         syn::Item::Fn(f) => self.ctx.index_of(&f.sig.ident).is_some(),
                         syn::Item::Verbatim(_) | syn::Item::Macro(_) => true,
@@ -923,11 +801,7 @@ pub(super) fn validate(ctx: &Ctx, func: &ItemFn) -> syn::Result<()> {
             self.check_macro(&m.mac, m.span());
         }
 
-        // A macro in *statement* position (`println!("{}", f(n - 1));`) is
-        // `Stmt::Macro`, not `Expr::Macro`, so it needs its own visit. Missing it
-        // meant the call was left untouched — `contains_rec` does not look inside
-        // macro tokens either, so the whole statement was spliced in as a leaf and
-        // recursed on the native stack, silently.
+        // Statement-position macros are `Stmt::Macro`, not `Expr::Macro`.
         fn visit_stmt_macro(&mut self, m: &'ast syn::StmtMacro) {
             self.check_macro(&m.mac, m.span());
         }
@@ -966,8 +840,7 @@ pub(super) fn validate(ctx: &Ctx, func: &ItemFn) -> syn::Result<()> {
         own_generics,
         err: None,
     };
-    // The body's own top-level items are moved out to enclose every arm, so only the blocks
-    // *inside* it are checked for a declaration a continuation would lose.
+    // Skip the body's own block: its top-level items are moved out to enclose every arm.
     for stmt in &func.block.stmts {
         v.visit_stmt(stmt);
     }
@@ -977,6 +850,7 @@ pub(super) fn validate(ctx: &Ctx, func: &ItemFn) -> syn::Result<()> {
     }
 }
 
+/// Whether `name` appears anywhere in `ts`.
 pub(super) fn tokens_mention(ts: &TokenStream, name: &Ident) -> bool {
     ts.clone().into_iter().any(|t| match t {
         TokenTree::Ident(i) => i == *name,
@@ -985,6 +859,7 @@ pub(super) fn tokens_mention(ts: &TokenStream, name: &Ident) -> bool {
     })
 }
 
+/// Whether `e` contains a recursive call, outside nested items.
 pub(super) fn contains_rec(ctx: &Ctx, e: &Expr) -> bool {
     struct V<'a> {
         ctx: &'a Ctx,
@@ -1005,6 +880,7 @@ pub(super) fn contains_rec(ctx: &Ctx, e: &Expr) -> bool {
     v.found
 }
 
+/// Whether `s` contains a recursive call; a macro counts if it mentions a member.
 pub(super) fn stmt_contains_rec(ctx: &Ctx, s: &Stmt) -> bool {
     match s {
         Stmt::Local(l) => l.init.as_ref().is_some_and(|i| {
@@ -1019,11 +895,8 @@ pub(super) fn stmt_contains_rec(ctx: &Ctx, s: &Stmt) -> bool {
     }
 }
 
-/// Bindings introduced by a pattern.
-///
-/// `syn` parses a unit-variant path such as `None` as `Pat::Ident`, so this
-/// applies the usual convention and only treats lowercase-initial identifiers as
-/// bindings. Threading a variant name as if it were a value would not compile.
+/// Bindings introduced by a pattern. Only identifiers starting lowercase or `_` count, since
+/// `syn` parses unit variants like `None` as `Pat::Ident`.
 pub(super) fn pat_bindings(pat: &Pat) -> Vec<Ident> {
     struct V(Vec<Ident>);
     impl<'ast> Visit<'ast> for V {
@@ -1040,14 +913,8 @@ pub(super) fn pat_bindings(pat: &Pat) -> Vec<Ident> {
     v.0
 }
 
-/// Reject a payload parameter whose type is generic in the member that declares it, where another
-/// member of the cycle calls that member without declaring the same parameter.
-///
-/// A group shares one driver, so a generic parameter has one instantiation for the whole group: the
-/// driver's caller picks it, and the body must hold for every choice. A call from a member that
-/// does not carry that parameter can only be passing some concrete type, which is the one thing the
-/// rigid parameter cannot be. Left to rustc it is an `E0308` between the payload slot and the
-/// argument, reported against the attribute.
+/// Reject a generic payload parameter when a group member lacking that generic calls its owner:
+/// the shared driver has one instantiation, so the caller can't pass a concrete type.
 pub(super) fn reject_generic_payload(ctx: &Ctx, funcs: &[ItemFn]) -> syn::Result<()> {
     fn type_params(func: &ItemFn) -> Vec<Ident> {
         func.sig
@@ -1079,7 +946,7 @@ pub(super) fn reject_generic_payload(ctx: &Ctx, funcs: &[ItemFn]) -> syn::Result
         v.found
     }
 
-    /// Which members each member calls.
+    /// Members called anywhere in `block`.
     fn callees(ctx: &Ctx, block: &Block) -> Vec<usize> {
         struct V<'a> {
             ctx: &'a Ctx,
@@ -1108,7 +975,7 @@ pub(super) fn reject_generic_payload(ctx: &Ctx, funcs: &[ItemFn]) -> syn::Result
         }
         for arg in &callee.sig.inputs {
             let syn::FnArg::Typed(pt) = arg else { continue };
-            // A `&mut` parameter is lent by the driver rather than carried, so it is not a slot.
+            // `&mut` parameters are context, not payload.
             if matches!(&*pt.ty, syn::Type::Reference(r) if r.mutability.is_some()) {
                 continue;
             }
@@ -1122,8 +989,7 @@ pub(super) fn reject_generic_payload(ctx: &Ctx, funcs: &[ItemFn]) -> syn::Result
                 if type_params(caller).iter().any(|g| g == generic) {
                     continue;
                 }
-                // `desugar_apit` names an `impl Trait` parameter for its own use; the user
-                // never wrote that name, so describe the parameter as they spelled it.
+                // Don't show the name `desugar_apit` invented.
                 let what = match generic.to_string().starts_with("__SsApit") {
                     true => "is an `impl Trait` parameter".to_string(),
                     false => format!("is generic in `{generic}`"),
@@ -1148,20 +1014,12 @@ pub(super) fn reject_generic_payload(ctx: &Ctx, funcs: &[ItemFn]) -> syn::Result
 // Parameter normalisation
 // ---------------------------------------------------------------------------
 
-/// Name every payload parameter that destructures, re-binding the pattern at the top of the body.
-///
-/// The expansion rebuilds the argument tuple as an *expression*, which a pattern cannot be, so a
-/// parameter needs a name — but only the expansion does, so `f((a, b): (u64, u64))` becomes
-/// `f(__ss_arg0: (u64, u64))` with `let (a, b): (u64, u64) = __ss_arg0;` prepended. The type is
-/// repeated on the `let` so nothing is left to inference.
-///
-/// A `&mut` parameter is a context slot the driver lends out rather than a value the body holds, so
-/// there is nothing to take apart; it keeps a rejection of its own.
+/// Replace each destructuring parameter with `__ss_argN` and prepend `let <pat>: <ty> = __ss_argN;`.
+/// Rejects destructuring a `&mut` parameter.
 pub(super) fn desugar_param_patterns(func: &mut ItemFn) -> syn::Result<()> {
     let mut lets: Vec<Stmt> = Vec::new();
     for (i, arg) in func.sig.inputs.iter_mut().enumerate() {
         let syn::FnArg::Typed(pt) = arg else { continue };
-        // A plain `x` or `mut x` is already a name; everything else is a pattern.
         if matches!(
             &*pt.pat,
             Pat::Ident(PatIdent {
@@ -1186,20 +1044,14 @@ pub(super) fn desugar_param_patterns(func: &mut ItemFn) -> syn::Result<()> {
         lets.push(parse_quote! { let #pat: #ty = #name; });
         *pt.pat = parse_quote! { #name };
     }
-    // Prepended in order, so the bindings arrive in the order the parameters were written.
     for stmt in lets.into_iter().rev() {
         func.block.stmts.insert(0, stmt);
     }
     Ok(())
 }
 
-/// Does this body assign to `name` itself, rather than through it?
-///
-/// Asked of a `mut` binding on a `&mut` parameter, which becomes a context slot every step
-/// re-derives: reassigning the binding would be invisible to the next step, while writing through
-/// it (`*out = ..`, `out.push(..)`) is the ordinary use. Only this body is looked at — an
-/// assignment in a nested item is that item's own — and a shadowing local of the same name counts,
-/// which errs towards the rejection.
+/// Whether `block` reassigns `name` itself (`name = ..`, `name += ..`), not through it. Nested
+/// items are skipped; a shadowing local counts.
 pub(super) fn assigns_binding(block: &Block, name: &Ident) -> bool {
     struct V<'a> {
         name: &'a Ident,
@@ -1207,7 +1059,6 @@ pub(super) fn assigns_binding(block: &Block, name: &Ident) -> bool {
     }
 
     impl V<'_> {
-        /// Is this the bare binding, as opposed to a place reached through it?
         fn is_binding(&self, e: &Expr) -> bool {
             matches!(strip_parens(e), Expr::Path(p)
                 if p.qself.is_none()
@@ -1224,7 +1075,6 @@ pub(super) fn assigns_binding(block: &Block, name: &Ident) -> bool {
             syn::visit::visit_expr_assign(self, a);
         }
 
-        // A compound assignment is a `Expr::Binary` with an assigning operator.
         fn visit_expr_binary(&mut self, b: &'ast syn::ExprBinary) {
             let assigns = matches!(
                 b.op,
