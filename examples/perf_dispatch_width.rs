@@ -274,10 +274,7 @@ fn hand3_generic(root: &E) -> R {
             match frames.pop() {
                 None => return val,
                 Some(f) => {
-                    let mut v = match val {
-                        Ok(v) => v,
-                        Err(e) => return Err(e),
-                    };
+                    let mut v = val?;
                     match f {
                         GFrame::R0(()) => {
                             v.1[0] ^= v.0.len() as u64;
@@ -334,10 +331,7 @@ fn ladder1_one_loop(root: &E) -> R {
                 }
             },
             L1In::Resume(f, r) => {
-                let mut v = match r {
-                    Ok(v) => v,
-                    Err(e) => return Err(e),
-                };
+                let mut v = r?;
                 match f {
                     GFrame::R0(()) => {
                         v.1[0] ^= v.0.len() as u64;
@@ -386,10 +380,7 @@ fn ladder2_step_protocol(root: &E) -> R {
                 }
             },
             L1In::Resume(f, r) => {
-                let mut v = match r {
-                    Ok(v) => v,
-                    Err(e) => return Err(e),
-                };
+                let mut v = r?;
                 match f {
                     GFrame::R0(()) => {
                         v.1[0] ^= v.0.len() as u64;
@@ -449,10 +440,7 @@ fn ladder3_tuple_payloads(root: &E) -> R {
                 }
             },
             L3In::Resume(f, r) => {
-                let mut v = match r {
-                    Ok(v) => v,
-                    Err(e) => return Err(e),
-                };
+                let mut v = r?;
                 match f {
                     TFrame::R0(()) => {
                         v.1[0] ^= v.0.len() as u64;
@@ -555,10 +543,7 @@ fn ladder3b_transition_first(root: &E) -> R {
                 }
             },
             L3In::Resume(f, r) => {
-                let mut v = match r {
-                    Ok(v) => v,
-                    Err(e) => return Err(e),
-                };
+                let mut v = r?;
                 match f {
                     TFrame::R0(()) => {
                         v.1[0] ^= v.0.len() as u64;
