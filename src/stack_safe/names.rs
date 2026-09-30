@@ -166,9 +166,9 @@ pub(super) fn machine_fn(members: &[Ident]) -> Ident {
     format_ident!("__ss_machine_{}", group_name(members))
 }
 
-/// The unmodified copy of a function kept for the borrow checker under a raw-pointer option.
-pub(super) fn original(name: &Ident) -> Ident {
-    format_ident!("__ss_orig_{}", name)
+/// The unmodified copy of a function kept so the compiler still checks the original.
+pub(super) fn original(name: &Ident, suffix: &str) -> Ident {
+    format_ident!("{}{}", name, suffix)
 }
 
 /// The lifetime the seed enum gives every reference parameter.

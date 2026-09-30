@@ -19,6 +19,7 @@ use super::Opts;
 use super::analyze::rename_calls;
 use super::emit::expand_group;
 use super::names;
+use super::try_shim;
 use super::{group, scope};
 
 /// The scope handed to the scan.
@@ -42,9 +43,9 @@ struct Roots<'a> {
 pub(super) struct Scanned {
     /// Per root, its replacement, or `None` if left as written.
     pub(super) rewritten: Vec<Option<TokenStream>>,
-    /// Per root, an uncalled copy named `<name>_orig`, emitted for cycles using an unsafe option
-    /// so the borrow checker still checks the original. See [`originals`].
-    pub(super) originals: Vec<Option<TokenStream>>,
+    /// Per root, an uncalled copy named `<name><original_suffix>`, emitted for every root a cycle
+    /// touches so the compiler still checks the original recursion. See [`originals`].
+    pub(super) originals: Vec<Option<ItemFn>>,
     /// Items to emit beside the container, e.g. a group of methods' seed enum (an impl block
     /// cannot hold an enum).
     pub(super) hoisted: Vec<TokenStream>,
@@ -153,7 +154,7 @@ impl Scope {
         let opts = own_opts.unwrap_or(opts);
         let scanned = expand_roots(Roots {
             funcs,
-            opts,
+            opts: opts.clone(),
             self_ty: host.self_ty(),
             host_name: host.host_name(),
             assoc: host.assoc(),
@@ -256,8 +257,8 @@ impl Host {
     }
 }
 
-/// Uncalled copies of the roots flagged in `wants_check`, as written, so the borrow checker
-/// still checks the original program under an unsafe option.
+/// Uncalled copies of the roots flagged in `wants_check`, as written, so the compiler still
+/// checks the original, stack-based program.
 ///
 /// The copies call each other, not the rewritten functions. Names defined more than once in
 /// the scope are not renamed, since resolving them would be a guess.
@@ -265,14 +266,19 @@ fn originals(
     as_written: &[ItemFn],
     defs: &[scope::Def],
     wants_check: &[bool],
-) -> Vec<Option<TokenStream>> {
-    let renames: HashMap<String, Ident> = as_written
-        .iter()
-        .enumerate()
-        .filter(|&(i, _)| wants_check[i])
-        .map(|(_, func)| &func.sig.ident)
-        .filter(|name| defs.iter().filter(|d| &d.name == *name).count() == 1)
-        .map(|name| (name.to_string(), names::original(name)))
+) -> Vec<Option<ItemFn>> {
+    // Roots come first in `defs`, in order.
+    let original =
+        |i: usize| names::original(&as_written[i].sig.ident, defs[i].opts.original_suffix());
+    let renames: HashMap<String, Ident> = (0..as_written.len())
+        .filter(|&i| wants_check[i])
+        .filter(|&i| {
+            defs.iter()
+                .filter(|d| d.name == as_written[i].sig.ident)
+                .count()
+                == 1
+        })
+        .map(|i| (as_written[i].sig.ident.to_string(), original(i)))
         .collect();
 
     as_written
@@ -282,15 +288,14 @@ fn originals(
             if !wants_check[i] {
                 return None;
             }
+            // Keeps the original's visibility, so it is reachable (and re-exported) alike.
             let mut copy = func.clone();
-            copy.vis = syn::Visibility::Inherited;
-            copy.sig.ident = names::original(&func.sig.ident);
+            copy.sig.ident = original(i);
             rename_calls(&mut copy, &renames);
+            try_shim::desugar(&mut copy);
             // Only hard errors matter here; warnings are already reported against the original.
-            Some(quote! {
-                #[allow(warnings)]
-                #copy
-            })
+            copy.attrs.insert(0, syn::parse_quote!(#[allow(warnings)]));
+            Some(copy)
         })
         .collect()
 }
@@ -299,9 +304,9 @@ fn originals(
 /// agree; a mismatch is reported against the differing member.
 fn agreed_opts(defs: &[scope::Def], cycle: &[usize]) -> syn::Result<Opts> {
     let (&host, rest) = cycle.split_first().expect("a cycle has a member");
-    let opts = defs[host].opts;
+    let opts = defs[host].opts.clone();
     for &member in rest {
-        if defs[member].opts != opts {
+        if !defs[member].opts.same_rewrite(&opts) {
             return Err(syn::Error::new(
                 defs[member].name.span(),
                 format!(
@@ -338,14 +343,14 @@ fn expand_nested_containers(func: &mut ItemFn, opts: Opts) -> syn::Result<bool> 
                     let mut inner = inner.clone();
                     let own = Opts::take_from(&mut inner.attrs)?;
                     Scope::of_mod(inner)?
-                        .expand(own.unwrap_or(self.opts), false)
+                        .expand(own.unwrap_or_else(|| self.opts.clone()), false)
                         .map(Some)
                 }
                 syn::Item::Impl(inner) => {
                     let mut inner = inner.clone();
                     let own = Opts::take_from(&mut inner.attrs)?;
                     Scope::of_impl(inner)?
-                        .expand(own.unwrap_or(self.opts), false)
+                        .expand(own.unwrap_or_else(|| self.opts.clone()), false)
                         .map(Some)
                 }
                 _ => Ok(None),
@@ -439,7 +444,7 @@ fn expand_roots(roots: Roots<'_>) -> syn::Result<Scanned> {
     // Expand containers in bodies first; they are separate scopes.
     let mut changed = vec![false; roots.len()];
     for (i, root) in roots.iter_mut().enumerate() {
-        changed[i] = expand_nested_containers(root, scope_opts)?;
+        changed[i] = expand_nested_containers(root, scope_opts.clone())?;
     }
     // Definitions in declaration order, markers removed, with the options in force at each.
     let defs = scope::collect(&mut roots, scope_opts)?;
@@ -482,15 +487,8 @@ fn expand_roots(roots: Roots<'_>) -> syn::Result<Scanned> {
         }
     }
 
-    // Copies of the roots as written, only needed if an unsafe option is in use.
-    let checkable = defs
-        .iter()
-        .any(|d| d.opts.use_nonlinear_mut || d.opts.data_in_frame);
-    let as_written: Vec<ItemFn> = if checkable {
-        roots.to_vec()
-    } else {
-        Vec::new()
-    };
+    // Copies of the roots as written.
+    let as_written: Vec<ItemFn> = roots.to_vec();
     let mut wants_check = vec![false; roots.len()];
 
     let mut out = Scanned {
@@ -541,11 +539,9 @@ fn expand_roots(roots: Roots<'_>) -> syn::Result<Scanned> {
         }
 
         let cycle_opts = agreed_opts(&defs, &cycle)?;
-        if cycle_opts.use_nonlinear_mut || cycle_opts.data_in_frame {
-            // Check every root this cycle touches.
-            for &j in &cycle {
-                wants_check[defs[j].owner] = true;
-            }
+        // Check every root this cycle touches.
+        for &j in &cycle {
+            wants_check[defs[j].owner] = true;
         }
         // `Self` is nameable in an arm only for a cycle among the impl block's own functions.
         let self_ty = if depth == 0 { self_ty } else { None };
@@ -580,8 +576,6 @@ fn expand_roots(roots: Roots<'_>) -> syn::Result<Scanned> {
             out.rewritten[i] = Some(root.to_token_stream());
         }
     }
-    if checkable {
-        out.originals = originals(&as_written, &defs, &wants_check);
-    }
+    out.originals = originals(&as_written, &defs, &wants_check);
     Ok(out)
 }

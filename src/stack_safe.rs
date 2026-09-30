@@ -97,7 +97,7 @@ fn already_expanded(item: &TokenStream) -> syn::Result<()> {
 }
 
 /// `#[stack_safe(..)]` flags.
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Clone, PartialEq, Eq)]
 pub(super) struct Opts {
     /// Allow passing a place derived from a context parameter (`walk(&mut t.kids[i])`).
     /// `analyze::scan_context_args` sets `CtxEntry::raw` on the affected slots.
@@ -106,10 +106,16 @@ pub(super) struct Opts {
     /// (`rec(n, &Node::Cons(v, rest))`). The value is stored by the driver and reached through
     /// a raw pointer.
     pub(super) data_in_frame: bool,
+    /// Appended to a root's name to name its uncalled copy as written (see
+    /// `scan::originals`). `None` means [`DEFAULT_ORIGINAL_SUFFIX`].
+    pub(super) original_suffix: Option<String>,
 }
 
+/// The suffix of an original's copy when `original_suffix` is not given.
+const DEFAULT_ORIGINAL_SUFFIX: &str = "_orig";
+
 /// All options, in error-message order.
-const FLAGS: [&str; 2] = ["use_nonlinear_mut", "data_in_frame"];
+const FLAGS: [&str; 3] = ["use_nonlinear_mut", "data_in_frame", "original_suffix"];
 
 /// Error for an unknown option, suggesting the nearest valid one.
 fn unknown_flag(path: &syn::Path) -> syn::Error {
@@ -124,8 +130,9 @@ fn unknown_flag(path: &syn::Path) -> syn::Error {
     syn::Error::new(
         path.span(),
         format!(
-            "unknown `#[stack_safe]` option `{written}`; the options are `{}` and `{}`{hint}",
-            FLAGS[0], FLAGS[1],
+            "unknown `#[stack_safe]` option `{written}`; the options are `{}`, `{}` and \
+             `{}`{hint}",
+            FLAGS[0], FLAGS[1], FLAGS[2],
         ),
     )
 }
@@ -173,6 +180,10 @@ impl Opts {
             let Some(name) = path.get_ident().map(Ident::to_string) else {
                 return Err(unknown_flag(path));
             };
+            if name == "original_suffix" {
+                opts.parse_original_suffix(meta)?;
+                continue;
+            }
             let flag = match name.as_str() {
                 "use_nonlinear_mut" => &mut opts.use_nonlinear_mut,
                 "data_in_frame" => &mut opts.data_in_frame,
@@ -193,6 +204,60 @@ impl Opts {
             *flag = true;
         }
         Ok(opts)
+    }
+
+    /// Parse `original_suffix = "..."`, which must extend any identifier to another.
+    fn parse_original_suffix(&mut self, meta: &syn::Meta) -> syn::Result<()> {
+        let usage = "`original_suffix` takes a string: write \
+                     `#[stack_safe(original_suffix = \"_orig\")]`";
+        let syn::Meta::NameValue(nv) = meta else {
+            return Err(syn::Error::new(meta.span(), usage));
+        };
+        let syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(lit),
+            ..
+        }) = &nv.value
+        else {
+            return Err(syn::Error::new(nv.value.span(), usage));
+        };
+        if self.original_suffix.is_some() {
+            return Err(syn::Error::new(
+                nv.path.span(),
+                "`original_suffix` is given twice; give it once",
+            ));
+        }
+        let suffix = lit.value();
+        if suffix.is_empty() {
+            return Err(syn::Error::new(
+                lit.span(),
+                "`original_suffix` cannot be empty: the copy would take the function's own name",
+            ));
+        }
+        if syn::parse_str::<Ident>(&format!("f{suffix}")).is_err() {
+            return Err(syn::Error::new(
+                lit.span(),
+                format!(
+                    "`original_suffix` must be made of identifier characters, so that \
+                     `f{suffix}` names a function; `{suffix}` is not"
+                ),
+            ));
+        }
+        self.original_suffix = Some(suffix);
+        Ok(())
+    }
+
+    /// The suffix naming an original's copy.
+    pub(super) fn original_suffix(&self) -> &str {
+        self.original_suffix
+            .as_deref()
+            .unwrap_or(DEFAULT_ORIGINAL_SUFFIX)
+    }
+
+    /// Whether the options that change the rewrite agree. `original_suffix` only names the
+    /// copy, so cycle members may differ in it.
+    pub(super) fn same_rewrite(&self, other: &Self) -> bool {
+        self.use_nonlinear_mut == other.use_nonlinear_mut
+            && self.data_in_frame == other.data_in_frame
     }
 
     /// Whether `attr` is `#[stack_safe]`, matched by last path segment. Aliases are caught later
@@ -237,7 +302,7 @@ impl Opts {
     }
 
     /// The enabled options, for error messages.
-    pub(super) fn flags(self) -> String {
+    pub(super) fn flags(&self) -> String {
         let mut names = Vec::new();
         if self.use_nonlinear_mut {
             names.push("use_nonlinear_mut");
@@ -252,11 +317,12 @@ impl Opts {
         }
     }
 
-    /// Union of both option sets.
+    /// Union of both option sets; a later `original_suffix` wins.
     pub(super) fn merge(self, other: Self) -> Self {
         Opts {
             use_nonlinear_mut: self.use_nonlinear_mut || other.use_nonlinear_mut,
             data_in_frame: self.data_in_frame || other.data_in_frame,
+            original_suffix: other.original_suffix.or(self.original_suffix),
         }
     }
 }

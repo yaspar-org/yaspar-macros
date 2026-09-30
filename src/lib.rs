@@ -63,6 +63,10 @@ mod stack_safe;
 ///   `walk(&mut t.kids[i])`.
 /// - `data_in_frame`: allow passing a reference to a value built at the call site, e.g.
 ///   `rec(&Node::Cons(v, rest))`. The callee must not return or keep that reference.
+/// - `original_suffix = "..."`: the suffix naming each rewritten function's copy as written
+///   (default `"_orig"`). The copy, `f_orig` for `f`, has `f`'s visibility (and is re-exported
+///   with it) and still recurses on the native stack; it is kept so the compiler checks the
+///   original program too.
 ///
 /// Options can go on a container or on individual functions inside it; the innermost wins.
 ///

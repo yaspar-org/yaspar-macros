@@ -28,7 +28,7 @@ error[E0382]: borrow of moved value: `v`
    |                                          |
    |                                          value moved here
    |
-note: consider changing this parameter type in function `__ss_orig_moved` to borrow instead if owning the value isn't necessary
+note: consider changing this parameter type in function `moved_orig` to borrow instead if owning the value isn't necessary
   --> tests/ui/original_moved.rs:14:38
    |
 14 | fn moved(n: usize, c: &Chain<'_>, v: Vec<u64>) -> usize {

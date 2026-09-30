@@ -1,0 +1,29 @@
+error: `original_suffix` must be made of identifier characters, so that `f-orig` names a function; `-orig` is not
+ --> tests/ui/original_suffix_invalid.rs:6:32
+  |
+6 | #[stack_safe(original_suffix = "-orig")]
+  |                                ^^^^^^^
+
+error: `original_suffix` cannot be empty: the copy would take the function's own name
+  --> tests/ui/original_suffix_invalid.rs:11:32
+   |
+11 | #[stack_safe(original_suffix = "")]
+   |                                ^^
+
+error: `original_suffix` takes a string: write `#[stack_safe(original_suffix = "_orig")]`
+  --> tests/ui/original_suffix_invalid.rs:16:14
+   |
+16 | #[stack_safe(original_suffix)]
+   |              ^^^^^^^^^^^^^^^
+
+error: `original_suffix` takes a string: write `#[stack_safe(original_suffix = "_orig")]`
+  --> tests/ui/original_suffix_invalid.rs:21:32
+   |
+21 | #[stack_safe(original_suffix = 1)]
+   |                                ^
+
+error: `original_suffix` is given twice; give it once
+  --> tests/ui/original_suffix_invalid.rs:26:38
+   |
+26 | #[stack_safe(original_suffix = "_a", original_suffix = "_b")]
+   |                                      ^^^^^^^^^^^^^^^
