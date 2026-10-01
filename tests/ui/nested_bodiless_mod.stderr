@@ -1,11 +1,3 @@
-error[E0658]: file modules in proc macro input are unstable
-  --> tests/ui/nested_bodiless_mod.rs:10:5
-   |
-10 |     pub mod sub;
-   |     ^^^^^^^^^^^^
-   |
-   = note: see issue #54727 <https://github.com/rust-lang/rust/issues/54727> for more information
-
 error[E0583]: file not found for module `sub`
   --> tests/ui/nested_bodiless_mod.rs:10:5
    |
