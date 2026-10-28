@@ -1026,3 +1026,144 @@ fn wide_range_loop_is_flat() {
     });
     assert_eq!(got, n as u64 + 1 + (n as u64 / 2));
 }
+
+// ---------------------------------------------------------------------------
+// A loop entered only after a call. Its state is first built in a resume arm, so the driver
+// must write that arm first, or the loop variable's type is not yet inferred where the body
+// matches on it, and the match binds by value.
+// ---------------------------------------------------------------------------
+
+enum Shape {
+    Leaf(u64),
+    Node(Box<Shape>, Vec<Shape>),
+}
+
+impl Shape {
+    /// `depth` nodes, each with a leaf head and a tail of one leaf and the next node.
+    fn spine(depth: usize) -> Shape {
+        let mut s = Shape::Leaf(1);
+        for _ in 0..depth {
+            s = Shape::Node(Box::new(Shape::Leaf(1)), vec![Shape::Leaf(1), s]);
+        }
+        s
+    }
+}
+
+impl Drop for Shape {
+    // Iterative, so dropping a deep spine does not overflow.
+    fn drop(&mut self) {
+        let mut stack = Vec::new();
+        if let Shape::Node(head, tail) = self {
+            stack.push(std::mem::replace(&mut **head, Shape::Leaf(0)));
+            stack.append(tail);
+        }
+        while let Some(mut s) = stack.pop() {
+            if let Shape::Node(head, tail) = &mut s {
+                stack.push(std::mem::replace(&mut **head, Shape::Leaf(0)));
+                stack.append(tail);
+            }
+        }
+    }
+}
+
+/// The loop variable is matched before the call in the body.
+#[stack_safe]
+fn shape_sum(s: &Shape) -> u64 {
+    match s {
+        Shape::Leaf(v) => *v,
+        Shape::Node(head, tail) => {
+            let mut acc = shape_sum(head);
+            for t in tail {
+                match t {
+                    Shape::Leaf(v) => acc += *v,
+                    Shape::Node(..) => acc += shape_sum(t),
+                }
+            }
+            acc
+        }
+    }
+}
+
+/// The loop variable is matched after the call in the body: that resume arm's frame is first
+/// built in the loop's arm, which is itself first built in a resume arm.
+#[stack_safe]
+fn shape_weighted(s: &Shape) -> u64 {
+    match s {
+        Shape::Leaf(v) => *v,
+        Shape::Node(head, tail) => {
+            let mut acc = shape_weighted(head);
+            for t in tail {
+                let r = shape_weighted(t);
+                match t {
+                    Shape::Leaf(v) => acc += *v + r,
+                    Shape::Node(..) => acc += 2 * r,
+                }
+            }
+            acc
+        }
+    }
+}
+
+/// As [`shape_sum`], with every call under `?`, so frames share one carrier check.
+#[stack_safe]
+fn shape_checked(s: &Shape, limit: u64) -> Result<u64, u64> {
+    match s {
+        Shape::Leaf(v) => Ok(*v),
+        Shape::Node(head, tail) => {
+            let mut acc = shape_checked(head, limit)?;
+            for t in tail {
+                match t {
+                    Shape::Leaf(v) => acc += *v,
+                    Shape::Node(..) => acc += shape_checked(t, limit)?,
+                }
+                if acc > limit {
+                    return Err(acc);
+                }
+            }
+            Ok(acc)
+        }
+    }
+}
+
+fn shape_weighted_naive(s: &Shape) -> u64 {
+    match s {
+        Shape::Leaf(v) => *v,
+        Shape::Node(head, tail) => {
+            let mut acc = shape_weighted_naive(head);
+            for t in tail {
+                let r = shape_weighted_naive(t);
+                match t {
+                    Shape::Leaf(v) => acc += *v + r,
+                    Shape::Node(..) => acc += 2 * r,
+                }
+            }
+            acc
+        }
+    }
+}
+
+#[test]
+fn loop_entered_after_a_call_matches_by_reference() {
+    for depth in 0..12 {
+        let s = Shape::spine(depth);
+        assert_eq!(shape_sum(&s), 2 * depth as u64 + 1, "depth {depth}");
+        assert_eq!(
+            shape_weighted(&s),
+            shape_weighted_naive(&s),
+            "depth {depth}"
+        );
+        assert_eq!(shape_checked(&s, u64::MAX), Ok(2 * depth as u64 + 1));
+    }
+    // Bottom-up the nodes sum to 3, 5, 7, ...: 7 is the first over the limit.
+    assert_eq!(shape_checked(&Shape::spine(10), 5), Err(7));
+}
+
+#[test]
+fn loop_entered_after_a_call_is_flat() {
+    let depth = 200_000;
+    let got = on_tiny_stack(move || {
+        let s = Shape::spine(depth);
+        (shape_sum(&s), shape_checked(&s, u64::MAX))
+    });
+    assert_eq!(got, (2 * depth as u64 + 1, Ok(2 * depth as u64 + 1)));
+}

@@ -155,3 +155,39 @@ fn gated_field_is_flat() {
         .join();
     assert_eq!(deep.ok(), Some(200_000));
 }
+
+/// A loop entered after a call is written in the interleaved driver, where a gated resume point
+/// is an entry arm and a step out of its frame; both must be gated.
+#[stack_safe]
+fn gated_after_a_call(n: &[u64]) -> u64 {
+    let Some((first, rest)) = n.split_first() else {
+        return 0;
+    };
+    let mut acc = gated_after_a_call(rest);
+    for k in [first] {
+        match k {
+            0 => {}
+            #[cfg(all())]
+            _ => acc += gated_after_a_call(&rest[rest.len().min(1)..]) + k,
+            #[cfg(any())]
+            _ => acc += no_such_function(gated_after_a_call(rest)),
+        }
+    }
+    acc
+}
+
+#[test]
+fn gated_resume_in_the_interleaved_driver() {
+    fn naive(n: &[u64]) -> u64 {
+        let Some((first, rest)) = n.split_first() else {
+            return 0;
+        };
+        let mut acc = naive(rest);
+        if *first != 0 {
+            acc += naive(&rest[rest.len().min(1)..]) + first;
+        }
+        acc
+    }
+    let v: Vec<u64> = (0..12).map(|i| i % 3).collect();
+    assert_eq!(gated_after_a_call(&v), naive(&v));
+}

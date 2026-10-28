@@ -115,7 +115,7 @@ fn canonical(id: &Ident) -> String {
     name.strip_prefix("r#").unwrap_or(&name).to_owned()
 }
 
-fn idents(ts: &TokenStream) -> HashSet<String> {
+pub(super) fn idents(ts: &TokenStream) -> HashSet<String> {
     fn go(ts: &TokenStream, out: &mut HashSet<String>) {
         for t in ts.clone() {
             match t {

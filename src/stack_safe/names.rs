@@ -37,6 +37,14 @@ pub(super) fn entry_ty() -> Ident {
 pub(super) fn entry_variant(n: usize) -> Ident {
     format_ident!("E{}", n)
 }
+/// In the interleaved driver, the entry resuming frame `r`: its payload and the value.
+pub(super) fn resume_entry_variant(r: usize) -> Ident {
+    format_ident!("X{}", r)
+}
+/// In the interleaved driver, the entry carrying a finished value to the next frame.
+pub(super) fn pop_variant() -> Ident {
+    format_ident!("Pop")
+}
 /// Placeholder for a lowered loop's state tuple, substituted once liveness is solved.
 pub(super) fn state_marker(n: usize) -> Ident {
     format_ident!("__ss_st{}", n)
