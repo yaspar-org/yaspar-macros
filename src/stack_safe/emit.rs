@@ -20,7 +20,7 @@ use super::analyze::{
 use super::context::{CtxEntry, is_context_slot, peel_type, slot_key, slot_type, strip_parens};
 use super::cps::cps_stmts;
 use super::driver;
-use super::loop_state::{Solved, solve_payloads, substitute};
+use super::loop_state::{Solved, idents, solve_payloads, substitute};
 use super::names::*;
 use super::walk::{Ctx, Env, Member};
 
@@ -587,20 +587,14 @@ struct Pieces<'a> {
     machinery: &'a TokenStream,
     /// The `#[allow(..)]` the rewritten body needs.
     allows: &'a TokenStream,
-    /// One arm per entry point.
-    arms: &'a [TokenStream],
-    /// Continuation-frame dispatch.
-    resume: &'a TokenStream,
+    /// The driver loop, run on `__ss_entry`.
+    drive: &'a TokenStream,
     /// How each context slot is filled from the member's parameters.
     ctx_inits: &'a [TokenStream],
     /// `: R`, naming the driver's result type.
     ret_ann: &'a TokenStream,
     /// Type ascription for the entry's known payload types.
     anchor: &'a TokenStream,
-    /// Annotation on the entry value, if any.
-    input_ann: &'a TokenStream,
-    /// `: Frames<Frame<..>>`.
-    frames_ann: &'a TokenStream,
     /// The return-type union, declared outside the machine since its signature names it.
     ret_union_decl: &'a TokenStream,
 }
@@ -619,12 +613,9 @@ fn lifted(
     let Pieces {
         machinery,
         allows,
-        arms,
-        resume,
+        drive,
         ctx_inits,
         anchor,
-        input_ann,
-        frames_ann,
         ret_ann,
         ret_union_decl,
     } = pieces;
@@ -781,7 +772,6 @@ fn lifted(
             #(#variants,)*
         }
     };
-    let loop_expr = driver::machine(&quote! { __ss_entry }, input_ann, frames_ann, arms, resume);
     // Bodies run in the machine, so it must be `#[track_caller]` if any member is.
     let tracked = funcs
         .iter()
@@ -798,7 +788,7 @@ fn lifted(
                 #(#dispatch)*
             };
             #anchor
-            let __ss_out #ret_ann = #loop_expr;
+            let __ss_out #ret_ann = #drive;
             __ss_out
         }
     };
@@ -1312,6 +1302,10 @@ pub(super) fn expand_group(
     let mut frame_arms: Vec<TokenStream> = Vec::new();
     // Drops each frame when the shared check fails.
     let mut frame_drops: Vec<TokenStream> = Vec::new();
+    // For the interleaved driver: each resume point as an entry arm, and the `Pop` arm's step
+    // from its frame into that entry.
+    let mut resume_entries: Vec<TokenStream> = Vec::new();
+    let mut converts: Vec<TokenStream> = Vec::new();
     for (r, res) in resumes.iter().enumerate() {
         let variant = frame_variant(r);
         let payload = &frames[r];
@@ -1319,15 +1313,38 @@ pub(super) fn expand_group(
         let code = &res.point.code;
         let recomputed = recompute(loops.len() + r);
         let (gate, stand_in) = gating(&res.point.gates);
+        // See `driver::resume_direct`.
+        let resumed = match hoist {
+            true => ok_local(),
+            false => value_local(),
+        };
+        let xv = resume_entry_variant(r);
+        let gated_out = stand_in.as_ref().map(|ungated| {
+            quote! { #ungated #entry::#xv(()) => unreachable!("gated out"), }
+        });
+        resume_entries.push(quote! {
+            #gate
+            #entry::#xv(((#(mut #payload,)*), #resumed)) => {
+                let #value = #resumed; #recomputed #code
+            },
+            #gated_out
+        });
+        let gated_out = stand_in.as_ref().map(|ungated| {
+            quote! { #ungated #frame::#variant(()) => unreachable!("gated out"), }
+        });
+        converts.push(quote! {
+            #gate
+            #frame::#variant(__ss_p) => #entry::#xv((__ss_p, #resumed)),
+            #gated_out
+        });
         if hoist {
-            let ok = ok_local();
             let stand_in_drop = stand_in.clone();
             let stand_in = stand_in.map(|ungated| {
                 quote! { #ungated #frame::#variant(()) => unreachable!("gated out"), }
             });
             frame_arms.push(quote! {
                 #gate
-                #frame::#variant((#(mut #payload,)*)) => { let #value = #ok; #recomputed #code },
+                #frame::#variant((#(mut #payload,)*)) => { let #value = #resumed; #recomputed #code },
                 #stand_in
             });
             let dropped = payload.iter().rev();
@@ -1341,8 +1358,6 @@ pub(super) fn expand_group(
             });
             continue;
         }
-        // See `driver::resume_direct`.
-        let resumed = value_local();
         let stand_in = stand_in.map(|ungated| {
             quote! { #ungated #frame::#variant(()) => unreachable!("gated out"), }
         });
@@ -1352,18 +1367,53 @@ pub(super) fn expand_group(
             #stand_in
         });
     }
-    let resume = match hoist {
-        true => driver::resume(&frame_arms, &frame_drops),
-        false => driver::resume_direct(&frame_arms),
+
+    let order = {
+        let codes: Vec<&TokenStream> = arms.iter().chain(&frame_arms).collect();
+        let markers: Vec<Option<String>> = (0..loop_base)
+            .map(|_| None)
+            .chain((0..loops.len()).map(|n| Some(state_marker(n).to_string())))
+            .chain((0..resumes.len()).map(|r| Some(frame_marker(r).to_string())))
+            .collect();
+        arm_order(&codes, &markers)
+    };
+    let total_entries = loop_base + loops.len();
+    let mut entry_params: Vec<Ident> = (0..total_entries)
+        .map(|n| format_ident!("__SsA{}", n))
+        .collect();
+    let mut entry_variants: Vec<Ident> = (0..total_entries).map(entry_variant).collect();
+    let (arms, resume) = match &order {
+        None => {
+            let resume = match hoist {
+                true => driver::resume(&frame_arms, &frame_drops),
+                false => driver::resume_direct(&frame_arms),
+            };
+            (arms, resume)
+        }
+        Some(order) => {
+            entry_params.extend((0..resumes.len()).map(|r| format_ident!("__SsX{}", r)));
+            entry_variants.extend((0..resumes.len()).map(resume_entry_variant));
+            entry_params.push(format_ident!("__SsV"));
+            entry_variants.push(pop_variant());
+            let drops = hoist.then_some(frame_drops.as_slice());
+            let mut ordered = vec![driver::pop_arm(&converts, drops)];
+            let mut resume_entries = resume_entries.into_iter().map(Some).collect::<Vec<_>>();
+            let mut arms = arms.into_iter().map(Some).collect::<Vec<_>>();
+            for &n in order {
+                ordered.push(
+                    match n.checked_sub(total_entries) {
+                        None => arms[n].take(),
+                        Some(r) => resume_entries[r].take(),
+                    }
+                    .expect("each arm placed once"),
+                );
+            }
+            (ordered, TokenStream::new())
+        }
     };
     let arms: Vec<TokenStream> = arms.into_iter().map(|ts| substitute(ts, &subst)).collect();
     let resume = substitute(resume, &subst);
 
-    let total_entries = loop_base + loops.len();
-    let entry_params: Vec<Ident> = (0..total_entries)
-        .map(|n| format_ident!("__SsA{}", n))
-        .collect();
-    let entry_variants: Vec<Ident> = (0..total_entries).map(entry_variant).collect();
     let frame_params: Vec<Ident> = (0..resumes.len())
         .map(|r| format_ident!("__SsF{}", r))
         .collect();
@@ -1372,8 +1422,10 @@ pub(super) fn expand_group(
 
     // Ascribe known entry payload types up front; inference alone can't pin loop states.
     let anchor = {
+        let interleaved = entry_params.len() - total_entries;
         let entry_args = (0..total_entries)
-            .map(|n| variant_payload_type(&ctx, n, &loops, &states, self_ty, seed_lt));
+            .map(|n| variant_payload_type(&ctx, n, &loops, &states, self_ty, seed_lt))
+            .chain((0..interleaved).map(|_| quote! { _ }));
         let entry_ty_name = entry_ty();
         quote! { let _: &#entry_ty_name<#(#entry_args),*> = &__ss_entry; }
     };
@@ -1446,16 +1498,24 @@ pub(super) fn expand_group(
         )]
     };
 
+    let loop_expr = match order {
+        None => driver::machine(
+            &quote! { __ss_entry },
+            &input_ann,
+            &frames_ann,
+            &arms,
+            &resume,
+        ),
+        Some(_) => driver::interleaved(&quote! { __ss_entry }, &input_ann, &frames_ann, &arms),
+    };
+
     if lift {
         let pieces = Pieces {
             machinery: &machinery,
             allows: &allows,
-            arms: &arms,
-            resume: &resume,
+            drive: &loop_expr,
             ctx_inits: &ctx_inits,
             anchor: &anchor,
-            input_ann: &input_ann,
-            frames_ann: &frames_ann,
             ret_ann: &ctx.ret_ann,
             ret_union_decl: &ret_union_decl,
         };
@@ -1464,13 +1524,6 @@ pub(super) fn expand_group(
 
     // Not liftable: each member gets its own copy of the machine.
     let ret_ann = &ctx.ret_ann;
-    let loop_expr = driver::machine(
-        &quote! { __ss_entry },
-        &input_ann,
-        &frames_ann,
-        &arms,
-        &resume,
-    );
     let mut out = Vec::with_capacity(funcs.len());
     for (i, func) in funcs.iter().enumerate() {
         let attrs = &func.attrs;
@@ -1538,6 +1591,43 @@ pub(super) fn expand_group(
         });
     }
     Ok((out, TokenStream::new()))
+}
+
+/// The order to write the driver's arms in, if the usual one (members, loops, resume points)
+/// won't do; indices run over that usual order. Arms are type-checked as written, and a payload's
+/// types are inferred where it is first built, so each arm must come after one that builds it
+/// (`markers[n]` in its code; members, with `None`, are entered from outside). Otherwise a loop
+/// first entered after a call sees its state as not yet inferred, and `match` on a borrowed loop
+/// variable binds by value.
+fn arm_order(codes: &[&TokenStream], markers: &[Option<String>]) -> Option<Vec<usize>> {
+    let mentions: Vec<HashSet<String>> = codes.iter().map(|c| idents(c)).collect();
+    let builds = |by: usize, n: usize| {
+        markers[n]
+            .as_ref()
+            .is_some_and(|m| mentions[by].contains(m))
+    };
+    let usual_is_fine =
+        (0..codes.len()).all(|n| markers[n].is_none() || (0..n).any(|by| builds(by, n)));
+    if usual_is_fine {
+        return None;
+    }
+    // Breadth-first from the members: each arm lands after the first one written that builds it.
+    let mut placed: Vec<bool> = markers.iter().map(Option::is_none).collect();
+    let mut order: Vec<usize> = (0..codes.len()).filter(|&n| placed[n]).collect();
+    let mut next = 0;
+    while next < order.len() {
+        let by = order[next];
+        next += 1;
+        for (n, done) in placed.iter_mut().enumerate() {
+            if !*done && builds(by, n) {
+                *done = true;
+                order.push(n);
+            }
+        }
+    }
+    // Unreachable arms still need writing.
+    order.extend((0..codes.len()).filter(|&n| !placed[n]));
+    Some(order)
 }
 
 /// For `#[cfg]` gates: the arm's `cfg`, and the `cfg(not(..))` for its stand-in arm.

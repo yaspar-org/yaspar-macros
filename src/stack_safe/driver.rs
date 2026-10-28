@@ -22,8 +22,8 @@ use proc_macro2::TokenStream;
 use quote::quote;
 
 use super::names::{
-    done_label, done_local, drive_label, frame_local, frames_local, frames_ty, input_local,
-    ok_local, push_fn, res_local, value_local,
+    done_label, done_local, drive_label, entry_ty, frame_local, frames_local, frames_ty,
+    input_local, ok_local, pop_variant, push_fn, res_local, value_local,
 };
 use super::try_shim;
 
@@ -136,6 +136,73 @@ pub(super) fn machine(
                     #value = #done: { #resume };
                 }
             }
+        }
+    }
+}
+
+/// The driver with resume points as entry arms, so they can be written between the others (see
+/// `emit::arm_order`). A finished value re-enters as `Pop`, whose arm (first in `arms`, from
+/// [`pop_arm`]) hands it to the next frame.
+pub(super) fn interleaved(
+    entry: &TokenStream,
+    input_ann: &TokenStream,
+    frames_ann: &TokenStream,
+    arms: &[TokenStream],
+) -> TokenStream {
+    let (frames, frames_ty) = (frames_local(), frames_ty());
+    let (input, value) = (input_local(), value_local());
+    let (drive, done) = (drive_label(), done_label());
+    let (entry_ty, pop) = (entry_ty(), pop_variant());
+    quote! {
+        {
+            let mut #frames #frames_ann = #frames_ty::new();
+            let mut #input #input_ann = #entry;
+            #drive: loop {
+                let #value = #done: {
+                    match #input {
+                        #(#arms)*
+                    }
+                };
+                #input = #entry_ty::#pop(#value);
+            }
+        }
+    }
+}
+
+/// The `Pop` arm of [`interleaved`]: pop a frame and enter its resume arm via `converts`, or
+/// finish if none is left. With `drops`, the `?` check is shared as in [`resume`].
+pub(super) fn pop_arm(converts: &[TokenStream], drops: Option<&[TokenStream]>) -> TokenStream {
+    let (frames, input, frame) = (frames_local(), input_local(), frame_local());
+    let (value, drive) = (value_local(), drive_label());
+    let (entry_ty, pop) = (entry_ty(), pop_variant());
+    let enter = quote! {
+        #input = match #frame { #(#converts)* };
+        continue #drive
+    };
+    let resume = match drops {
+        None => enter,
+        Some(drops) => {
+            let (ok, res) = (ok_local(), res_local());
+            let branch = try_shim::branch(quote! { #value });
+            let handed_down = done(try_shim::from_residual(quote! { #res }));
+            quote! {
+                match #branch {
+                    ::core::result::Result::Ok(#ok) => { #enter }
+                    ::core::result::Result::Err(#res) => {
+                        match #frame { #(#drops)* }
+                        #handed_down
+                    }
+                }
+            }
+        }
+    };
+    quote! {
+        #entry_ty::#pop(#value) => {
+            let #frame = match #frames.pop() {
+                ::core::option::Option::None => break #drive #value,
+                ::core::option::Option::Some(#frame) => #frame,
+            };
+            #resume
         }
     }
 }
